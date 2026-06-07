@@ -188,6 +188,9 @@ missing/unexpected keys）、SyncBN 是否真的开启、AMP 是否引入数值�
   amp / accumulative_counts4 / SyncBN 设置下训练。
 - **绝不**拿官方 8×A100 全量权重(71.4/68.6) 当 baseline 去比 4 卡训练的变体。
 - 变体的对比锚点 = **本文 §7 实跑出的 4 卡 baseline 数**（回填后）。
+- **D(InsFusion) 例外提示**：InsFusion 原协议是**冻结 baseline + 小 LR(2e-5) 两阶段微调**
+  （见 DESIGN.md §6.3 / 假设 D-3），与 A/C 的全端到端训练不同。`+D` 档采用哪种训练方式会影响与
+  baseline/其它变体的可比性，**须由用户拍板**后再统一记录于此。
 
 ---
 
