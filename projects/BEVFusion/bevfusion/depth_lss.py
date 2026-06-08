@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from mmdet3d.registry import MODELS
+from .depth_sup import depth_bce_loss
 from .ops import bev_pool
 
 
@@ -345,9 +346,17 @@ class DepthLSSTransform(BaseDepthTransform):
         zbound: Tuple[float, float, float],
         dbound: Tuple[float, float, float],
         downsample: int = 1,
+        use_depth_sup: bool = False,
+        depth_loss_weight: float = 0.5,
     ) -> None:
         """Compared with `LSSTransform`, `DepthLSSTransform` adds sparse depth
-        information from lidar points into the inputs of the `depthnet`."""
+        information from lidar points into the inputs of the `depthnet`.
+
+        [module-A/depth-sup] ``use_depth_sup`` (default False) toggles BEVDepth
+        (arXiv:2206.10092) explicit depth supervision. When False, this module
+        is byte-identical to the baseline: nothing is cached, no loss is added,
+        and no parameters are introduced.
+        """
         super().__init__(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -403,22 +412,61 @@ class DepthLSSTransform(BaseDepthTransform):
         else:
             self.downsample = nn.Identity()
 
+        # [module-A/depth-sup] BEVDepth (arXiv:2206.10092) explicit depth
+        # supervision. Adds NO trainable parameters: it only supervises the
+        # depth logits the `depthnet` already predicts. Caches below are
+        # populated ONLY when use_depth_sup is True (see get_cam_feats); they
+        # are plain attributes -> never enter parameters()/state_dict.
+        self.use_depth_sup = use_depth_sup
+        self.depth_loss_weight = depth_loss_weight
+        self._depth_pred_logits = None  # (B*N, D, fH, fW), pre-softmax
+        self._depth_gt = None           # (B*N, 1, iH, iW), sparse LiDAR depth
+
     def get_cam_feats(self, x, d):
         B, N, C, fH, fW = x.shape
 
         d = d.view(B * N, *d.shape[2:])
         x = x.view(B * N, C, fH, fW)
 
+        if self.use_depth_sup:
+            # [module-A/depth-sup] stash the sparse LiDAR depth GT at full
+            # image resolution BEFORE `dtransform` overwrites `d`.
+            self._depth_gt = d
+
         d = self.dtransform(d)
         x = torch.cat([d, x], dim=1)
         x = self.depthnet(x)
 
-        depth = x[:, :self.D].softmax(dim=1)
+        if self.use_depth_sup:
+            # [module-A/depth-sup] stash the PRE-softmax depth logits for BCE
+            # (the depth below is numerically identical to the baseline; this
+            # only keeps an extra reference to the logits).
+            self._depth_pred_logits = x[:, :self.D]
+            depth = self._depth_pred_logits.softmax(dim=1)
+        else:
+            depth = x[:, :self.D].softmax(dim=1)  # baseline, byte-identical
         x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
 
         x = x.view(B, N, self.C, self.D, fH, fW)
         x = x.permute(0, 1, 3, 4, 5, 2)
         return x
+
+    def get_depth_loss(self):
+        """[module-A/depth-sup] BEVDepth (arXiv:2206.10092) depth supervision.
+
+        Masked per-bin BCE-with-logits between the stashed pre-softmax depth
+        logits and the discretized sparse LiDAR depth GT. Only pixels with a
+        LiDAR point in ``[d_min, d_max)`` are supervised (the sparse mask).
+        Reads AND clears the caches; returns the weighted scalar loss.
+        """
+        logits, gt = self._depth_pred_logits, self._depth_gt
+        assert logits is not None and gt is not None, (
+            'get_depth_loss called without cached depth tensors; ensure '
+            'use_depth_sup=True and a forward ran before loss().')
+        self._depth_pred_logits = None
+        self._depth_gt = None
+        return depth_bce_loss(logits, gt, self.image_size, self.feature_size,
+                              self.dbound, self.D, self.depth_loss_weight)
 
     def forward(self, *args, **kwargs):
         x = super().forward(*args, **kwargs)

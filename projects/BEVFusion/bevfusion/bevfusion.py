@@ -295,4 +295,11 @@ class BEVFusion(Base3DDetector):
 
         losses.update(bbox_loss)
 
+        # [module-A/depth-sup] BEVDepth-style explicit depth supervision,
+        # active only when the view transform has use_depth_sup=True. The
+        # getattr guard keeps the baseline (all-off) loss dict byte-identical.
+        vt = getattr(self, 'view_transform', None)
+        if vt is not None and getattr(vt, 'use_depth_sup', False):
+            losses['loss_depth'] = vt.get_depth_loss()
+
         return losses
