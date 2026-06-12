@@ -29,14 +29,26 @@
 11. 上游隔离：禁止修改 projects/BEVFusion/ 与 mmdet3d 库内任何文件。
     全部新代码放在新建的 projects/EPFusion/ 下（模型类继承 BEVFusion 并注册，
     config 继承复现所用 config）。
-12. Git 纪律：只在分支 claude/jolly-wozniak-c4YMQ 上工作；每完成一个模块
-    （含其 sanity 通过）做一次独立 commit，message 注明模块名与验证结果。
+12. Git 纪律：Claude Code 在 harness 分配的会话分支上工作并推送；
+    claude/jolly-wozniak-c4YMQ 为集成分支，由用户在 GitHub 网页端以 PR 合并。
+    禁止推送 main/master。每完成一个模块（含 sanity 通过）独立 commit。
 13. 运行中训练保护：执行任何脚本前先检测是否有训练进程在跑（nvidia-smi / ps）。
     检测到正在运行的训练时：禁止任何 GPU 操作、禁止修改已有 tracked 文件、
     禁止 git checkout/切分支、禁止改动 conda 环境；只允许只读勘察和新建文件。
 14. 探针工作流：需要 GPU/数据/训练日志才能回答的问题，一律打包成无副作用的
     探针脚本（输出汇总到单个文本报告），由用户在 GPU 服务器上执行后贴回结果，
     不得用估计值或文档默认值冒充实测值。
+15. 零新依赖：离线服务器无法 pip install。所有新代码只准 import 当前 conda 环境
+    已有的包（torch/numpy/mmcv/mmdet3d/mmengine/matplotlib 等，以探针 P1 实测的
+    pip list 为白名单）。损坏管线等一律用 torch/numpy 手写。
+16. 运行时禁用 git：服务器上的代码来自 zip，没有 .git 目录。任何脚本禁止调用
+    git 命令获取版本号；统一读取仓库根目录 VERSION 文件（每次 commit 顺手更新
+    一行日期+模块名），读不到则记 "unknown"，不许报错。
+17. 一切可调参数走 CLI：脚本中的路径、严重度、w_teach、样本数等一律做成命令行
+    参数（带默认值），禁止硬编码——离线环境下每次改代码的代价是一整轮
+    zip 下载/上传，参数调整不应消耗这个代价。
+18. 报告单文件化：每个诊断/评测脚本的全部结论汇入一个 .txt 或 .json
+    （可附 PNG），文件名带脚本名与日期，方便拷出回传。
 
 ## M0 范围纪律（防 scope creep）
 - 只做：逐格标量 Λ、教师对照(路线b)+退化演练(路线c)、PoE 融合。
