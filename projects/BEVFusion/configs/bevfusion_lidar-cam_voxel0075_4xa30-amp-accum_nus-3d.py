@@ -7,8 +7,8 @@
 #      GridMask max_epoch stretched consistently (same 40%/60% momentum split:
 #      2.4/6 -> 8/20);
 #   2. AMP stability (fixes grad_norm nan/inf): AmpOptimWrapper is pinned IN
-#      the config with loss_scale=dict(init_scale=512) -- the `--amp` CLI flag
-#      would otherwise inject loss_scale='dynamic' (GradScaler starting at
+#      the config with loss_scale=512.0 (a static scale) -- the `--amp` CLI
+#      flag would otherwise inject loss_scale='dynamic' (GradScaler starting at
 #      65536, which overflows early fp16 grads); clip_grad.max_norm 35 -> 10;
 #   3. offline hardening: img_backbone.init_cfg.checkpoint pinned to a LOCAL
 #      absolute path placeholder (never an online URL).
@@ -30,15 +30,16 @@ point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
 backend_args = None
 
 # --- offline hardening: Swin-T init from a LOCAL file, never an online URL ---
-# <FILL_ME>: replace <SWINT_CKPT_PATH> with the real absolute path on the
-# server, e.g.
-#   /212022085500129/mmdetection3d-claude-jolly-wozniak-c4YMQ/checkpoints/swint-nuimages-pretrained.pth
-# Launching with
+# Pinned to the repo's current absolute location on the server. Launching with
 #   --cfg-options model.img_backbone.init_cfg.checkpoint=...
-# still overrides this value.
+# still overrides this. NOTE: this hardcodes an absolute path; if the repo dir
+# is renamed/moved, update it here (or pass --cfg-options).
 model = dict(
     img_backbone=dict(
-        init_cfg=dict(type='Pretrained', checkpoint='<SWINT_CKPT_PATH>')))
+        init_cfg=dict(
+            type='Pretrained',
+            checkpoint='/212022085500129/mmdetection3d-claude-jolly-wozniak-c4YMQ/checkpoints/swint-nuimages-pretrained.pth'  # noqa: E501
+        )))
 
 # Full copy of the parent train_pipeline -- mmengine replaces (does not merge)
 # lists, so changing one field requires re-stating the whole list. The ONLY
@@ -121,10 +122,11 @@ train_pipeline = [
         ])
 ]
 
-# --- per-GPU batch: 4 -> 2 (validated-feasible value on a 24GB card in fp16);
-# the training pipeline is re-bound to the 20-epoch copy above. Dataset type/
-# modality/CBGS wrapper etc. are inherited untouched. val_dataloader stays at
-# the inherited batch_size=1.
+# --- per-GPU batch_size 2. (The OFFICIAL upstream config is 8xb4 = batch 4/GPU;
+# this 4xA30 config has always used 2 -- NOT a new change here.) The training
+# pipeline is re-bound to the 20-epoch copy above (only GridMask.max_epoch
+# differs). Dataset type/modality/CBGS wrapper, num_workers, sampler etc. are
+# inherited untouched. val_dataloader stays at the inherited batch_size=1.
 train_dataloader = dict(
     batch_size=2,
     num_workers=4,
@@ -173,15 +175,19 @@ train_cfg = dict(by_epoch=True, max_epochs=20, val_interval=1)
 # AmpOptimWrapper is pinned IN the config: tools/train.py's `--amp` flag only
 # injects loss_scale='dynamic' when converting a plain OptimWrapper; with the
 # type already AmpOptimWrapper it just warns "AMP training is already enabled"
-# and leaves loss_scale alone -- which is what lets init_scale=512 stick.
-# loss_scale=dict(init_scale=512): still a dynamic GradScaler, but starting at
-# 512 instead of 65536, so early fp16 steps don't overflow (grad_norm nan).
+# and leaves loss_scale alone -- which is what lets loss_scale=512.0 stick.
+# loss_scale=512.0: a STATIC loss scale of 512 (mmengine stores it as
+# _scale_update_param and forces GradScaler back to 512 every step), vs the
+# default dynamic scaler starting at 65536 that overflows early fp16 grads ->
+# grad_norm nan. 512 is low enough to avoid early overflow, high enough to
+# avoid grad underflow. (A dynamic variant would be loss_scale=dict(
+# init_scale=512); we use the static float form as the most robust choice.)
 # clip_grad.max_norm 35 -> 10 further suppresses gradient spikes.
 # Optimizer (AdamW lr=2e-4, wd=0.01) inherited UNCHANGED;
 # accumulative_counts=4 keeps the effective batch at 32 (4 GPUs x 2 x 4).
 optim_wrapper = dict(
     type='AmpOptimWrapper',
-    loss_scale=dict(init_scale=512),
+    loss_scale=512.0,
     accumulative_counts=4,
     clip_grad=dict(max_norm=10, norm_type=2))
 
