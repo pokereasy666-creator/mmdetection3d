@@ -23,6 +23,14 @@
 8. 每 N 步必须记录 clean / corrupt_cam / corrupt_lidar 三种模式下的
    mean(Λ_C) 与 mean(Λ_L)（这是活体 sanity 信号）。
 9. 所有 run 固定 seed 并记录 git commit hash。
+10. mmengine 特有：训练循环会反复调用 model.train()（epoch 开始、验证结束后）。
+    冻结模块保持 eval 必须通过 override 模型类的 train(self, mode=True) 方法实现，
+    在其中强制冻结子模块 .eval()。禁止只在构造函数里调一次 .eval()。
+11. 上游隔离：禁止修改 projects/BEVFusion/ 与 mmdet3d 库内任何文件。
+    全部新代码放在新建的 projects/EPFusion/ 下（模型类继承 BEVFusion 并注册，
+    config 继承复现所用 config）。
+12. Git 纪律：只在分支 claude/jolly-wozniak-c4YMQ 上工作；每完成一个模块
+    （含其 sanity 通过）做一次独立 commit，message 注明模块名与验证结果。
 
 ## M0 范围纪律（防 scope creep）
 - 只做：逐格标量 Λ、教师对照(路线b)+退化演练(路线c)、PoE 融合。
