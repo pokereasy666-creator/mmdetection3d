@@ -117,6 +117,9 @@ fi
 
 # ---------- 4) 环境自检 ----------
 echo "[deploy] 环境自检（PYTHONPATH=${REPO_ROOT}）..."
+# 临时关闭 errexit：自检 python 返回非零时要走到下方 RC 判定打印友好提示，
+# 而不是被 set -e 在此处直接中断。
+set +e
 PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" "${PYTHON_BIN}" - <<'PYEOF'
 import importlib, sys
 ok = True
@@ -143,6 +146,7 @@ except Exception:
 sys.exit(0 if ok else 1)
 PYEOF
 RC=$?
+set -e
 if [[ ${RC} -ne 0 ]]; then
   echo "[deploy] 自检未全部通过（见上）" >&2
   exit ${RC}

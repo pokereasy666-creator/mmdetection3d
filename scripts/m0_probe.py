@@ -81,6 +81,23 @@ def section(title):
     print('=' * 78)
 
 
+def import_first(module_paths, attr):
+    """从多个候选模块路径里取第一个能拿到 attr 的（防 mmengine 版本间模块路径漂移）。
+
+    本机无 mmengine 源，无法静态确认 EpochBasedTrainLoop/ValLoop 究竟从
+    `mmengine.runner` 还是 `mmengine.runner.loops` 暴露——两条路径都试，
+    谁先成功用谁；都失败则抛出最后一个异常（由 P6 的 try/except 兜住）。
+    """
+    last_err = None
+    for mp in module_paths:
+        try:
+            return getattr(importlib.import_module(mp), attr)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise ImportError('无法从 %s 导入 %s（最后错误 %r）'
+                      % (module_paths, attr, last_err))
+
+
 def read_version():
     """铁律 16：不调 git，读 VERSION；读不到记 unknown，不许报错。"""
     try:
@@ -524,7 +541,11 @@ def probe_p6(args):
     from torch import nn
 
     print('[6.1] EpochBasedTrainLoop.run / run_epoch 源码（model.train() 调用时机）:')
-    from mmengine.runner.loops import EpochBasedTrainLoop, ValLoop
+    # 本机无 mmengine 源，类暴露路径无法静态确认；两条候选路径都试（见 import_first）。
+    EpochBasedTrainLoop = import_first(
+        ['mmengine.runner', 'mmengine.runner.loops'], 'EpochBasedTrainLoop')
+    ValLoop = import_first(
+        ['mmengine.runner', 'mmengine.runner.loops'], 'ValLoop')
     print(inspect.getsource(EpochBasedTrainLoop.run))
     print(inspect.getsource(EpochBasedTrainLoop.run_epoch))
     print('[6.2] ValLoop.run 源码（eval/train 切换时机）:')
