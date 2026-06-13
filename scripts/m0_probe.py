@@ -222,8 +222,12 @@ def probe_p1(args):
             print('       请经 scripts/m0_probe.sh 启动（它设置 PYTHONPATH=仓库根）')
     if 'torch' in mods:
         torch = mods['torch']
+        try:
+            cudnn_v = torch.backends.cudnn.version()
+        except Exception as e:  # cudnn 未编译/不可用时不应连累整个 P1
+            cudnn_v = 'N/A(%r)' % e
         print('torch.version.cuda = %s, cudnn = %s' %
-              (torch.version.cuda, torch.backends.cudnn.version()))
+              (torch.version.cuda, cudnn_v))
         print('CUDA available = %s, device_count = %d' %
               (torch.cuda.is_available(), torch.cuda.device_count()))
         for i in range(torch.cuda.device_count()):
@@ -263,10 +267,13 @@ def probe_p2(args):
         jsons = sorted(
             glob.glob(os.path.join(args.work_dir, '*', 'vis_data', '*.json')),
             key=os.path.getmtime)
+        logs = sorted(glob.glob(os.path.join(args.work_dir, '*', '*.log')),
+                      key=os.path.getmtime)
+        val_rows, loss_rows = [], []
+        # ---- 首选：解析 vis_data 下的 JSON-lines scalars ----
         if jsons:
             latest = jsons[-1]
             print('最新 scalars 文件: %s' % latest)
-            val_rows, loss_rows = [], []
             with open(latest, encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
@@ -275,30 +282,48 @@ def probe_p2(args):
                     try:
                         d = json.loads(line)
                     except Exception:
-                        continue
+                        continue  # 非 JSON-lines 行跳过（兼容非标准格式）
                     if any(('NDS' in k or 'mAP' in k) for k in d):
                         val_rows.append(d)
                     elif any('loss' in k for k in d):
                         loss_rows.append(d)
-            print('\n[val 指标记录数: %d；最近 3 条]' % len(val_rows))
+            print('[val 指标记录数: %d；最近 3 条]' % len(val_rows))
             for d in val_rows[-3:]:
                 print('  %s' % json.dumps(d, ensure_ascii=False))
-            if val_rows:
-                last = val_rows[-1]
-                nds = [v for k, v in last.items() if k.endswith('NDS')]
-                mAP = [v for k, v in last.items() if k.endswith('mAP')]
-                print('\n>>> 复现最终 val: NDS=%s mAP=%s' % (nds, mAP))
-                print('>>> 官方参照（projects/BEVFusion/README.md:71）: '
-                      'NDS 71.4 / mAP 68.6；|Δ| > 0.5 NDS 须排查后再继续 M0')
-            print('\n[train loss 尾部 10 条]')
-            for d in loss_rows[-10:]:
-                brief = {k: v for k, v in d.items()
-                         if 'loss' in k or k in ('epoch', 'iter', 'lr')}
-                print('  %s' % json.dumps(brief, ensure_ascii=False))
+            if loss_rows:
+                print('[train loss 尾部 10 条]')
+                for d in loss_rows[-10:]:
+                    brief = {k: v for k, v in d.items()
+                             if 'loss' in k or k in ('epoch', 'iter', 'lr')}
+                    print('  %s' % json.dumps(brief, ensure_ascii=False))
         else:
             print('未在 %s/*/vis_data/ 下找到 scalars json' % args.work_dir)
-        logs = sorted(glob.glob(os.path.join(args.work_dir, '*', '*.log')),
-                      key=os.path.getmtime)
+
+        # ---- 关键数（复现 NDS/mAP，决定 Δ>0.5 排查门）：vis_data 读不出则
+        #      回退到 .log 文本 grep，绝不因日志格式而读不出最关键的数 ----
+        if val_rows:
+            last = val_rows[-1]
+            nds = [v for k, v in last.items() if k.endswith('NDS')]
+            mAP = [v for k, v in last.items() if k.endswith('mAP')]
+            print('\n>>> 复现最终 val（来自 vis_data）: NDS=%s mAP=%s' % (nds, mAP))
+        elif logs:
+            print('\n>>> vis_data 未解析到 val 指标，回退 .log grep NDS/mAP:')
+            hit = []
+            for lg in logs:
+                with open(lg, encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        if 'NDS' in line or 'mAP' in line:
+                            hit.append(line.rstrip())
+            for line in hit[-12:]:  # 尾部若干条≈最终评测结果
+                print('  ' + line)
+            if not hit:
+                print('  .log 中也未出现 NDS/mAP（训练可能尚未跑到 val）')
+        else:
+            print('\n>>> 既无 vis_data val 行，也无 .log 文件，无法取复现 NDS')
+        print('>>> 官方参照（projects/BEVFusion/README.md:71）: '
+              'NDS 71.4 / mAP 68.6；|Δ| > 0.5 NDS 须排查后再继续 M0')
+
+        # ---- 最新 .log 尾部，便于人工核对训练收尾 ----
         if logs:
             print('\n[最新 .log 尾部 20 行] %s' % logs[-1])
             with open(logs[-1], encoding='utf-8', errors='replace') as f:
@@ -346,7 +371,10 @@ def probe_p3(args):
     dl_cfg['num_workers'] = 2
     dl_cfg['persistent_workers'] = False
     loader = Runner.build_dataloader(dl_cfg)
-    batch = next(iter(loader))
+    batch = next(iter(loader))  # DataLoader 的 collate_fn(pseudo_collate) 已 collate
+
+    # 先实测属性名（不凭记忆挂 hook）；单个属性名错也不应崩掉整个 P3
+    print('model.named_children(): %s' % [n for n, _ in model.named_children()])
 
     records = []
 
@@ -355,18 +383,26 @@ def probe_p3(args):
             records.append((name, shape_of(list(inputs)), shape_of(output)))
         return hook
 
-    handles = [
-        model.view_transform.register_forward_hook(mk_hook('view_transform(相机 BEV 出口)')),
-        model.pts_middle_encoder.register_forward_hook(mk_hook('pts_middle_encoder(LiDAR BEV 出口)')),
-        model.fusion_layer.register_forward_hook(mk_hook('fusion_layer(ConvFuser)')),
-        model.pts_backbone.register_forward_hook(mk_hook('pts_backbone(SECOND)')),
-        model.pts_neck.register_forward_hook(mk_hook('pts_neck(SECONDFPN)')),
+    hook_targets = [
+        ('view_transform', '相机 BEV 出口'),
+        ('pts_middle_encoder', 'LiDAR BEV 出口'),
+        ('fusion_layer', 'ConvFuser'),
+        ('pts_backbone', 'SECOND'),
+        ('pts_neck', 'SECONDFPN'),
     ]
+    handles = []
+    for attr, desc in hook_targets:
+        mod = getattr(model, attr, None)
+        if mod is None:
+            print('  [跳过 hook] model.%s 不存在' % attr)
+            continue
+        handles.append(
+            mod.register_forward_hook(mk_hook('%s(%s)' % (attr, desc))))
     try:
+        # 走官方推理入口 test_step（内部 data_preprocessor + predict 前向），
+        # 不手搓 data_preprocessor/extract_feat 绕过 BEVFusion 的 forward 契约
         with torch.no_grad():
-            data = model.data_preprocessor(batch, False)
-            metas = [s.metainfo for s in data['data_samples']]
-            model.extract_feat(data['inputs'], metas)
+            model.test_step(batch)
     finally:
         for h in handles:
             h.remove()
@@ -423,6 +459,7 @@ def probe_p4(args):
                       (tag, n_train / 1e6, n_frozen / 1e6))
 
                 from mmengine.runner import Runner
+                from mmengine.optim import build_optim_wrapper
                 dl_cfg = copy.deepcopy(cfg.train_dataloader)
                 ds = dl_cfg['dataset']
                 if ds.get('type') == 'CBGSDataset':
@@ -434,25 +471,25 @@ def probe_p4(args):
                 loader = Runner.build_dataloader(dl_cfg)
                 batch = next(iter(loader))
 
-                opt = torch.optim.AdamW(
-                    [p for p in model.parameters() if p.requires_grad],
-                    lr=2e-4, weight_decay=0.01)
-                scaler = torch.cuda.amp.GradScaler(enabled=amp)
+                # 官方入口：amp=True→AmpOptimWrapper(loss_scale='dynamic')，
+                # amp=False→OptimWrapper；model.train_step 内部完成
+                # preprocess+loss+parse+backward+step，对齐真实 --amp 路径。
+                # 两套 AMP 机制不可叠加，故不再手搓 GradScaler/autocast。
+                ow_cfg = dict(
+                    type='AmpOptimWrapper' if amp else 'OptimWrapper',
+                    optimizer=dict(type='AdamW', lr=2e-4, weight_decay=0.01))
+                if amp:
+                    ow_cfg['loss_scale'] = 'dynamic'
+                optim_wrapper = build_optim_wrapper(model, ow_cfg)
+
                 iters = max(2, args.timing_iters)
                 times = []
+                last_log = None
                 torch.cuda.reset_peak_memory_stats()
                 for it in range(iters):
                     torch.cuda.synchronize()
                     t0 = time.time()
-                    with torch.autocast('cuda', enabled=amp):
-                        data = model.data_preprocessor(batch, True)
-                        losses = model.loss(data['inputs'],
-                                            data['data_samples'])
-                        loss, log_vars = model.parse_losses(losses)
-                    scaler.scale(loss).backward()
-                    scaler.step(opt)
-                    scaler.update()
-                    opt.zero_grad(set_to_none=True)
+                    last_log = model.train_step(batch, optim_wrapper)
                     torch.cuda.synchronize()
                     times.append(time.time() - t0)
                 peak_alloc = torch.cuda.max_memory_allocated() / 1024 ** 3
@@ -461,8 +498,10 @@ def probe_p4(args):
                       (peak_alloc, peak_resv))
                 print('  iter 走时: %s（首 iter 含 warmup；稳态≈%.2fs）' %
                       (['%.2fs' % t for t in times], times[-1]))
-                print('  total loss=%.4f（数值仅证通路打通）' % float(loss))
-                del model, opt, loader, batch
+                if isinstance(last_log, dict) and 'loss' in last_log:
+                    print('  train_step log loss=%s（仅证通路打通）'
+                          % last_log.get('loss'))
+                del model, optim_wrapper, loader, batch
                 torch.cuda.empty_cache()
             except RuntimeError as e:
                 if 'out of memory' in str(e).lower():
@@ -517,10 +556,14 @@ def probe_p5(args):
             uniq = col.unique()
             intlike = bool(((col - col.round()).abs() < 1e-6).float()
                            .mean() > 0.999)
+            # 阈值放宽到 128：nuScenes 单帧 ring∈[0,31]，但 9-sweep 叠加
+            # （及不同采集）会抬高唯一整数值的边界，用 128 作宽松上界，
+            # 避免把 ring index 误判为连续量（时间戳）。
+            ring_like = intlike and uniq.numel() <= 128
             print('  [第 5 维语义线索] unique=%d, 整数性=%s → %s' %
                   (uniq.numel(), intlike,
                    'ring index 可能性高（抽线损坏可直接用）'
-                   if intlike and uniq.numel() <= 64 else
+                   if ring_like else
                    '疑似时间戳/连续量（抽线损坏须回退俯仰角分箱）'))
     ds_sample = sample.get('data_samples')
     if ds_sample is not None:
@@ -551,23 +594,37 @@ def probe_p6(args):
     print('[6.2] ValLoop.run 源码（eval/train 切换时机）:')
     print(inspect.getsource(ValLoop.run))
 
-    print('[6.3] Runner.train 中 load_or_resume 与 train_loop.run 的顺序'
-          '（R0WeightCopyHook before_train 时机依据）:')
+    print('[6.3] Runner.train 中 load_or_resume 与 train_loop.run 的先后'
+          '（R0WeightCopyHook before_train 时机依据；机器判定仅辅助，主看行号人工确认）:')
     from mmengine.runner import Runner
-    src = inspect.getsource(Runner.train)
-    for i, line in enumerate(src.splitlines()):
-        if any(k in line for k in ('load_or_resume', 'self.train_loop.run',
-                                   'call_hook')):
-            print('  L%03d: %s' % (i, line.rstrip()))
-    pos_load = src.find('load_or_resume')
-    pos_run = src.find('self.train_loop.run')
-    if pos_load >= 0 and pos_run >= 0:
-        verdict = 'PASS（load_or_resume 在 train_loop.run 之前 → before_train 晚于权重加载）' \
-            if pos_load < pos_run else \
-            'FAIL（顺序与预期相反！R0WeightCopyHook 须改为惰性拷贝兜底方案）'
-        print('  [顺序判定] %s' % verdict)
+    src_lines = inspect.getsource(Runner.train).splitlines()
+
+    def find_call_lineno(needle):
+        """needle 首次作为【实际调用语句】（非注释行、含 self. 前缀）出现的行号。"""
+        for idx, ln in enumerate(src_lines):
+            if ln.strip().startswith('#'):     # 整行注释跳过
+                continue
+            code = ln.split('#', 1)[0]         # 去掉行内注释
+            if needle in code and 'self.' in code:
+                return idx
+        return -1
+
+    # 打印所有相关行（含行号）供人工确认——机器判定不作唯一依据
+    for idx, ln in enumerate(src_lines):
+        if any(k in ln for k in ('load_or_resume', 'train_loop.run',
+                                 'call_hook')):
+            print('  L%03d: %s' % (idx, ln.rstrip()))
+    li_load = find_call_lineno('load_or_resume')
+    li_run = find_call_lineno('train_loop.run')
+    print('  [实际调用行号] load_or_resume=L%d, train_loop.run=L%d' %
+          (li_load, li_run))
+    if li_load >= 0 and li_run >= 0:
+        verdict = ('PASS（load_or_resume 行号在前 → before_train 晚于权重加载）'
+                   if li_load < li_run else
+                   'FAIL（顺序与预期相反！R0WeightCopyHook 须改惰性拷贝兜底）')
+        print('  [机器判定·辅助] %s' % verdict)
     else:
-        print('  [顺序判定] 无法定位关键调用，请人工阅读上方源码')
+        print('  [机器判定·辅助] 未能定位实际调用行，请按上方行号人工确认')
 
     print('\n[6.4] BaseModel.train_step 源码（parse_losses 调用证据）:')
     from mmengine.model import BaseModel

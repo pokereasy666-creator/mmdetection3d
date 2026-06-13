@@ -1,1 +1,1 @@
-2026-06-13 M0-deploy+probe scripts hardened; plan finalized (API audit static-verified)
+2026-06-13 m0_probe.py review fixes: official train_step/test_step entry, AMP via OptimWrapper, P2 log fallback, P6.3 lineno-based
