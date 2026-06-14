@@ -3,8 +3,9 @@
 #   BEVDepth (arXiv:2206.10092) depth supervision.
 #
 # Inherits the verified 4xA30 baseline config UNCHANGED (batch_size 2,
-# accumulative_counts 4 -> effective batch 32, AMP, SyncBN, cyclic-6e, lr 2e-4)
-# and ONLY turns on `use_depth_sup` (+ depth_loss_weight) on the view transform.
+# accumulative_counts 4 -> effective batch 32, AMP loss_scale=512.0, SyncBN,
+# cyclic-20e, lr 2e-4) and ONLY turns on `use_depth_sup` (+ depth_loss_weight)
+# on the view transform.
 # This keeps +A trained under the exact same hardware/optimisation setup as the
 # baseline (fairness rule). Toggling is a single config field; with
 # use_depth_sup=False the model is byte-identical to the baseline.
