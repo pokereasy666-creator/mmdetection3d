@@ -3,10 +3,10 @@
 #   DepthFusion (arXiv:2505.07398) Sec. III-B.
 #
 # Inherits the verified 4xA30 baseline config UNCHANGED (batch_size 2,
-# accumulative_counts 4 -> effective batch 32, AMP, SyncBN, cyclic-6e, lr 2e-4)
-# and ONLY swaps `model.fusion_layer` to `DGFFuser`. This keeps the +C variant
-# trained under the exact same hardware/optimisation setup as the baseline
-# (fairness rule). Toggling between baseline and +C is a single config field.
+# accumulative_counts 4 -> effective batch 32, AMP loss_scale=512.0, SyncBN,
+# cyclic-20e, lr 2e-4) and ONLY swaps `model.fusion_layer` to `DGFFuser`.
+# This keeps the +C variant trained under the exact same hardware/optimisation
+# setup as the baseline (fairness rule). Toggling baseline<->+C is one field.
 #
 # Offline-deployment notes (see RUNBOOK_C.md):
 #   - work_dir is set OUTSIDE the source tree (placeholder below) so runtime
