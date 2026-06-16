@@ -266,4 +266,10 @@ class DGFFuser(nn.Module):
         #   ASSUMPTION (A12): residual base is V_GB (lidar_proj) -> lidar-centric.
         x = self.norm1(v_hat + v_gb)
         out = self.norm2(self.ffn(x) + x)
-        return out
+        # Return a contiguous NCHW tensor (like ConvFuser's Conv2d output): the
+        # attention permute/reshape + mixed-memory-format residual can leave a
+        # non-standard stride / channels-last layout that Conv2d preserves all
+        # the way to TransFusionHead, where `heatmap.view(B, -1)` then fails
+        # ("view size is not compatible ... use .reshape"). Forcing contiguity
+        # here keeps the downstream contract identical to the baseline fuser.
+        return out.contiguous()
