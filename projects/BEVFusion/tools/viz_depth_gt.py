@@ -30,6 +30,13 @@ import matplotlib.pyplot as plt  # noqa: E402
 from mmengine.config import Config  # noqa: E402
 from mmengine.registry import init_default_scope  # noqa: E402
 
+# Make `import projects...` work when run as a bare script: a script run only
+# puts its own dir on sys.path[0] (not the repo root); dist_train.sh sets
+# PYTHONPATH but a direct `python ...` does not. Add the repo root (3 levels up).
+import sys  # noqa: E402
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
+
 import projects.BEVFusion.bevfusion  # noqa: F401,E402  (register modules)
 from mmdet3d.registry import DATASETS  # noqa: E402
 
