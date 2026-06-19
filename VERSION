@@ -1,1 +1,1 @@
-2026-06-13 m0_probe.py review fixes: official train_step/test_step entry, AMP via OptimWrapper, P2 log fallback, P6.3 lineno-based
+2026-06-13 docs: backfill repro baseline (NDS 0.696/mAP 0.665 @baseline1 epoch_19); fix max_epochs 6->20; lock teacher ckpt epoch_19

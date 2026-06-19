@@ -154,5 +154,5 @@ fi
 
 echo "[deploy] 完成。后续命令均从本目录出发，例如："
 echo "  bash scripts/m0_probe.sh --config projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py \\"
-echo "       --repro-ckpt work_dirs/<run>/epoch_6.pth --official-ckpt <path>/bevfusion_lidar-cam_..._nus-3d-5239b1af.pth \\"
+echo "       --repro-ckpt work_dirs/baseline1/epoch_19.pth --official-ckpt <path>/bevfusion_lidar-cam_..._nus-3d-5239b1af.pth \\"
 echo "       --work-dir work_dirs/<run>"

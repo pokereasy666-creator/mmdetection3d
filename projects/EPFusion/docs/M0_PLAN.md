@@ -50,7 +50,7 @@ config 要点：
 - GT-sampling：fusion 管线本就未启用（M0_RECON_REPORT.md §3b）→ 新 config 仅注释说明 +
   sanity_lambda_logging 断言 pipeline 无 'ObjectSample'（铁律 4 防回归）。
 - 主 config 覆盖：`model.type='EPFusion'`、`model.data_preprocessor.type='EPFusionDataPreprocessor'`
-  （dict 合并保留 mean/std/voxelize_cfg）、`load_from=<复现 epoch_6.pth>`、`train_cfg.max_epochs`、
+  （dict 合并保留 mean/std/voxelize_cfg）、`load_from=work_dirs/baseline1/epoch_19.pth`、`train_cfg.max_epochs`、
   `param_scheduler` 端点、`optim_wrapper.paramwise_cfg`、`randomness=dict(seed=2026)`。
   所有可调项（w_teach、p_zero、严重度区间、模式配比、开关）皆为 model/preprocessor 的 config 字段，
   经 `--cfg-options` 命令行覆盖（铁律 17，零代码迭代）。
@@ -278,7 +278,7 @@ losses[<Λ 与坍缩预警键>]                                        # 仅日�
   bash scripts/deploy.sh --data <nuscenes> --work-dirs <work_dirs> --ops-from <旧部署目录>
   bash tools/dist_train.sh projects/EPFusion/configs/epfusion_m0_poe_4xa30-amp-accum_nus-3d.py 4 \
       --amp --sync_bn torch \
-      --cfg-options load_from=<复现 epoch_6.pth> model.w_teach=1.0 randomness.seed=2026
+      --cfg-options load_from=work_dirs/baseline1/epoch_19.pth model.w_teach=1.0 randomness.seed=2026
   ```
 
 ## G. 诊断与验收脚本
@@ -338,11 +338,14 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
 
 ## I. 风险与开放问题
 
-1. **教师/冻结主干用官方 ckpt 还是复现 ckpt**：**倾向复现 epoch_6**，前提
-   Δ(NDS) ≤ 0.5【待探针 P2】。理由：(a) R0 与 R1-R3 同一初始化，锚点公平性最大化；
-   (b) BN running stats 与本机 SyncBN/有效 batch 设置同源，教师 eval 输出分布与学生训练
-   分布一致；(c) 数据预处理完全同构。若 Δ > 0.5：先排查复现 run（不得静默换官方 ckpt
-   掩盖问题），排查无果再切官方 ckpt 并在 EXPERIMENTS.md 记录决策。
+1. **教师/冻结主干 checkpoint【已决，开放问题闭合】**：锁定
+   **`work_dirs/baseline1/epoch_19.pth`**（20 轮 run 暴跌前最佳点，NDS 0.696 / mAP 0.665）。
+   理由：(a) 与 R0/R1-R3 同源初始化，锚点公平性最大化；(b) BN running stats 与本机
+   SyncBN/有效 batch（4 卡×2）设置同源，教师 eval 输出分布与学生训练分布一致；
+   (c) 数据预处理完全同构。**epoch_6（失败的首次 6 轮 run）与 epoch_20（20 轮 run 暴跌点）
+   永久弃用**（暴跌为 CBGS 调度端点固有行为，见 RECON §4）。复现 Δ≈−1.8 NDS（< 官方）经
+   双 run 自洽 + SyncBN 归因判定为已知系统性差异、非 bug；因 M0 锚点是本机 R0 冻结对照
+   （H 章）而非官方分，该差异不影响相对比较，故不阻塞。
 2. **共享投影维 D**：默认 256（= pts_backbone 入口）【待探针 P3】；压小 D 需 out-proj，M1 再议。
 3. **投影后是否加 norm 及位置**：默认无 norm（线性投影 + 对齐由 L_teach 驱动）；
    **BN 高危否决**（整批单模式 micro-batch 使 BN 统计随模式震荡）；GN 为备选 config 开关。

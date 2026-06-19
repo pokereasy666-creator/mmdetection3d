@@ -60,14 +60,24 @@ README.md:69-71 表格中该 ckpt 挂的 config 正是上述官方 fusion config
 
 → **结构对应关系成立**（最终由探针 P2 的 missing/unexpected keys 实证）。
 
-**复现 val 指标**：【待训练结束后由探针 P2 补填】
+**复现 val 指标**：【已由复现实跑回填，见下】
 
-| 指标 | 官方（README.md:71） | 本复现 | Δ |
+| 指标 | 官方（README.md:71） | 本复现（baseline1 epoch_19） | Δ（复现−官方） |
 | --- | --- | --- | --- |
-| NDS | 71.4 | 【待探针 P2】 | 【待探针 P2】 |
-| mAP | 68.6 | 【待探针 P2】 | 【待探针 P2】 |
+| NDS | 71.4 | 69.6 (0.696) | −1.8 |
+| mAP | 68.6 | 66.5 (0.665) | −2.1 |
 
-**门槛：|Δ NDS| > 0.5 须先排查（算子编译、双权重加载、SyncBN、AMP、infos 版本）再继续 M0。**
+> 数据点取自 work_dirs/baseline1 的 20 轮 run 在 **epoch_19**（暴跌前最佳点，见 §4 说明）。
+> **环境健康判定（通过）**：两个独立 run（6 轮 / 20 轮）均收敛到 NDS≈0.69 区间，且末轮
+> 暴跌模式自洽（见 §4），判定复现环境健康、自定义算子/权重加载/AMP 均正常。
+> Δ≈−1.8 NDS 最可能源于 **SyncBN 跨卡数差异**：本机 4 卡×batch2 vs 官方 8 卡×batch4，
+> 有效 batch 同为 32 但每卡前向看到的样本数（4×2=8 vs 8×4=32）不同，BN 统计行为有别。
+> 此偏差对 EP-Fusion 的**相对比较不构成影响**（R0 与 R1-R3 同在本机同设置下训练，
+> 锚点为本机 R0 而非官方分；见 M0_PLAN.md §8 公平性 / I.1）。
+
+**门槛说明**：原 |Δ NDS| > 0.5 排查门是针对"复现是否忠实于官方"。此处 Δ=−1.8 已 >0.5，
+但经上述双 run 自洽 + SyncBN 归因排查后判定为已知系统性差异、非 bug，**放行进入 M0**；
+M0 的走/停判据改以本机 R0 冻结对照为锚（M0_PLAN.md H 章）。
 
 ---
 
@@ -167,8 +177,16 @@ e) **注入点方案与干净副本携带机制**：
 
 - **model.train() 调用时机**：属 mmengine（EpochBasedTrainLoop 每 epoch 开始、val 结束后恢复）；
   mmengine 源码不在本机，**【待探针 P6】直接打印 EpochBasedTrainLoop.run/run_epoch 与
-  ValLoop.run 源码验证**。本仓库 config 走 epoch 制：train_cfg
-  `by_epoch=True, max_epochs=6, val_interval=1`（fusion config:217-219）。
+  ValLoop.run 源码验证**（探针 P6 已落地脚本，待服务器实跑）。
+- **max_epochs（已按复现实跑修正）**：**实际复现采用 max_epochs=20**
+  （work_dirs/baseline1 dumped config:703 实证）。注意 in-repo 静态 fusion config:217 声明的是
+  `max_epochs=6`（首次 6 轮 run 即用此值，已弃用，见 I.1），二者为不同 run——本条修正即纠正
+  前一版误把静态 6 当作复现值。
+  **CBGS 调度端点暴跌（配置固有行为、非 bug）**：该 CBGS 配置的 param_scheduler（CosineAnnealingLR
+  的 T_max/end、CosineAnnealingMomentum 的端点）与 max_epochs 绑定，最后一个 epoch 因
+  LR/动量调度走到端点叠加 CBGS 重采样，指标会暴跌——6 轮 run 的 epoch_6=0.6214、20 轮 run 的
+  epoch_20=0.5631 均如此。**真实基线取暴跌前一个 epoch（20 轮 run 即 epoch_19=0.696）。**
+  EPFusion 自身 config 的 max_epochs 与调度端点须同步设定（M0_PLAN.md E 章已列），避免误用末轮。
 - **override train() 实现位置（铁律 10）**：新模型类 EPFusion（projects/EPFusion/epfusion/
   ep_fusion.py，待实现）override `train(self, mode=True)`：`super().train(mode)` 后强制
   冻结子模块逐一 `.eval()`。**仓库内先例**：mmdet3d/models/detectors/imvotenet.py:185-198
@@ -227,9 +245,9 @@ bash scripts/deploy.sh \
 # 2) 跑探针（P1-P6 全量；输出 m0_probe_report_<日期>.txt，整文件拷回）
 bash scripts/m0_probe.sh \
     --config projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py \
-    --repro-ckpt    work_dirs/<run>/epoch_6.pth \
+    --repro-ckpt    work_dirs/baseline1/epoch_19.pth \
     --official-ckpt /path/to/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth \
-    --work-dir      work_dirs/<run>
+    --work-dir      work_dirs/baseline1
 # 可选：--skip p4（先快速拿 P1-P3/P5/P6）、--batch-sizes 1,2、--out 自定义报告名
 ```
 

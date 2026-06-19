@@ -32,7 +32,7 @@
   bash scripts/deploy.sh --data <nuscenes> --work-dirs <work_dirs> --ops-from <旧部署目录>
   bash scripts/m0_probe.sh \
       --config projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py \
-      --repro-ckpt work_dirs/<run>/epoch_6.pth \
+      --repro-ckpt work_dirs/baseline1/epoch_19.pth \
       --official-ckpt <path>/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth \
       --work-dir work_dirs/<run>
 """
@@ -669,7 +669,8 @@ def main():
     parser.add_argument('--config', default=DEFAULT_CONFIG,
                         help='复现 config 路径（默认 4xA30 config）')
     parser.add_argument('--repro-ckpt', default=None,
-                        help='复现 checkpoint（work_dirs/<run>/epoch_6.pth）')
+                        help='复现 checkpoint（默认建议 work_dirs/baseline1/epoch_19.pth；'
+                             'epoch_20 为 CBGS 调度暴跌点，勿用）')
     parser.add_argument('--official-ckpt', default=None,
                         help='官方 checkpoint（...5239b1af.pth）')
     parser.add_argument('--work-dir', default=None,
