@@ -76,19 +76,40 @@ def test_only_valid_pixels_are_supervised():
     assert torch.allclose(loss, loss2)
 
 
-# --------------------------- logits, not probs ------------------------------
-def test_bce_consumes_logits_not_probabilities():
+# ------------------- softmax + BCE (activation-matched) ---------------------
+def test_uses_softmax_then_bce():
+    # [module-A/fix-softmax-bce] loss must equal BCE on the softmax-over-bins
+    # probabilities (matching the forward LSS lift), NOT per-bin BCE-with-logits.
     img, feat, D = (2, 2), (1, 1), 4
     gt = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])  # depth 1.0 -> bin 0
     logits = torch.tensor([[[[3.0]], [[-1.0]], [[0.0]], [[2.0]]]])  # (1,4,1,1)
     loss = depth_sup.depth_bce_loss(logits, gt, img, feat, DBOUND, D, 1.0)
-    flat = logits.permute(0, 2, 3, 1).reshape(1, D)
+    flat = logits.permute(0, 2, 3, 1).reshape(1, D).float()
     tgt = torch.zeros(1, D)
     tgt[0, 0] = 1.0
+    ref_softmax = F.binary_cross_entropy(flat.softmax(1), tgt, reduction='mean')
+    assert torch.allclose(loss, ref_softmax)          # softmax(dim=bins) + BCE
     ref_logits = F.binary_cross_entropy_with_logits(flat, tgt, reduction='mean')
-    assert torch.allclose(loss, ref_logits)           # uses BCE-with-logits
-    wrong = F.binary_cross_entropy(flat.softmax(1), tgt, reduction='mean')
-    assert not torch.allclose(loss, wrong)            # NOT BCE on softmaxed probs
+    assert not torch.allclose(loss, ref_logits)       # NOT the old per-bin logits-BCE
+
+
+def test_dummy_forward_no_nan_and_softmax_dim():
+    # full-size dummy: (B, D=118, 32, 88) logits + sparse GT at 256x704 (ds=8)
+    B, D, fH, fW = 2, NUM_BINS, 32, 88
+    img, feat = (256, 704), (fH, fW)
+    torch.manual_seed(0)
+    logits = torch.randn(B, D, fH, fW, requires_grad=True)
+    gt = torch.zeros(B, 1, *img)
+    gt[0, 0, 10, 20] = 7.3       # -> a valid bin
+    gt[0, 0, 100, 300] = 25.0
+    gt[1, 0, 200, 600] = 41.1
+    loss = depth_sup.depth_bce_loss(logits, gt, img, feat, DBOUND, D, 0.5)
+    assert torch.isfinite(loss)                       # no NaN/Inf
+    loss.backward()                                   # differentiable
+    assert torch.isfinite(logits.grad).all()
+    # softmax is over the depth-bin dim (dim=1): per-pixel probs sum to 1
+    s = logits.detach().softmax(dim=1).sum(dim=1)     # (B, fH, fW)
+    assert torch.allclose(s, torch.ones_like(s), atol=1e-4)
 
 
 def test_weight_scales_loss():

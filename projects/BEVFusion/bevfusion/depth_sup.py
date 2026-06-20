@@ -68,11 +68,17 @@ def depth_bce_loss(
     num_bins: int,
     weight: float = 0.5,
 ) -> torch.Tensor:
-    """Masked per-bin BCE-with-logits depth loss (BEVDepth-style).
+    """Masked softmax + BCE depth loss, activation-matched to the forward LSS.
+
+    The logits are softmaxed over the depth-bin dim (dim=1) -- exactly the
+    activation ``DepthLSSTransform.get_cam_feats`` uses to lift features -- and
+    BCE is taken on those probabilities over the LiDAR-hit (valid) pixels.
+    (A previous version used per-bin BCE-with-logits, which mismatched the
+    forward softmax and diluted the supervision; see [module-A/fix-softmax-bce].)
 
     Args:
-        logits (Tensor): ``(M, D, fH, fW)`` PRE-softmax depth logits (BCE needs
-            logits, not the softmaxed probabilities).
+        logits (Tensor): ``(M, D, fH, fW)`` PRE-softmax depth logits; softmaxed
+            over the bin dim (dim=1) inside this function.
         gt_depth (Tensor): ``(M, 1, iH, iW)`` sparse LiDAR depth GT.
         image_size / feature_size / dbound / num_bins: see ``downsample_gt_depth``.
         weight (float): loss weight (``depth_loss_weight``).
@@ -83,12 +89,19 @@ def depth_bce_loss(
     """
     one_hot, valid = downsample_gt_depth(gt_depth, image_size, feature_size,
                                          dbound, num_bins)
-    # (M, D, fH, fW) -> (M, fH, fW, D), then keep only valid pixels (the mask)
-    pred = logits.permute(0, 2, 3, 1)[valid]   # (Nvalid, D)
-    tgt = one_hot[valid]                        # (Nvalid, D)
-    if pred.numel() == 0:
+    if not valid.any():
         # no LiDAR-hit pixel this batch -> zero loss, but keep the graph alive
         return logits.sum() * 0.0
-    # per-bin sigmoid BCE on logits (autocast-safe, numerically stable).
-    loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction='mean')
+    # Activation MUST match the forward LSS lift: DepthLSSTransform.get_cam_feats
+    # lifts features with `logits.softmax(dim=1)` over the depth-bin dim, so the
+    # supervision uses the SAME softmax distribution (coupled, normalised over
+    # bins) -- NOT independent per-bin sigmoids -- and BCE on those probs.
+    # F.binary_cross_entropy is NOT autocast-safe, so compute in fp32 with
+    # autocast disabled (also avoids fp16 log instability).
+    with torch.cuda.amp.autocast(enabled=False):
+        # softmax over dim=1 (the D depth bins, NOT a spatial dim), matching the
+        # forward lift; then (M,D,fH,fW) -> (M,fH,fW,D) and mask to valid pixels.
+        pred_prob = logits.float().softmax(dim=1).permute(0, 2, 3, 1)[valid]
+        tgt = one_hot[valid].float()
+        loss = F.binary_cross_entropy(pred_prob, tgt, reduction='mean')
     return weight * loss

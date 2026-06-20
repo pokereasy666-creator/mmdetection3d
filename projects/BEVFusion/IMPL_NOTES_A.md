@@ -50,8 +50,15 @@ Re-implements BEVDepth's `get_downsampled_gt_depth`, self-contained:
    range. **This is the sparse mask: no-point pixels are never supervised.**
 
 ## Depth loss (`depth_bce_loss`)
-- **Per-bin BCE-with-logits** on the PRE-softmax logits vs the one-hot bins,
-  computed **only over `valid` pixels** (`pred[valid]`, `tgt[valid]`).
+- **softmax over the depth-bin dim (dim=1) + BCE on probabilities**, computed
+  **only over `valid` pixels**. The softmax is the SAME activation the forward
+  LSS uses (`DepthLSSTransform.get_cam_feats`: `logits.softmax(dim=1)`), so the
+  supervision matches the forward lift. ([module-A/fix-softmax-bce] — previously
+  per-bin `binary_cross_entropy_with_logits`, which mismatched the forward
+  softmax and diluted the signal.)
+- `F.binary_cross_entropy` is NOT autocast-safe, so it runs inside
+  `torch.cuda.amp.autocast(enabled=False)` with fp32 inputs (`logits.float()`,
+  `one_hot.float()`) to avoid fp16 instability.
 - No valid pixel in a batch ⇒ returns a graph-connected `0` (no NaN).
 - Weighted by `depth_loss_weight` (config, default `0.5`).
 - Added to total loss as `losses['loss_depth']`.
@@ -59,7 +66,7 @@ Re-implements BEVDepth's `get_downsampled_gt_depth`, self-contained:
 ## ASSUMPTIONs (paper/instruction-unspecified → chosen value + reason)
 | ID | Decision | Reason |
 | --- | --- | --- |
-| **A-D1** | Loss = **BCE-with-logits per bin** on raw logits (`F.binary_cross_entropy_with_logits`). | Task: "对预测 logits 做 BCE"; `_with_logits` consumes logits directly (numerically stable, **autocast-safe** unlike plain `binary_cross_entropy`). BEVDepth's variant applies softmax then per-bin BCE; using logits+sigmoid-BCE is the closest stable form to the instruction. |
+| **A-D1** | Loss = **softmax over bins (dim=1) + `F.binary_cross_entropy` on probs**, in fp32 under `autocast(enabled=False)`. | [module-A/fix-softmax-bce] Activation matched to the forward LSS lift (`logits.softmax(dim=1)`); the earlier per-bin `binary_cross_entropy_with_logits` used independent sigmoids that mismatched the forward softmax and diluted supervision. `binary_cross_entropy` needs fp32 (not autocast-safe). |
 | **A-D2** | Bin index = `floor((d - d_min)/d_step)`, range `[0, D-1]` (clamped); `valid = d∈[d_min,d_max)`. | Simple, deterministic mapping over `dbound`; out-of-range LiDAR points are masked out (not clamped into edge bins for supervision). |
 | **A-D3** | Downsample = **min-pool of nearest non-zero** over the `8x8` patch. | BEVDepth convention; keeps the closest real depth, ignores empty pixels. |
 | **A-D4** | `depth_loss_weight` default **0.5**. | Task-specified default; a common BEVDepth-range weight. Tune down if `loss_depth` dwarfs `loss_bbox` (RUNBOOK §3). |
