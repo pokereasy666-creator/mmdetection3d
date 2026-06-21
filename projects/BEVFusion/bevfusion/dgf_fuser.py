@@ -284,9 +284,15 @@ class DGFFuser(nn.Module):
         #   ASSUMPTION (A12): residual base is V_GB (lidar_proj) -> lidar-centric.
         #   gamma (ReZero) gates the camera increment; out_relu aligns the output
         #   distribution with ConvFuser (non-negative).
+        # Intermediates are NAMED (not re-computed) so the DGF_DEBUG block below
+        # can print per-step stats WITHOUT re-calling norm1/norm2/ffn. Re-calling
+        # a BatchNorm in train mode would update its running_mean/var a second
+        # time and corrupt training; this naming is numerically identical to
+        # `out = self.out_relu(self.norm2(self.ffn(x) + x))`.
         x = self.norm1(v_gb + self.gamma * v_hat)
-        out = self.norm2(self.ffn(x) + x)
-        out = self.out_relu(out)
+        ffn_out = self.ffn(x)
+        pre_relu = self.norm2(ffn_out + x)
+        out = self.out_relu(pre_relu)
 
         # [dgf-debug] env-guarded diagnostics (set DGF_DEBUG=1). No effect on the
         # forward result, params, or normal/no-env runs. Reads:
@@ -324,6 +330,30 @@ class DGFFuser(nn.Module):
                             / (self.head_dim**0.5)).softmax(-1)
                     ent = -(attn * (attn + 1e-12).log()).sum(-1).mean().item()
                     maxp = attn.max(-1).values.mean().item()
+
+                    # [dgf-step-norms] per-step stats of the LiDAR-base path
+                    # (v_gb -> norm1 -> ffn -> norm2 -> out_relu). With the
+                    # zero-init out_proj, the camera increment v_hat=0 early on,
+                    # so an exploding/NaN output must arise in THIS path; these
+                    # prints localise which step (norm1/ffn/norm2) blows up.
+                    def _stat(name, t):
+                        tf = t.float()
+                        return (f'{name}: norm={tf.norm().item():.3f} '
+                                f'mean={tf.mean().item():.4f} '
+                                f'std={tf.std().item():.4f} '
+                                f'nan={bool(torch.isnan(tf).any())} '
+                                f'inf={bool(torch.isinf(tf).any())}')
+
+                    print(
+                        f'[DGF-DEBUG step-norms] call={self._dbg_calls} | '
+                        + ' | '.join([
+                            _stat('1.v_gb(in)', v_gb),
+                            _stat('2.x=norm1(v_gb+g*vhat)', x),
+                            _stat('3.ffn_out', ffn_out),
+                            _stat('4.pre_relu=norm2(ffn+x)', pre_relu),
+                            _stat('5.out=relu', out),
+                        ]),
+                        flush=True)
                     print(
                         f'[DGF-DEBUG] call={self._dbg_calls} '
                         f'|vhat(cam-incr)|={incr:.3f} '
