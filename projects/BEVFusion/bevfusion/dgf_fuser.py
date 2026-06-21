@@ -18,6 +18,7 @@
 # Points the paper leaves unspecified are implemented with the values listed
 # in projects/BEVFusion/IMPL_NOTES_C.md and tagged `ASSUMPTION (A#)` below.
 import math
+import os
 from contextlib import nullcontext
 from typing import List, Optional
 
@@ -203,6 +204,7 @@ class DGFFuser(nn.Module):
         self._pe = None
         self._de = None
         self._cached_hw = None
+        self._dbg_calls = 0  # [dgf-debug] forward counter for env-guarded prints
 
     def _get_pe_de(self, H, W, device, dtype):
         if (self._cached_hw != (H, W) or self._pe is None
@@ -266,6 +268,52 @@ class DGFFuser(nn.Module):
         #   ASSUMPTION (A12): residual base is V_GB (lidar_proj) -> lidar-centric.
         x = self.norm1(v_hat + v_gb)
         out = self.norm2(self.ffn(x) + x)
+
+        # [dgf-debug] env-guarded diagnostics (set DGF_DEBUG=1). No effect on the
+        # forward result, params, or normal/no-env runs. Reads:
+        #   ratio = |v_hat| / |v_gb| << 0.1  -> camera increment collapsed (#1)
+        #   attn_entropy << uniform / max_prob -> 1 -> attention collapse (#1c)
+        #   out min<0 & mean~0 -> distribution differs from ConvFuser's ReLU>=0 (#2)
+        if os.environ.get('DGF_DEBUG') == '1':
+            self._dbg_calls += 1
+            every = int(os.environ.get('DGF_DEBUG_EVERY', '50'))
+            rank0 = (not torch.distributed.is_available()
+                     or not torch.distributed.is_initialized()
+                     or torch.distributed.get_rank() == 0)
+            if rank0 and self._dbg_calls == 1:
+                print(
+                    '[DGF-DEBUG] sdpa '
+                    f'flash={torch.backends.cuda.flash_sdp_enabled()} '
+                    f'mem_efficient={torch.backends.cuda.mem_efficient_sdp_enabled()} '
+                    f'math={torch.backends.cuda.math_sdp_enabled()}',
+                    flush=True)
+            if rank0 and self._dbg_calls % every == 1:
+                with torch.no_grad():
+                    base = v_gb.norm().item()
+                    incr = v_hat.norm().item()
+
+                    def _th(t):
+                        return t.reshape(B, self.num_heads, self.head_dim,
+                                         H * W).permute(0, 1, 3, 2)
+
+                    qh, kh = _th(q.float()), _th(k.float())
+                    s = min(64, H * W)
+                    idx = torch.randperm(H * W, device=q.device)[:s]
+                    attn = ((qh[:, :, idx, :] @ kh.transpose(-2, -1))
+                            / (self.head_dim**0.5)).softmax(-1)
+                    ent = -(attn * (attn + 1e-12).log()).sum(-1).mean().item()
+                    maxp = attn.max(-1).values.mean().item()
+                    print(
+                        f'[DGF-DEBUG] call={self._dbg_calls} '
+                        f'|vhat(cam-incr)|={incr:.3f} '
+                        f'|vgb(lidar-base)|={base:.3f} '
+                        f'ratio={incr / max(base, 1e-6):.4f} | '
+                        f'attn_entropy={ent:.3f} (uniform={math.log(H * W):.3f}) '
+                        f'max_prob={maxp:.4f} | out mean={out.mean().item():.3f} '
+                        f'std={out.std().item():.3f} min={out.min().item():.3f} '
+                        f'norm={out.norm().item():.3f}',
+                        flush=True)
+
         # Return a contiguous NCHW tensor (like ConvFuser's Conv2d output): the
         # attention permute/reshape + mixed-memory-format residual can leave a
         # non-standard stride / channels-last layout that Conv2d preserves all
