@@ -29,7 +29,8 @@ model = dict(
         # norm_cfg=dict(type='BN2d')  # default; -> SyncBN with --sync_bn torch.
         #   If small-batch loss is unstable, switch to:
         #   norm_cfg=dict(type='GN', num_groups=32)   # GroupNorm (batch-free)
-        # use_out_proj=False,         # default; set True to add W_O (A2b)
+        # [module-C/fix-residual-stability] out_proj(zero-init) + gamma(ReZero
+        # 0.05) + final ReLU are built-in (not config knobs).
     ))
 
 # Runtime products MUST live outside the (re-extracted) source tree.

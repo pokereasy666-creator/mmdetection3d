@@ -144,9 +144,13 @@ class DGFFuser(nn.Module):
             batch training is unstable (A8).
         ffn_channels (int | None): conv-FFN hidden channels. Default
             ``embed_dims`` (A9).
-        use_out_proj (bool): add a 1x1 output projection W_O after attention.
-            Default ``False`` (A2b).
         pe_temperature / depth_temperature (float): sin/cos frequency bases.
+
+    [module-C/fix-residual-stability] Residual stabilisation (no constructor
+    args): the camera increment passes a ZERO-initialised 1x1 ``out_proj`` and a
+    ReZero scalar ``gamma`` (init 0.05), and the final output passes ``ReLU``
+    (matching ConvFuser's non-negative output). So training starts as a
+    pure-LiDAR(-derived) path and grows the camera increment from ~0.
     """
 
     def __init__(self,
@@ -156,7 +160,6 @@ class DGFFuser(nn.Module):
                  num_heads: int = 8,
                  norm_cfg: Optional[dict] = None,
                  ffn_channels: Optional[int] = None,
-                 use_out_proj: bool = False,
                  pe_temperature: float = 10000.0,
                  depth_temperature: float = 10000.0) -> None:
         super().__init__()
@@ -183,9 +186,23 @@ class DGFFuser(nn.Module):
         # No separate per-head QKV linears.
         self.lidar_proj = nn.Conv2d(lidar_ch, embed_dims, kernel_size=1)
         self.img_proj = nn.Conv2d(img_ch, embed_dims, kernel_size=1)
-        # ASSUMPTION (A2b): optional output projection W_O, default off.
-        self.out_proj = nn.Conv2d(embed_dims, embed_dims,
-                                  kernel_size=1) if use_out_proj else None
+        # [module-C/fix-residual-stability] camera-increment output projection,
+        # ALWAYS on and ZERO-initialised -> v_hat = out_proj(attn) = 0 at step 0,
+        # so the fusion starts as a pure-LiDAR(-derived) path (no exploding
+        # camera increment). It still receives gradient (proportional to gamma
+        # != 0 below) and learns out of zero.
+        self.out_proj = nn.Conv2d(embed_dims, embed_dims, kernel_size=1)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        # ReZero-style learnable scale on the camera increment. Init 0.05
+        # (NONZERO on purpose): gamma=0 together with a zero-init out_proj would
+        # freeze the camera path (grad to gamma is proportional to v_hat=0, grad
+        # to out_proj is proportional to gamma=0). 0.05 keeps the increment
+        # small while letting both learn.
+        self.gamma = nn.Parameter(torch.full((1, ), 0.05))
+        # Final activation: match ConvFuser's Conv-BN-ReLU (non-negative) output
+        # distribution, removing the extreme negative values DGF produced.
+        self.out_relu = nn.ReLU(inplace=True)
 
         # --- Eq.(4) aggregation: two norms + conv-FFN ---
         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
@@ -260,20 +277,23 @@ class DGFFuser(nn.Module):
         k = i_gb + pe
         v = i_gb
         v_hat = self._cross_attention(q, k, v, B, H, W)  # V̂_GB
-        if self.out_proj is not None:
-            v_hat = self.out_proj(v_hat)
+        v_hat = self.out_proj(v_hat)  # zero-init -> 0 at step 0 (camera off)
 
-        # (5) DepthFusion Eq.(4): F_GB = N(FFN(N(V̂+V_GB)) + N(V̂+V_GB))
+        # (5) DepthFusion Eq.(4) + [module-C/fix-residual-stability]:
         #   ASSUMPTION (A10): aggregation in (B,C,H,W) layout (FFN = convs);
         #   ASSUMPTION (A12): residual base is V_GB (lidar_proj) -> lidar-centric.
-        x = self.norm1(v_hat + v_gb)
+        #   gamma (ReZero) gates the camera increment; out_relu aligns the output
+        #   distribution with ConvFuser (non-negative).
+        x = self.norm1(v_gb + self.gamma * v_hat)
         out = self.norm2(self.ffn(x) + x)
+        out = self.out_relu(out)
 
         # [dgf-debug] env-guarded diagnostics (set DGF_DEBUG=1). No effect on the
         # forward result, params, or normal/no-env runs. Reads:
-        #   ratio = |v_hat| / |v_gb| << 0.1  -> camera increment collapsed (#1)
+        #   eff_ratio = |gamma*v_hat| / |v_gb| -> effective camera vs lidar base
+        #     (was up to ~390 pre-fix; should now start ~0 and grow controlled)
         #   attn_entropy << uniform / max_prob -> 1 -> attention collapse (#1c)
-        #   out min<0 & mean~0 -> distribution differs from ConvFuser's ReLU>=0 (#2)
+        #   out min should now be >= 0 (out_relu) -> aligned with ConvFuser (#2)
         if os.environ.get('DGF_DEBUG') == '1':
             self._dbg_calls += 1
             every = int(os.environ.get('DGF_DEBUG_EVERY', '50'))
@@ -291,6 +311,7 @@ class DGFFuser(nn.Module):
                 with torch.no_grad():
                     base = v_gb.norm().item()
                     incr = v_hat.norm().item()
+                    g = float(self.gamma.detach())
 
                     def _th(t):
                         return t.reshape(B, self.num_heads, self.head_dim,
@@ -306,8 +327,9 @@ class DGFFuser(nn.Module):
                     print(
                         f'[DGF-DEBUG] call={self._dbg_calls} '
                         f'|vhat(cam-incr)|={incr:.3f} '
-                        f'|vgb(lidar-base)|={base:.3f} '
-                        f'ratio={incr / max(base, 1e-6):.4f} | '
+                        f'|vgb(lidar-base)|={base:.3f} gamma={g:.4f} '
+                        f'raw_ratio={incr / max(base, 1e-6):.4f} '
+                        f'eff_ratio={g * incr / max(base, 1e-6):.4f} | '
                         f'attn_entropy={ent:.3f} (uniform={math.log(H * W):.3f}) '
                         f'max_prob={maxp:.4f} | out mean={out.mean().item():.3f} '
                         f'std={out.std().item():.3f} min={out.min().item():.3f} '

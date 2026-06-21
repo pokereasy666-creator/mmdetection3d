@@ -23,9 +23,10 @@ inputs = [img_bev (B,80,H,W), lidar_bev (B,256,H,W)]        # baseline ConvFuser
  ├ D : sin/cos of dist-to-centre matrix (256,H,W), param-free   # ⊙ onto the query
  ├ cross-attention (heads=8, head_dim=32) via F.scaled_dot_product_attention
  │     q=(V_GB+P)⊙D , k=I_GB+P , v=I_GB  → V̂_GB (B,256,H,W)
- │     [optional W_O: Conv2d(256→256,1x1), default OFF]
- ├ x   = Norm1(V̂_GB + V_GB)
- └ out = Norm2(FFN(x) + x)             # FFN = Conv3x3→ReLU→Conv3x3 ;  out (B,256,H,W)
+ ├ V̂_GB = out_proj(V̂_GB)              # 1x1, ZERO-init -> 0 at step 0  [fix-residual-stability]
+ ├ x   = Norm1(V_GB + gamma * V̂_GB)    # gamma=ReZero scalar init 0.05  [fix-residual-stability]
+ ├ out = Norm2(FFN(x) + x)             # FFN = Conv3x3→ReLU→Conv3x3
+ └ out = ReLU(out)                     # non-negative, matches ConvFuser ; out (B,256,H,W)  [fix-residual-stability]
 ```
 P and D are built lazily from the actual (H,W), cached as **plain tensors** (not
 `nn.Parameter`, not buffers) so they never appear in `parameters()` or `state_dict`.
@@ -35,7 +36,9 @@ P and D are built lazily from the actual (H,W), cached as **plain tensors** (not
 | --- | --- | --- |
 | **A1** | `embed_dims = 256` | Paper uses C=128; we use 256 to match the baseline LiDAR-BEV / `pts_backbone(in_channels=256)` and **avoid an extra output projection**. |
 | **A2** | Channel-align 1×1 convs ARE the attention projections: `W_Q=lidar_proj`, `W_K=W_V=img_proj` (key & value share the img projection). No separate per-head QKV linears. | Eq.(3) writes the attention directly on `(V_GB+P)⊙D`, `I_GB+P`, `I_GB`; the per-modality C-dim projection is the only learnable projection the paper shows. |
-| **A2b** | Output projection `W_O` is **optional, default `use_out_proj=False`**. | Eq.(3) feeds V̂ straight to Eq.(4) with no W_O shown; kept configurable for flexibility (per review). |
+| **A2b** | Output projection `W_O` (`out_proj`, 1×1) is **always on and ZERO-initialised** (weight & bias = 0). | [module-C/fix-residual-stability] Makes the camera increment `V̂_GB = out_proj(attn) = 0` at step 0 → fusion starts as a pure-LiDAR(-derived) path, killing the camera-increment explosion (|v_hat| was up to ~390× |v_gb|). `out_proj` still gets gradient (∝ gamma≠0) and learns out of zero. (Replaces the earlier optional `use_out_proj`; arg removed.) |
+| **A2c** | **ReZero scalar `gamma`** on the camera increment: `Norm1(V_GB + gamma·V̂)`, `gamma` init **0.05 (nonzero)**. | [module-C/fix-residual-stability] Gates camera-increment magnitude. **NONZERO on purpose**: `gamma=0` *with* zero-init `out_proj` would freeze the camera path (∂L/∂gamma ∝ v_hat=0 and ∂L/∂out_proj ∝ gamma=0). 0.05 keeps the increment small while letting both learn. New param in state_dict (only under +C). |
+| **A2d** | **Final `ReLU`** after `Norm2`. | [module-C/fix-residual-stability] Matches ConvFuser's Conv-BN-**ReLU** non-negative output; removes the extreme negative values (e.g. −92) DGF produced that mismatched `pts_backbone`'s expected distribution. |
 | **A3** | `P` = parameter-free 2D sinusoidal PE (128 ch for y + 128 for x, temperature 1e4); added to query & key streams, **not** to value. | Paper says "positional encoding … added through element-wise addition" without details; value term in Eq.(3) is `I_GB` (no +P). |
 | **A4** | `D` = sin/cos embedding (temperature 1e4) of the per-cell Euclidean distance to the centre cell `(H//2,W//2)`; **distance in BEV-cell-index units**. | Eq.(1)/(2) + "apply sine and cosine to the depth matrix"; units unspecified → cell units (resolution-agnostic). |
 | **A5** | `num_heads = 8`, `head_dim = 32`. | Standard MHA; head_dim 32 satisfies flash-attention constraints. |

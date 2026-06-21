@@ -79,13 +79,20 @@ def test_resolution_agnostic():
     assert out2.shape == (1, 256, 20, 24)
 
 
-def test_use_out_proj_and_groupnorm():
+def test_residual_stabilization_init_and_groupnorm():
+    # [module-C/fix-residual-stability] out_proj is always-on + ZERO-init, gamma
+    # (ReZero) inits 0.05, and the output is non-negative (out_relu) like
+    # ConvFuser. Also exercises the configurable GroupNorm.
     fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
-                     use_out_proj=True,
                      norm_cfg=dict(type='GN', num_groups=32))
     assert fuser.out_proj is not None
+    assert float(fuser.out_proj.weight.abs().sum()) == 0.0   # zero-init weight
+    assert float(fuser.out_proj.bias.abs().sum()) == 0.0     # zero-init bias
+    assert torch.allclose(fuser.gamma.detach(),
+                          torch.tensor([0.05]))              # ReZero init 0.05
     out = fuser([torch.randn(1, 80, 16, 16), torch.randn(1, 256, 16, 16)])
     assert out.shape == (1, 256, 16, 16)
+    assert float(out.min()) >= 0.0   # out_relu -> non-negative, like ConvFuser
 
 
 def test_invalid_args():
