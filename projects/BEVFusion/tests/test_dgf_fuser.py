@@ -95,6 +95,21 @@ def test_residual_stabilization_init_and_groupnorm():
     assert float(out.min()) >= 0.0   # out_relu -> non-negative, like ConvFuser
 
 
+def test_default_norm_is_groupnorm():
+    # [module-C/bn-to-groupnorm] The default DGF norm is GroupNorm, NOT BN2d:
+    # BatchNorm renormalised the sparse, low-variance LiDAR feature (std~0.056)
+    # to ~1, amplifying the norm ~18x -> NaN gradients. GroupNorm is
+    # batch-independent and robust to sparse features.
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
+    assert isinstance(fuser.norm1, torch.nn.GroupNorm)
+    assert isinstance(fuser.norm2, torch.nn.GroupNorm)
+    assert fuser.norm1.num_groups == 32
+    assert fuser.norm1.num_channels == 256
+    # GroupNorm carries no BatchNorm running stats
+    assert not any('running_mean' in k or 'running_var' in k
+                   for k in fuser.state_dict())
+
+
 def test_invalid_args():
     with pytest.raises(AssertionError):
         DGFFuser(in_channels=[80, 256], out_channels=128, embed_dims=256)

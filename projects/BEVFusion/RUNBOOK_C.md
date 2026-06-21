@@ -99,10 +99,15 @@ DGF's full-resolution global attention is the main memory risk.
 3. **last resort, ask first**: downsample the BEV before DGF attention (deviates
    from the paper) — do NOT do this without approval.
 
-## 9. If small-batch loss is unstable / NaN
-Switch the DGF norm from BN2d to GroupNorm (batch-independent):
-`--cfg-options model.fusion_layer.norm_cfg.type=GN model.fusion_layer.norm_cfg.num_groups=32`
-(or edit the config's `norm_cfg`).
+## 9. DGF norm = GroupNorm (default; was the NaN root cause)
+The DGF norm is **GroupNorm by default** (`num_groups=32`), set in
+`DGFFuser.__init__` [module-C/bn-to-groupnorm]. BatchNorm2d was the NaN root
+cause: `norm1` runs on the sparse, low-variance `lidar_proj(lidar_bev)` output
+(std~0.056) and BN renormalises that std to ~1, amplifying the feature norm ~18×
+(229→~4218) → `grad_norm=NaN`, `loss_heatmap` explodes (diagnosed via the
+DGF_DEBUG step-norms). GroupNorm is batch-independent and unaffected by
+`--sync_bn torch`. To force BN back (not recommended):
+`--cfg-options model.fusion_layer.norm_cfg.type=BN2d`.
 
 ## 10. Hard offline rules (checklist)
 - [ ] No `wget` / `mim download` / online URL in any command or config.

@@ -26,9 +26,11 @@ model = dict(
         out_channels=256,        # == embed_dims; feeds pts_backbone(in=256)
         embed_dims=256,          # ASSUMPTION A1/A13 (paper uses 128)
         num_heads=8,             # head_dim = 32 (A5)
-        # norm_cfg=dict(type='BN2d')  # default; -> SyncBN with --sync_bn torch.
-        #   If small-batch loss is unstable, switch to:
-        #   norm_cfg=dict(type='GN', num_groups=32)   # GroupNorm (batch-free)
+        # norm_cfg default = dict(type='GN', num_groups=32) -> GroupNorm, set in
+        #   DGFFuser.__init__ [module-C/bn-to-groupnorm]. NOT BN2d: BatchNorm on
+        #   the sparse, low-variance LiDAR BEV amplifies the norm ~18x -> NaN.
+        #   GroupNorm is batch-free (unaffected by --sync_bn torch). To force BN
+        #   back: norm_cfg=dict(type='BN2d').
         # [module-C/fix-residual-stability] out_proj(zero-init) + gamma(ReZero
         # 0.05) + final ReLU are built-in (not config knobs).
     ))

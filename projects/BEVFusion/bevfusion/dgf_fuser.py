@@ -138,10 +138,13 @@ class DGFFuser(nn.Module):
             ASSUMPTION (A1): paper uses 128; we use 256 to match the baseline
             and avoid an extra output projection (A13).
         num_heads (int): attention heads. Default 8 -> head_dim 32 (A5).
-        norm_cfg (dict): normalization in Eq.(4). Default ``BN2d`` (becomes
-            SyncBN under ``--sync_bn torch``, consistent with ConvFuser/
-            baseline). Switch to ``dict(type='GN', num_groups=32)`` if small-
-            batch training is unstable (A8).
+        norm_cfg (dict): normalization in Eq.(4). Default
+            ``dict(type='GN', num_groups=32)`` -> GroupNorm (A8). NOT BN2d:
+            ``norm1`` sits on the sparse, low-variance ``lidar_proj`` output, and
+            BatchNorm renormalises std~0.056 to ~1, amplifying the norm ~18x
+            (229 -> ~4218) and producing NaN gradients. GroupNorm is
+            batch-independent (also unaffected by ``--sync_bn torch``). Override
+            with ``dict(type='BN2d')`` only if you specifically want BN back.
         ffn_channels (int | None): conv-FFN hidden channels. Default
             ``embed_dims`` (A9).
         pe_temperature / depth_temperature (float): sin/cos frequency bases.
@@ -178,7 +181,15 @@ class DGFFuser(nn.Module):
         self.pe_temperature = pe_temperature
         self.depth_temperature = depth_temperature
         if norm_cfg is None:
-            norm_cfg = dict(type='BN2d')  # A8
+            # A8: GroupNorm (NOT BatchNorm2d). norm1 sits on the sparse,
+            # low-variance lidar_proj(lidar_bev) output (norm~229, std~0.056,
+            # lots of zeros); BN's per-channel (x-mu)/sqrt(var+eps) renormalises
+            # that std to ~1, amplifying the feature norm ~18x (229 -> ~4218)
+            # and driving grad_norm to NaN (loss_heatmap explodes ~14 vs ~4).
+            # GroupNorm is batch-independent and does not blow up sparse
+            # low-variance features. 32 groups (8 ch/group) is the GroupNorm
+            # default for 256 channels.
+            norm_cfg = dict(type='GN', num_groups=32)  # A8
 
         # --- channel-align projections (DepthFusion Sec. III-B) ---
         # ASSUMPTION (A2): these 1x1 convs ARE the attention projections:
