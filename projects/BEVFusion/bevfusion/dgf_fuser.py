@@ -234,6 +234,19 @@ class DGFFuser(nn.Module):
         self._cached_hw = None
         self._dbg_calls = 0  # [dgf-debug] forward counter for env-guarded prints
 
+        # [dgf-anomaly-probe] TEMPORARY backward-NaN localiser (env-guarded).
+        # The DGF forward is finite (step-norms show no NaN/Inf) yet grad_norm is
+        # NaN -> the NaN is born in the BACKWARD pass (or downstream). Enabling
+        # autograd anomaly detection here (at model-build, before any forward)
+        # records forward metadata for the WHOLE model, so the first backward op
+        # producing NaN/Inf raises and prints the offending forward stack
+        # (DGF? pts_backbone? neck? TransFusionHead? loss?). Off by default
+        # (zero effect); slow when on. Remove once the culprit layer is found.
+        if os.environ.get('DGF_ANOMALY') == '1':
+            torch.autograd.set_detect_anomaly(True)
+            print('[DGF-ANOMALY] torch.autograd.set_detect_anomaly(True) ENABLED '
+                  '(slow; localisation only, remove after).', flush=True)
+
     def _get_pe_de(self, H, W, device, dtype):
         if (self._cached_hw != (H, W) or self._pe is None
                 or self._pe.device != device):
