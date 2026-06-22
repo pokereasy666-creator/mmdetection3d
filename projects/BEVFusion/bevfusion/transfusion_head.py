@@ -1,6 +1,5 @@
 # modify from https://github.com/mit-han-lab/bevfusion
 import copy
-import os  # [dgf-anomaly-probe] TEMPORARY: env-guarded ConvFuser stat print
 from typing import List, Tuple
 
 import numpy as np
@@ -40,17 +39,7 @@ class ConvFuser(nn.Sequential):
         )
 
     def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
-        out = super().forward(torch.cat(inputs, dim=1))
-        # [dgf-anomaly-probe] TEMPORARY env-guarded stat print so the baseline's
-        # ConvFuser output scale can be compared with DGFFuser's (set FUSE_DEBUG=1
-        # and run the BASELINE config for a few iters). Off by default -> the
-        # baseline path is byte-identical at runtime. Remove with the probe.
-        if os.environ.get('FUSE_DEBUG') == '1':
-            with torch.no_grad():
-                print(f'[CONVFUSER] out norm={out.norm().item():.1f} '
-                      f'mean={out.mean().item():.4f} std={out.std().item():.4f} '
-                      f'min={out.min().item():.3f}', flush=True)
-        return out
+        return super().forward(torch.cat(inputs, dim=1))
 
 
 @MODELS.register_module()
