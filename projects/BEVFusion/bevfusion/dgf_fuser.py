@@ -134,10 +134,15 @@ class DGFFuser(nn.Module):
             e.g. ``[80, 256]`` (mirrors the baseline ConvFuser interface).
         out_channels (int): output channels; must equal ``embed_dims`` (no
             output reshape), fed to ``pts_backbone`` (256).
-        embed_dims (int): common attention dim ``C``. Default 256.
-            ASSUMPTION (A1): paper uses 128; we use 256 to match the baseline
-            and avoid an extra output projection (A13).
+        embed_dims (int): aggregation + OUTPUT dim ``C`` (== out_channels).
+            Default 256 to match the baseline / pts_backbone (A1/A13).
         num_heads (int): attention heads. Default 8 -> head_dim 32 (A5).
+        attn_dim (int | None): ATTENTION internal width (QKV / SDPA / v_hat),
+            decoupled from ``embed_dims`` (A14). Default ``None`` -> ``embed_dims``
+            (byte-identical to the old path). Set e.g. 128 (with ``num_heads=4``
+            to keep head_dim 32) to roughly halve the global-attention matmul;
+            ``out_proj`` lifts the camera increment back to ``embed_dims`` and the
+            residual base / aggregation / output stay at ``embed_dims`` (256).
         norm_cfg (dict): normalization in Eq.(4). Default
             ``dict(type='GN', num_groups=32)`` -> GroupNorm (A8). NOT BN2d:
             ``norm1`` sits on the sparse, low-variance ``lidar_proj`` output, and
@@ -161,6 +166,7 @@ class DGFFuser(nn.Module):
                  out_channels: int = 256,
                  embed_dims: int = 256,
                  num_heads: int = 8,
+                 attn_dim: Optional[int] = None,
                  norm_cfg: Optional[dict] = None,
                  ffn_channels: Optional[int] = None,
                  pe_temperature: float = 10000.0,
@@ -169,15 +175,22 @@ class DGFFuser(nn.Module):
         assert len(in_channels) == 2, \
             'in_channels must be [img_bev_ch, lidar_bev_ch]'
         assert out_channels == embed_dims, \
-            'DGFFuser keeps out_channels == embed_dims (no output reshape)'
-        assert embed_dims % num_heads == 0, \
-            'embed_dims must be divisible by num_heads'
+            'DGFFuser keeps out_channels == embed_dims (aggregation/output dim)'
+        # [module-C/dgf-attn-dim] attn_dim decouples the ATTENTION internal width
+        # (QKV / SDPA / v_hat) from embed_dims (aggregation + output, which must
+        # stay 256 to feed pts_backbone). Default attn_dim = embed_dims -> the
+        # module is byte-identical to before. Set attn_dim < embed_dims (e.g. 128)
+        # to roughly halve the global-attention matmul cost.
+        attn_dim = attn_dim if attn_dim is not None else embed_dims
+        assert attn_dim % num_heads == 0, \
+            'attn_dim must be divisible by num_heads'
         img_ch, lidar_ch = in_channels
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.embed_dims = embed_dims
+        self.attn_dim = attn_dim
         self.num_heads = num_heads
-        self.head_dim = embed_dims // num_heads
+        self.head_dim = attn_dim // num_heads
         self.pe_temperature = pe_temperature
         self.depth_temperature = depth_temperature
         if norm_cfg is None:
@@ -195,14 +208,20 @@ class DGFFuser(nn.Module):
         # ASSUMPTION (A2): these 1x1 convs ARE the attention projections:
         #   W_Q = lidar_proj ; W_K = W_V = img_proj (key/value share img_proj).
         # No separate per-head QKV linears.
+        # lidar_proj output = V_GB = residual base; stays at embed_dims (256).
         self.lidar_proj = nn.Conv2d(lidar_ch, embed_dims, kernel_size=1)
-        self.img_proj = nn.Conv2d(img_ch, embed_dims, kernel_size=1)
+        # img_proj output = I_GB = key/value stream; at the (smaller) attn_dim.
+        self.img_proj = nn.Conv2d(img_ch, attn_dim, kernel_size=1)
+        # q_proj down-projects V_GB (embed_dims) to the query width (attn_dim).
+        # Identity when attn_dim == embed_dims -> byte-identical to the old path.
+        self.q_proj = (nn.Identity() if attn_dim == embed_dims else nn.Conv2d(
+            embed_dims, attn_dim, kernel_size=1))
         # [module-C/fix-residual-stability] camera-increment output projection,
         # ALWAYS on and ZERO-initialised -> v_hat = out_proj(attn) = 0 at step 0,
         # so the fusion starts as a pure-LiDAR(-derived) path (no exploding
         # camera increment). It still receives gradient (proportional to gamma
         # != 0 below) and learns out of zero.
-        self.out_proj = nn.Conv2d(embed_dims, embed_dims, kernel_size=1)
+        self.out_proj = nn.Conv2d(attn_dim, embed_dims, kernel_size=1)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
         # ReZero-style learnable scale on the camera increment. Init 0.05
@@ -240,9 +259,9 @@ class DGFFuser(nn.Module):
     def _get_pe_de(self, H, W, device, dtype):
         if (self._cached_hw != (H, W) or self._pe is None
                 or self._pe.device != device):
-            self._pe = build_pos_encoding(H, W, self.embed_dims, device,
+            self._pe = build_pos_encoding(H, W, self.attn_dim, device,
                                           self.pe_temperature)
-            self._de = build_depth_encoding(H, W, self.embed_dims, device,
+            self._de = build_depth_encoding(H, W, self.attn_dim, device,
                                             self.depth_temperature)
             self._cached_hw = (H, W)
             self._pe_builds += 1  # [dgf-perf] real (re)build counter
@@ -271,8 +290,8 @@ class DGFFuser(nn.Module):
         ctx = efficient_sdpa_ctx() if q.is_cuda else nullcontext()
         with ctx:
             out = F.scaled_dot_product_attention(qh, kh, vh)  # (B,heads,HW,hd)
-        # (B,heads,HW,hd) -> (B, C, H, W)
-        return out.permute(0, 1, 3, 2).reshape(B, self.embed_dims, H, W)
+        # (B,heads,HW,hd) -> (B, attn_dim, H, W)
+        return out.permute(0, 1, 3, 2).reshape(B, self.attn_dim, H, W)
 
     def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
         # `inputs` follows the baseline ConvFuser order: [img_bev, lidar_bev]
@@ -293,8 +312,10 @@ class DGFFuser(nn.Module):
         de = de.unsqueeze(0)               # (1,C,H,W)
 
         # (2)/(3) DepthFusion Eq.(3): depth-modulated cross-attention
-        #   query = (V_GB + P) ⊙ D ; key = I_GB + P ; value = I_GB
-        q = (v_gb + pe) * de
+        #   query = (q_proj(V_GB) + P) ⊙ D ; key = I_GB + P ; value = I_GB
+        #   q_proj down-projects V_GB (embed_dims) to attn_dim (Identity when
+        #   attn_dim == embed_dims); P/D and I_GB are all at attn_dim.
+        q = (self.q_proj(v_gb) + pe) * de
         k = i_gb + pe
         v = i_gb
         # [dgf-perf] env-guarded forward timing: attention vs the rest (aggregation).

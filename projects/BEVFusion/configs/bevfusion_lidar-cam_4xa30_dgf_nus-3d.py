@@ -24,8 +24,11 @@ model = dict(
         type='DGFFuser',
         in_channels=[80, 256],   # [img_bev_ch, lidar_bev_ch]
         out_channels=256,        # == embed_dims; feeds pts_backbone(in=256)
-        embed_dims=256,          # ASSUMPTION A1/A13 (paper uses 128)
-        num_heads=8,             # head_dim = 32 (A5)
+        embed_dims=256,          # aggregation/OUTPUT dim == out_channels (A1/A13)
+        attn_dim=128,            # [module-C/dgf-attn-dim] attention internal width
+                                 #   (QKV/SDPA), decoupled from output -> ~2x faster
+                                 #   attention; output stays 256 for pts_backbone.
+        num_heads=4,             # head_dim = attn_dim/num_heads = 32 (A5, flash-ok)
         # norm_cfg default = dict(type='GN', num_groups=32) -> GroupNorm, set in
         #   DGFFuser.__init__ [module-C/bn-to-groupnorm]. NOT BN2d: BatchNorm on
         #   the sparse, low-variance LiDAR BEV amplifies the norm ~18x -> NaN.

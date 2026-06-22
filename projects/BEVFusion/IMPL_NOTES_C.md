@@ -50,6 +50,7 @@ P and D are built lazily from the actual (H,W), cached as **plain tensors** (not
 | **A11** | Attention dropout = 0. | Unspecified; default off. |
 | **A12** | Residual base in Eq.(4) = `V_GB` (`lidar_proj`); output is lidar-centric, 256 ch. | Matches `V̂_GB + V_GB` in Eq.(4); 256 ch feeds `pts_backbone`. |
 | **A13** | Common dim 256 instead of paper's 128. | Same as A1 (only `d_model` differs from the paper). |
+| **A14** | `attn_dim` decouples the ATTENTION internal width (QKV/SDPA/v_hat) from `embed_dims` (aggregation+output, fixed 256). Default `None`→`embed_dims` (byte-identical). +C uses `attn_dim=128, num_heads=4` (head_dim 32). | [module-C/dgf-attn-dim] Training step was ~10× ConvFuser (3.0s vs 0.3s) — diagnosed (Round 13) to the single 32400-token global attention's fwd+bwd on the torch-2.0.1 SDPA kernel (not a loop / not D/P recompute, which are cached). Halving the attention width (`img_proj`/`q_proj`/`out_proj`/P/D at 128, softmax 4 vs 8 heads) ~halves that matmul while keeping the residual base / aggregation / output at 256 (pts_backbone needs 256) and preserving all residual-stability props (zero-init `out_proj` 128→256, gamma, out_relu). Partial speedup (~2×), not a return to baseline — the kernel cost itself remains. |
 
 ## SDPA backend — how to CONFIRM flash/mem-efficient is used (A7)
 The forward wraps the attention in `efficient_sdpa_ctx()` **only on CUDA**, which enables FLASH +
