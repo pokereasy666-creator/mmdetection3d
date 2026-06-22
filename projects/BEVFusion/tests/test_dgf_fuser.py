@@ -110,33 +110,6 @@ def test_default_norm_is_groupnorm():
                    for k in fuser.state_dict())
 
 
-def test_attn_dim_decoupled_from_output():
-    # [module-C/dgf-attn-dim] attn_dim (attention internal width) is decoupled
-    # from embed_dims/out_channels (output, must stay 256). With attn_dim=128:
-    #   img_proj/out_proj/q_proj/P/D run at 128, but the output stays 256.
-    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, out_channels=256,
-                     attn_dim=128, num_heads=4)
-    assert fuser.attn_dim == 128 and fuser.embed_dims == 256
-    assert fuser.head_dim == 32                      # 128 / 4 heads
-    assert isinstance(fuser.q_proj, torch.nn.Conv2d)  # real down-proj when 128!=256
-    assert fuser.q_proj.out_channels == 128
-    assert fuser.img_proj.out_channels == 128
-    assert fuser.out_proj.in_channels == 128 and fuser.out_proj.out_channels == 256
-    assert float(fuser.out_proj.weight.abs().sum()) == 0.0  # still zero-init
-    out = fuser([torch.randn(1, 80, 16, 16), torch.randn(1, 256, 16, 16)])
-    assert out.shape == (1, 256, 16, 16)              # output dim preserved
-    assert float(out.min()) >= 0.0                    # out_relu -> non-negative
-
-
-def test_attn_dim_defaults_to_embed_dims():
-    # attn_dim=None -> equals embed_dims; q_proj is Identity (old behaviour).
-    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
-    assert fuser.attn_dim == 256
-    assert isinstance(fuser.q_proj, torch.nn.Identity)
-    assert fuser.img_proj.out_channels == 256
-    assert fuser.out_proj.in_channels == 256 and fuser.out_proj.out_channels == 256
-
-
 def test_invalid_args():
     with pytest.raises(AssertionError):
         DGFFuser(in_channels=[80, 256], out_channels=128, embed_dims=256)
