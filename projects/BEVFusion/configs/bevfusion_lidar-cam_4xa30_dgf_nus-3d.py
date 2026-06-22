@@ -26,6 +26,9 @@ model = dict(
         out_channels=256,        # == embed_dims; feeds pts_backbone(in=256)
         embed_dims=256,          # ASSUMPTION A1/A13 (paper uses 128)
         num_heads=8,             # head_dim = 32 (A5)
+        attn_resolution=135,     # [module-C/dgf-attn-downsample] run attention on
+                                 #   a 135x135 BEV (180->135, N -1.78x => ~3.16x
+                                 #   cheaper attn fwd+bwd); LiDAR base/output 180.
         # norm_cfg default = dict(type='GN', num_groups=32) -> GroupNorm, set in
         #   DGFFuser.__init__ [module-C/bn-to-groupnorm]. NOT BN2d: BatchNorm on
         #   the sparse, low-variance LiDAR BEV amplifies the norm ~18x -> NaN.

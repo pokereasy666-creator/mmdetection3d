@@ -110,6 +110,30 @@ def test_default_norm_is_groupnorm():
                    for k in fuser.state_dict())
 
 
+def test_attn_resolution_downsamples_attention():
+    # [module-C/dgf-attn-downsample] with attn_resolution set, the attention runs
+    # on a downsampled grid but the output stays at the input resolution and
+    # non-negative; channels stay 256 (embed_dims/num_heads unchanged).
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
+                     attn_resolution=8)
+    assert fuser.attn_resolution == 8
+    assert fuser.head_dim == 32                       # 256 / 8 heads (unchanged)
+    out = fuser([torch.randn(1, 80, 16, 16), torch.randn(1, 256, 16, 16)])
+    assert out.shape == (1, 256, 16, 16)              # full-res output preserved
+    assert float(out.min()) >= 0.0                    # out_relu -> non-negative
+    # P/D were built on the 8x8 attention grid, not 16x16
+    assert fuser._cached_hw == (8, 8)
+
+
+def test_attn_resolution_none_is_full_res():
+    # attn_resolution=None (default) -> attention on the full grid (no pooling).
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
+    assert fuser.attn_resolution is None
+    out = fuser([torch.randn(1, 80, 16, 16), torch.randn(1, 256, 16, 16)])
+    assert out.shape == (1, 256, 16, 16)
+    assert fuser._cached_hw == (16, 16)               # built on full grid
+
+
 def test_invalid_args():
     with pytest.raises(AssertionError):
         DGFFuser(in_channels=[80, 256], out_channels=128, embed_dims=256)

@@ -138,6 +138,12 @@ class DGFFuser(nn.Module):
             ASSUMPTION (A1): paper uses 128; we use 256 to match the baseline
             and avoid an extra output projection (A13).
         num_heads (int): attention heads. Default 8 -> head_dim 32 (A5).
+        attn_resolution (int | None): if set, the global attention runs on a
+            downsampled ``attn_resolution`` x ``attn_resolution`` BEV (A14) and
+            the camera increment is bilinearly upsampled back; the LiDAR residual
+            base / aggregation / output stay full-res. Default ``None`` -> full
+            resolution (byte-identical). E.g. 135 (180->135) cuts N ~1.78x =>
+            ~3.16x cheaper attention fwd+bwd; lower values are faster but coarser.
         norm_cfg (dict): normalization in Eq.(4). Default
             ``dict(type='GN', num_groups=32)`` -> GroupNorm (A8). NOT BN2d:
             ``norm1`` sits on the sparse, low-variance ``lidar_proj`` output, and
@@ -161,6 +167,7 @@ class DGFFuser(nn.Module):
                  out_channels: int = 256,
                  embed_dims: int = 256,
                  num_heads: int = 8,
+                 attn_resolution: Optional[int] = None,
                  norm_cfg: Optional[dict] = None,
                  ffn_channels: Optional[int] = None,
                  pe_temperature: float = 10000.0,
@@ -178,6 +185,14 @@ class DGFFuser(nn.Module):
         self.embed_dims = embed_dims
         self.num_heads = num_heads
         self.head_dim = embed_dims // num_heads
+        # [module-C/dgf-attn-downsample] optional spatial downsampling of the
+        # attention grid: run the global cross-attention on an
+        # attn_resolution x attn_resolution BEV (cuts N -> N^2 fwd+bwd), then
+        # bilinearly upsample the camera increment back. None -> full resolution
+        # (byte-identical). The LiDAR residual base / output stay full-res.
+        assert attn_resolution is None or attn_resolution >= 1, \
+            'attn_resolution must be a positive int or None'
+        self.attn_resolution = attn_resolution
         self.pe_temperature = pe_temperature
         self.depth_temperature = depth_temperature
         if norm_cfg is None:
@@ -284,19 +299,34 @@ class DGFFuser(nn.Module):
         B, _, H, W = lidar_bev.shape
 
         # (1) channel alignment to the common dim C (DepthFusion Sec. III-B)
-        v_gb = self.lidar_proj(lidar_bev)   # V_GB (query stream), (B,C,H,W)
+        v_gb = self.lidar_proj(lidar_bev)   # V_GB residual base (FULL res), (B,C,H,W)
         i_gb = self.img_proj(img_bev)       # I_GB (key/value stream), (B,C,H,W)
 
-        # positional encoding P and depth encoding D (param-free)
-        pe, de = self._get_pe_de(H, W, lidar_bev.device, v_gb.dtype)
-        pe = pe.unsqueeze(0)                # (1,C,H,W)
-        de = de.unsqueeze(0)               # (1,C,H,W)
+        # [module-C/dgf-attn-downsample] run the global attention on a coarser
+        # (Hl,Wl) grid to cut N (=> N^2 attention fwd+bwd). The residual base
+        # v_gb stays FULL resolution; only the attention inputs are average-pooled,
+        # and the camera increment v_hat is bilinearly upsampled back before the
+        # residual add. attn_resolution=None (or >= H,W) -> full-res (no-op).
+        R = self.attn_resolution
+        if R is not None and (R < H or R < W):
+            Hl, Wl = min(R, H), min(R, W)
+            v_gb_a = F.adaptive_avg_pool2d(v_gb, (Hl, Wl))
+            i_gb_a = F.adaptive_avg_pool2d(i_gb, (Hl, Wl))
+            do_up = True
+        else:
+            Hl, Wl, v_gb_a, i_gb_a, do_up = H, W, v_gb, i_gb, False
+
+        # positional encoding P and depth encoding D (param-free), built at the
+        # attention grid (Hl, Wl)
+        pe, de = self._get_pe_de(Hl, Wl, lidar_bev.device, v_gb.dtype)
+        pe = pe.unsqueeze(0)                # (1,C,Hl,Wl)
+        de = de.unsqueeze(0)               # (1,C,Hl,Wl)
 
         # (2)/(3) DepthFusion Eq.(3): depth-modulated cross-attention
         #   query = (V_GB + P) ⊙ D ; key = I_GB + P ; value = I_GB
-        q = (v_gb + pe) * de
-        k = i_gb + pe
-        v = i_gb
+        q = (v_gb_a + pe) * de
+        k = i_gb_a + pe
+        v = i_gb_a
         # [dgf-perf] env-guarded forward timing: attention vs the rest (aggregation).
         # CUDA events measure the FORWARD only; the attention backward runs later in
         # loss.backward() and is inferred from the overall step-time delta.
@@ -305,10 +335,13 @@ class DGFFuser(nn.Module):
             _e0 = torch.cuda.Event(enable_timing=True)
             _e1 = torch.cuda.Event(enable_timing=True)
             _e0.record()
-        v_hat = self._cross_attention(q, k, v, B, H, W)  # V̂_GB
+        v_hat = self._cross_attention(q, k, v, B, Hl, Wl)  # V̂_GB at (Hl,Wl)
         if _perf:
             _e1.record()
         v_hat = self.out_proj(v_hat)  # zero-init -> 0 at step 0 (camera off)
+        if do_up:  # upsample the camera increment back to full res (zero stays 0)
+            v_hat = F.interpolate(v_hat, size=(H, W), mode='bilinear',
+                                  align_corners=False)
 
         # (5) DepthFusion Eq.(4) + [module-C/fix-residual-stability]:
         #   ASSUMPTION (A10): aggregation in (B,C,H,W) layout (FFN = convs);
@@ -365,13 +398,16 @@ class DGFFuser(nn.Module):
                     incr = v_hat.norm().item()
                     g = float(self.gamma.detach())
 
+                    # q/k live on the (Hl,Wl) attention grid, not (H,W)
+                    Nl = Hl * Wl
+
                     def _th(t):
                         return t.reshape(B, self.num_heads, self.head_dim,
-                                         H * W).permute(0, 1, 3, 2)
+                                         Nl).permute(0, 1, 3, 2)
 
                     qh, kh = _th(q.float()), _th(k.float())
-                    s = min(64, H * W)
-                    idx = torch.randperm(H * W, device=q.device)[:s]
+                    s = min(64, Nl)
+                    idx = torch.randperm(Nl, device=q.device)[:s]
                     attn = ((qh[:, :, idx, :] @ kh.transpose(-2, -1))
                             / (self.head_dim**0.5)).softmax(-1)
                     ent = -(attn * (attn + 1e-12).log()).sum(-1).mean().item()
@@ -406,7 +442,7 @@ class DGFFuser(nn.Module):
                         f'|vgb(lidar-base)|={base:.3f} gamma={g:.4f} '
                         f'raw_ratio={incr / max(base, 1e-6):.4f} '
                         f'eff_ratio={g * incr / max(base, 1e-6):.4f} | '
-                        f'attn_entropy={ent:.3f} (uniform={math.log(H * W):.3f}) '
+                        f'attn_entropy={ent:.3f} (uniform={math.log(Nl):.3f}) '
                         f'max_prob={maxp:.4f} | out mean={out.mean().item():.3f} '
                         f'std={out.std().item():.3f} min={out.min().item():.3f} '
                         f'norm={out.norm().item():.3f}',
