@@ -233,6 +233,9 @@ class DGFFuser(nn.Module):
         self._de = None
         self._cached_hw = None
         self._dbg_calls = 0  # [dgf-debug] forward counter for env-guarded prints
+        # [dgf-perf] env-guarded (DGF_PERF=1) counters/timers; default zero impact.
+        self._pe_builds = 0   # times P/D were actually (re)built -> proves cache
+        self._attn_calls = 0  # SDPA calls -> proves one attention per forward
 
     def _get_pe_de(self, H, W, device, dtype):
         if (self._cached_hw != (H, W) or self._pe is None
@@ -242,6 +245,11 @@ class DGFFuser(nn.Module):
             self._de = build_depth_encoding(H, W, self.embed_dims, device,
                                             self.depth_temperature)
             self._cached_hw = (H, W)
+            self._pe_builds += 1  # [dgf-perf] real (re)build counter
+            if os.environ.get('DGF_PERF') == '1':
+                print(f'[DGF-PERF] built P/D #{self._pe_builds} (H,W)=({H},{W}) '
+                      f'device={device} (should print ONCE for the whole run)',
+                      flush=True)
         return self._pe.to(dtype), self._de.to(dtype)
 
     def _cross_attention(self, q, k, v, B, H, W):
@@ -252,6 +260,8 @@ class DGFFuser(nn.Module):
         deviates from the paper's 1/sqrt(C) -- ASSUMPTION A6). On CUDA the call
         is wrapped to use the flash / mem-efficient backend only.
         """
+        self._attn_calls += 1  # [dgf-perf] proves one SDPA call per forward
+
         def to_heads(x):
             # (B,C,H,W) -> (B, heads, head_dim, H*W) -> (B, heads, H*W, head_dim)
             return x.reshape(B, self.num_heads, self.head_dim,
@@ -287,7 +297,17 @@ class DGFFuser(nn.Module):
         q = (v_gb + pe) * de
         k = i_gb + pe
         v = i_gb
+        # [dgf-perf] env-guarded forward timing: attention vs the rest (aggregation).
+        # CUDA events measure the FORWARD only; the attention backward runs later in
+        # loss.backward() and is inferred from the overall step-time delta.
+        _perf = os.environ.get('DGF_PERF') == '1' and q.is_cuda
+        if _perf:
+            _e0 = torch.cuda.Event(enable_timing=True)
+            _e1 = torch.cuda.Event(enable_timing=True)
+            _e0.record()
         v_hat = self._cross_attention(q, k, v, B, H, W)  # V̂_GB
+        if _perf:
+            _e1.record()
         v_hat = self.out_proj(v_hat)  # zero-init -> 0 at step 0 (camera off)
 
         # (5) DepthFusion Eq.(4) + [module-C/fix-residual-stability]:
@@ -304,6 +324,21 @@ class DGFFuser(nn.Module):
         ffn_out = self.ffn(x)
         pre_relu = self.norm2(ffn_out + x)
         out = self.out_relu(pre_relu)
+
+        if _perf:
+            _e2 = torch.cuda.Event(enable_timing=True)
+            _e2.record()
+            torch.cuda.synchronize()
+            _rank0 = (not torch.distributed.is_available()
+                      or not torch.distributed.is_initialized()
+                      or torch.distributed.get_rank() == 0)
+            _every = int(os.environ.get('DGF_PERF_EVERY', '50'))
+            if _rank0 and self._attn_calls % _every == 1:
+                print(
+                    f'[DGF-PERF] fwd attn={_e0.elapsed_time(_e1):.1f}ms '
+                    f'aggregation(out_proj+norm+ffn+relu)={_e1.elapsed_time(_e2):.1f}ms '
+                    f'| attn_calls={self._attn_calls} pe_builds={self._pe_builds}',
+                    flush=True)
 
         # [dgf-debug] env-guarded diagnostics (set DGF_DEBUG=1). No effect on the
         # forward result, params, or normal/no-env runs. Reads:
