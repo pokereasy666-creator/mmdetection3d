@@ -352,7 +352,13 @@ class DGFFuser(nn.Module):
         v_hat = self._cross_attention(q, k, v, B, Hl, Wl)  # V̂_GB at (Hl,Wl)
         if _perf:
             _e1.record()
-        v_hat = self.out_proj(v_hat)  # W_O (default init): camera live from step 0
+        # [dgf-debug/bug2-probe] name the pre-out_proj attention output (softmax·V)
+        # so the DGF_DEBUG block can read |attn_out| -- numerically identical to
+        # the previous `v_hat = self.out_proj(v_hat)` (pure renaming, no behavior
+        # change). `attn_out` is at the (Hl,Wl) attention grid (= full res when
+        # attn_resolution is None).
+        attn_out = v_hat
+        v_hat = self.out_proj(attn_out)  # W_O (default init): camera live from step 0
         if do_up:  # upsample the camera increment back to full res
             v_hat = F.interpolate(v_hat, size=(H, W), mode='bilinear',
                                   align_corners=False)
@@ -525,6 +531,56 @@ class DGFFuser(nn.Module):
                         f'bg|post-norm1|={bg_post:.3f} fg|post-norm1|={fg_post:.3f} '
                         f'contrast_pre(fg/bg)={c_pre:.3f} '
                         f'contrast_post(fg/bg)={c_post:.3f}',
+                        flush=True)
+
+                    # [bug2-probe] Stage-A localization of the |vhat|/|vgb|
+                    # 7-132x blow-up. Measures (does NOT fix) the three candidate
+                    # sources so the decision table can be applied:
+                    #   - |i_gb| vs |vgb| : is the image-BEV value already huge at
+                    #     DGF input? (|i_gb|>>|vgb| -> upstream view-transform)
+                    #   - max-cell|i_gb|  : a few huge image cells the attention
+                    #     could broadcast across all N BEV cells?
+                    #   - |attn_out|      : softmax·V BEFORE out_proj. If
+                    #     |attn_out|~=|vhat|>>|i_gb| -> amplification is INSIDE
+                    #     the attention ("已爆在 attention 内").
+                    #   - ||W_O||         : TRAINED out_proj weight norm (init
+                    #     argument can't rule out a grown W_O). >>O(1) -> out_proj.
+                    igb = i_gb.float()
+                    igb_norm = igb.norm().item()
+                    igb_maxcell = igb.norm(dim=1).max().item()
+                    attn_out_norm = attn_out.float().norm().item()
+                    wo_norm = self.out_proj.weight.float().norm().item()
+                    print(
+                        f'[DGF-DEBUG bug2] call={self._dbg_calls} '
+                        f'|i_gb(img-val)|={igb_norm:.3f} '
+                        f'max-cell|i_gb|={igb_maxcell:.3f} | '
+                        f'|attn_out(softmax.V,pre-Wo)|={attn_out_norm:.3f} '
+                        f'|vhat(post-Wo)|={incr:.3f} | '
+                        f'||W_O||={wo_norm:.4f} | '
+                        f'ref |vgb(lidar)|={base:.3f}',
+                        flush=True)
+
+                    # [bug1-preview] GN(v_gb) contrast look-ahead (nice-to-have,
+                    # zero footprint): manual GroupNorm (32 groups, weight=1/
+                    # bias=0, axis-only) on v_gb -> does GN preserve fg/bg
+                    # contrast (unlike per-cell LN, which forces it to 1.000)?
+                    # This previews BUG 1's fix WITHOUT changing the live norm1.
+                    G = 32
+                    vg = v_gb.float()
+                    Bv, Cv, Hv, Wv = vg.shape
+                    gg = vg.reshape(Bv, G, Cv // G, Hv, Wv)
+                    gmean = gg.mean(dim=(2, 3, 4), keepdim=True)
+                    gvar = gg.var(dim=(2, 3, 4), keepdim=True, unbiased=False)
+                    gn = ((gg - gmean) / (gvar + 1e-5).sqrt()).reshape(
+                        Bv, Cv, Hv, Wv)
+                    gn_c = gn.norm(dim=1)
+                    gn_bg, gn_fg = _mm(gn_c, empty), _mm(gn_c, ~empty)
+                    gn_contrast = gn_fg / max(gn_bg, 1e-6)
+                    print(
+                        f'[DGF-DEBUG bug1-preview gn(v_gb)] call={self._dbg_calls} '
+                        f'bg|gn|={gn_bg:.3f} fg|gn|={gn_fg:.3f} '
+                        f'contrast_gn(fg/bg)={gn_contrast:.3f} '
+                        f'(LN forces 1.000; GN should be >1)',
                         flush=True)
 
         # Return a contiguous NCHW tensor (like ConvFuser's Conv2d output): the
