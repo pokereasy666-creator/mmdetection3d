@@ -24,19 +24,34 @@ model = dict(
         type='DGFFuser',
         in_channels=[80, 256],   # [img_bev_ch, lidar_bev_ch]
         out_channels=256,        # == embed_dims; feeds pts_backbone(in=256)
-        embed_dims=256,          # ASSUMPTION A1/A13 (paper uses 128)
+        embed_dims=256,          # deliberate adaptation: paper uses C=128; we use
+                                 #   256 to match LiDAR BEV / pts_backbone (no extra
+                                 #   projection). 8 heads -> head_dim 32 -> 1/sqrt(32).
         num_heads=8,             # head_dim = 32 (A5)
-        attn_resolution=135,     # [module-C/dgf-attn-downsample] run attention on
-                                 #   a 135x135 BEV (180->135, N -1.78x => ~3.16x
-                                 #   cheaper attn fwd+bwd); LiDAR base/output 180.
-        # norm_cfg default = dict(type='GN', num_groups=32) -> GroupNorm, set in
-        #   DGFFuser.__init__ [module-C/bn-to-groupnorm]. NOT BN2d: BatchNorm on
-        #   the sparse, low-variance LiDAR BEV amplifies the norm ~18x -> NaN.
-        #   GroupNorm is batch-free (unaffected by --sync_bn torch). To force BN
-        #   back: norm_cfg=dict(type='BN2d').
-        # [module-C/fix-residual-stability] out_proj(zero-init) + gamma(ReZero
-        # 0.05) + final ReLU are built-in (not config knobs).
+        attn_resolution=None,    # FULL 180x180 attention (faithful, no downsample).
+                                 #   The avg-pool/interpolate knob stays dormant for
+                                 #   the later speed task; None = structural no-op.
+        # norm_cfg default = None -> channel-wise LayerNorm (LayerNorm2d): the
+        #   transformer Add&Norm, per-sample, no batch stats, no cross-GPU sync ->
+        #   removes the SyncBN+fp16 nan path. To experiment: norm_cfg=dict(
+        #   type='GN', num_groups=32) or dict(type='BN2d').
+        # Faithful aggregation: U=N(V̂+V_B), F=N(FFN(U)+U), added 1:1 (no gamma
+        # gate, no zero-init out_proj, no final ReLU). The camera is live from
+        # step 0; stability comes from LayerNorm, never from suppressing camera.
     ))
+
+# [module-C/dgf-stability] loss_scale = 64 is a STARTING point, not a fixed param.
+# The inherited baseline uses 512 (tuned for ConvFuser); the faithful DGF has the
+# camera fully active from step 0, so the grad-magnitude distribution differs. Rule
+# from the smoke run: if inf appears -> drop to 32; if healthy -> keep 64 (later
+# 64->128->...->512 is fair game once stable). accumulative_counts/clip_grad are
+# inherited from the baseline (effective batch 32, grad-clip max_norm 10). This is
+# a DGF-config-only override; the baseline config is untouched.
+optim_wrapper = dict(
+    type='AmpOptimWrapper',
+    loss_scale=64.0,
+    accumulative_counts=4,
+    clip_grad=dict(max_norm=10, norm_type=2))
 
 # Runtime products MUST live outside the (re-extracted) source tree.
 # <FILL_ME>: replace with a real absolute path on your server, e.g. /data/abl/dgf

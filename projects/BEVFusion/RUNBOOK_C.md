@@ -28,7 +28,9 @@ cd <repo-root>
 pytest projects/BEVFusion/tests/test_dgf_fuser.py -q
 ```
 Checks output shape, that D/P carry no trainable params, backward runs,
-resolution-agnostic, and the use_out_proj / GroupNorm options.
+resolution-agnostic, the faithful contract (no `gamma`, no `out_relu`, `out_proj`
+NOT zero-init, signed output), that the camera contributes, and that the default
+norm is `LayerNorm2d`. (Needs `pytest`; if unavailable, run the module directly.)
 
 ## 3. Baseline-untouched check (needs compiled ops; CPU is fine)
 ```bash
@@ -38,13 +40,15 @@ python tools/check_c_alloff.py
 Asserts baseline=ConvFuser, +C=DGFFuser, and that **only** `fusion_layer.*`
 keys change (every other parameter identical) ⇒ module C touches nothing else.
 
-## 4. Smoke test BEFORE the full run (catch OOM / NaN / bad ckpt-load early)
-Run a few dozen iters (or 1 epoch) and watch the log:
+## 4. Smoke test BEFORE the full run — FULL 180, with DGF diagnostics ON
+Run ~200–300 iters (don't run a full epoch — 180 is slow) with `DGF_DEBUG=1` and
+watch the `[DGF-DEBUG]` lines:
 ```bash
 LIDAR_CKPT=<LIDAR_CKPT_PATH>
 SWINT_CKPT=<SWINT_CKPT_PATH>
 CFG=projects/BEVFusion/configs/bevfusion_lidar-cam_4xa30_dgf_nus-3d.py
 
+DGF_DEBUG=1 DGF_DEBUG_EVERY=50 \
 bash tools/dist_train.sh ${CFG} 4 \
   --amp --sync_bn torch \
   --work-dir /data/abl/dgf_smoke \
@@ -53,13 +57,27 @@ bash tools/dist_train.sh ${CFG} 4 \
     load_from=${LIDAR_CKPT} \
     model.img_backbone.init_cfg.checkpoint=${SWINT_CKPT}
 ```
-Confirm in the log:
-- **weights loaded**: the `load_from` line + sensible `missing_keys` /
-  `unexpected_keys` (the new `fusion_layer.*` DGF weights are expected to be in
-  `missing_keys` w.r.t. the LiDAR-only checkpoint — that's normal, they train
-  from scratch);
-- **forward+backward OK**, loss is finite and **trends down**, **no NaN/Inf**;
-- **memory fits** (no CUDA OOM) — note the peak (step 6).
+Confirm in the log (the new `fusion_layer.*` DGF weights are expected in
+`missing_keys` w.r.t. the LiDAR-only ckpt — normal, they train from scratch).
+**Quantitative pass/fail gates** (RED = stop and diagnose, do NOT add suppression):
+- **No NaN/Inf** fwd+bwd: the `[DGF-NAN]` localizer must stay **silent**. If it
+  fires, it names the FIRST bad tensor (`q/k/v_hat/u/ffn_out/out`) or grad —
+  fix the cause. If overflow only (inf), drop `loss_scale 64 → 32` via
+  `--cfg-options optim_wrapper.loss_scale=32.0` and re-smoke. (64 is a starting
+  point; if healthy, keep it.)
+- **Attention not collapsed**: `[DGF-DEBUG] … attn_entropy …/ max_prob …` — RED if
+  `max_prob → ~1` or `entropy → ~0` (near one-hot).
+- **Camera contributes**: `rel_cam(||F-Flidar||/||Flidar||)` **stably > 0.05**.
+  RED if it sits at ~0.
+- **No camera gating**: structurally guaranteed (no `gamma`).
+- **LayerNorm-axis health** (`[DGF-DEBUG ln-sparse]`): note `empty_ratio`,
+  `bg|post-norm1|`, and `contrast_pre` vs `contrast_post`. If `contrast_post` is
+  much smaller than `contrast_pre` (LN compressed background contrast) or it
+  destabilises, apply the norm mitigation ladder (IMPL_NOTES_C A8): LN bias-0 →
+  `--cfg-options model.fusion_layer.norm_cfg.type=GN model.fusion_layer.norm_cfg.num_groups=32`.
+- **Memory fits** (no CUDA OOM at full 180) — note the peak (step 6).
+- **loss finite and trending down**; send the loss / grad_norm curves + the gate
+  table for sign-off BEFORE the long run.
 
 ## 5. Full +C training (same recipe as baseline; fairness rule)
 Drop `train_cfg.max_epochs=1` and point `--work-dir` at the real out-of-repo path:
@@ -99,15 +117,19 @@ DGF's full-resolution global attention is the main memory risk.
 3. **last resort, ask first**: downsample the BEV before DGF attention (deviates
    from the paper) — do NOT do this without approval.
 
-## 9. DGF norm = GroupNorm (default; was the NaN root cause)
-The DGF norm is **GroupNorm by default** (`num_groups=32`), set in
-`DGFFuser.__init__` [module-C/bn-to-groupnorm]. BatchNorm2d was the NaN root
-cause: `norm1` runs on the sparse, low-variance `lidar_proj(lidar_bev)` output
-(std~0.056) and BN renormalises that std to ~1, amplifying the feature norm ~18×
-(229→~4218) → `grad_norm=NaN`, `loss_heatmap` explodes (diagnosed via the
-DGF_DEBUG step-norms). GroupNorm is batch-independent and unaffected by
-`--sync_bn torch`. To force BN back (not recommended):
-`--cfg-options model.fusion_layer.norm_cfg.type=BN2d`.
+## 9. DGF norm = LayerNorm (default; faithful Add&Norm, kills the SyncBN nan)
+The DGF norm `N` is **channel-wise LayerNorm (`LayerNorm2d`) by default**, set in
+`DGFFuser.__init__` (A8). It is per-sample, has no batch running stats and needs
+no cross-GPU sync — removing the **SyncBN+fp16 nan** path (BN renormalised the
+sparse, low-variance `lidar_proj(lidar_bev)` std~0.056→1, ~18× norm blow-up →
+`grad_norm=NaN`). It also symmetrically bounds `V̂+V_B`, which is why the faithful
+module needs no `gamma` gate.
+**Known LN risk to watch in smoke** (see `[DGF-DEBUG ln-sparse]`, IMPL_NOTES_C A8):
+empty cells (~constant = `lidar_proj` bias) map to LN's affine `bias`, lifting
+background from ~0 to a nonzero constant — possibly compressing fg/bg contrast.
+If flagged, mitigation ladder: LN with bias-0 → GroupNorm
+(`--cfg-options model.fusion_layer.norm_cfg.type=GN model.fusion_layer.norm_cfg.num_groups=32`)
+→ full-sample LN. (BN can still be forced via `norm_cfg.type=BN2d` — not recommended.)
 
 ## 10. Hard offline rules (checklist)
 - [ ] No `wget` / `mim download` / online URL in any command or config.

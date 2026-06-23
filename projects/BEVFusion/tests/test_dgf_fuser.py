@@ -79,35 +79,52 @@ def test_resolution_agnostic():
     assert out2.shape == (1, 256, 20, 24)
 
 
-def test_residual_stabilization_init_and_groupnorm():
-    # [module-C/fix-residual-stability] out_proj is always-on + ZERO-init, gamma
-    # (ReZero) inits 0.05, and the output is non-negative (out_relu) like
-    # ConvFuser. Also exercises the configurable GroupNorm.
-    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
-                     norm_cfg=dict(type='GN', num_groups=32))
+def test_faithful_no_suppression_stack():
+    # Faithful DGF (DepthFusion Eq.4) has NO camera-suppression stack: no ReZero
+    # gamma, no zero-init out_proj, no final ReLU. out_proj is a normal W_O
+    # (default init -> nonzero), and the LayerNorm-ended output may be negative.
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
+    assert not hasattr(fuser, 'gamma')          # ReZero gate removed
+    assert not hasattr(fuser, 'out_relu')       # final ReLU removed
     assert fuser.out_proj is not None
-    assert float(fuser.out_proj.weight.abs().sum()) == 0.0   # zero-init weight
-    assert float(fuser.out_proj.bias.abs().sum()) == 0.0     # zero-init bias
-    assert torch.allclose(fuser.gamma.detach(),
-                          torch.tensor([0.05]))              # ReZero init 0.05
+    assert float(fuser.out_proj.weight.abs().sum()) > 0.0   # NOT zero-init
     out = fuser([torch.randn(1, 80, 16, 16), torch.randn(1, 256, 16, 16)])
     assert out.shape == (1, 256, 16, 16)
-    assert float(out.min()) >= 0.0   # out_relu -> non-negative, like ConvFuser
+    # faithful output is LayerNorm-ended -> signed (no out_relu clamp)
+    assert float(out.min()) < 0.0
 
 
-def test_default_norm_is_groupnorm():
-    # [module-C/bn-to-groupnorm] The default DGF norm is GroupNorm, NOT BN2d:
-    # BatchNorm renormalised the sparse, low-variance LiDAR feature (std~0.056)
-    # to ~1, amplifying the norm ~18x -> NaN gradients. GroupNorm is
-    # batch-independent and robust to sparse features.
+def test_camera_contributes():
+    # The camera branch must move the fused output (no suppression). Compare the
+    # real output F against the counterfactual v_hat=0 reference F_lidar; they
+    # must differ. (F_lidar is a yardstick, NOT a path the model uses.)
+    torch.manual_seed(0)
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8).eval()
+    img = torch.randn(1, 80, 16, 16)
+    lidar = torch.randn(1, 256, 16, 16)
+    with torch.no_grad():
+        out = fuser([img, lidar])
+        # zero the image stream -> camera increment goes to (near) zero
+        out_zero_cam = fuser([torch.zeros_like(img), lidar])
+    rel = (out - out_zero_cam).norm() / out_zero_cam.norm().clamp_min(1e-6)
+    assert float(rel) > 0.05   # camera meaningfully changes the output
+
+
+def test_default_norm_is_layernorm():
+    # Faithful default norm N = channel-wise LayerNorm (LayerNorm2d), NOT GN/BN.
+    # Per-sample, no batch running stats, no cross-GPU sync (removes the SyncBN
+    # fp16-nan path). GN/BN remain available as explicit overrides.
     fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
-    assert isinstance(fuser.norm1, torch.nn.GroupNorm)
-    assert isinstance(fuser.norm2, torch.nn.GroupNorm)
-    assert fuser.norm1.num_groups == 32
-    assert fuser.norm1.num_channels == 256
-    # GroupNorm carries no BatchNorm running stats
+    assert isinstance(fuser.norm1, dgf_fuser.LayerNorm2d)
+    assert isinstance(fuser.norm2, dgf_fuser.LayerNorm2d)
+    assert fuser.norm1.normalized_shape == (256, )
+    # no BatchNorm running stats anywhere
     assert not any('running_mean' in k or 'running_var' in k
                    for k in fuser.state_dict())
+    # explicit override still works
+    gn = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
+                  norm_cfg=dict(type='GN', num_groups=32))
+    assert isinstance(gn.norm1, torch.nn.GroupNorm)
 
 
 def test_attn_resolution_downsamples_attention():
@@ -120,7 +137,6 @@ def test_attn_resolution_downsamples_attention():
     assert fuser.head_dim == 32                       # 256 / 8 heads (unchanged)
     out = fuser([torch.randn(1, 80, 16, 16), torch.randn(1, 256, 16, 16)])
     assert out.shape == (1, 256, 16, 16)              # full-res output preserved
-    assert float(out.min()) >= 0.0                    # out_relu -> non-negative
     # P/D were built on the 8x8 attention grid, not 16x16
     assert fuser._cached_hw == (8, 8)
 

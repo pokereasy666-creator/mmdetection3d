@@ -120,6 +120,33 @@ def efficient_sdpa_ctx():
             enable_flash=True, enable_mem_efficient=True, enable_math=False)
 
 
+class LayerNorm2d(nn.LayerNorm):
+    """Transformer Add&Norm over the channel (token-feature) dim for NCHW.
+
+    DepthFusion Eq.(4) ``N`` is the transformer "Add & Norm" (LayerNorm). Here
+    each BEV cell is a token and its C-dim feature vector is normalised
+    independently: for every ``(b, h, w)`` location we normalise over ``C``.
+    This is **per-sample**, carries **no batch statistics** and needs **no
+    cross-GPU sync** -- it removes the SyncBN path that caused the fp16 nan at
+    full 180 (BN renormalised the sparse, low-variance LiDAR BEV std~0.056 -> 1,
+    a ~18x norm blow-up). It also symmetrically bounds ``V̂ + V_B``, which is
+    why the faithful module needs no camera gate (gamma).
+
+    KNOWN RISK (validated in smoke, not assumed away): on sparse LiDAR many
+    empty cells are ~constant vectors (the ``lidar_proj`` bias); LayerNorm maps
+    a constant vector to its affine ``bias``, i.e. it lifts empty background
+    from ~0 to a nonzero constant and can compress fg/bg contrast -- the LN
+    analogue of the BN blow-up. Mitigation ladder if smoke flags it: LN with
+    ``bias`` forced 0 -> GroupNorm -> full-sample LN (see IMPL_NOTES_C A8).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)  # (B,C,H,W) -> (B,H,W,C)
+        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias,
+                         self.eps)
+        return x.permute(0, 3, 1, 2)  # back to (B,C,H,W)
+
+
 @MODELS.register_module()
 class DGFFuser(nn.Module):
     """Depth-GFusion fuser — DepthFusion (arXiv:2505.07398) Sec. III-B.
@@ -144,22 +171,22 @@ class DGFFuser(nn.Module):
             base / aggregation / output stay full-res. Default ``None`` -> full
             resolution (byte-identical). E.g. 135 (180->135) cuts N ~1.78x =>
             ~3.16x cheaper attention fwd+bwd; lower values are faster but coarser.
-        norm_cfg (dict): normalization in Eq.(4). Default
-            ``dict(type='GN', num_groups=32)`` -> GroupNorm (A8). NOT BN2d:
-            ``norm1`` sits on the sparse, low-variance ``lidar_proj`` output, and
-            BatchNorm renormalises std~0.056 to ~1, amplifying the norm ~18x
-            (229 -> ~4218) and producing NaN gradients. GroupNorm is
-            batch-independent (also unaffected by ``--sync_bn torch``). Override
-            with ``dict(type='BN2d')`` only if you specifically want BN back.
+        norm_cfg (dict | None): normalization layer ``N`` in Eq.(4). Default
+            ``None`` -> channel-wise ``LayerNorm2d`` (A8): the transformer
+            "Add & Norm", per-sample, no batch stats, no cross-GPU sync. This is
+            the faithful choice and removes the SyncBN+fp16 nan path. Pass an
+            explicit cfg (e.g. ``dict(type='GN', num_groups=32)`` or
+            ``dict(type='BN2d')``) to override for experiments.
         ffn_channels (int | None): conv-FFN hidden channels. Default
             ``embed_dims`` (A9).
         pe_temperature / depth_temperature (float): sin/cos frequency bases.
 
-    [module-C/fix-residual-stability] Residual stabilisation (no constructor
-    args): the camera increment passes a ZERO-initialised 1x1 ``out_proj`` and a
-    ReZero scalar ``gamma`` (init 0.05), and the final output passes ``ReLU``
-    (matching ConvFuser's non-negative output). So training starts as a
-    pure-LiDAR(-derived) path and grows the camera increment from ~0.
+    Faithful aggregation (DepthFusion Eq.4): ``U = N(V̂_GB + V_GB)`` then
+    ``F_GB = N(FFN(U) + U)`` -- the camera increment ``V̂_GB`` and the LiDAR
+    base ``V_GB`` are added **1:1** (no ReZero ``gamma``, no zero-init
+    ``out_proj``, no final ``ReLU``). ``LayerNorm`` symmetrically bounds the sum,
+    so the camera branch cannot explode and needs no gate; it participates from
+    step 0.
     """
 
     def __init__(self,
@@ -195,16 +222,7 @@ class DGFFuser(nn.Module):
         self.attn_resolution = attn_resolution
         self.pe_temperature = pe_temperature
         self.depth_temperature = depth_temperature
-        if norm_cfg is None:
-            # A8: GroupNorm (NOT BatchNorm2d). norm1 sits on the sparse,
-            # low-variance lidar_proj(lidar_bev) output (norm~229, std~0.056,
-            # lots of zeros); BN's per-channel (x-mu)/sqrt(var+eps) renormalises
-            # that std to ~1, amplifying the feature norm ~18x (229 -> ~4218)
-            # and driving grad_norm to NaN (loss_heatmap explodes ~14 vs ~4).
-            # GroupNorm is batch-independent and does not blow up sparse
-            # low-variance features. 32 groups (8 ch/group) is the GroupNorm
-            # default for 256 channels.
-            norm_cfg = dict(type='GN', num_groups=32)  # A8
+        self.norm_cfg = norm_cfg  # A8: None -> faithful channel-wise LayerNorm
 
         # --- channel-align projections (DepthFusion Sec. III-B) ---
         # ASSUMPTION (A2): these 1x1 convs ARE the attention projections:
@@ -212,27 +230,20 @@ class DGFFuser(nn.Module):
         # No separate per-head QKV linears.
         self.lidar_proj = nn.Conv2d(lidar_ch, embed_dims, kernel_size=1)
         self.img_proj = nn.Conv2d(img_ch, embed_dims, kernel_size=1)
-        # [module-C/fix-residual-stability] camera-increment output projection,
-        # ALWAYS on and ZERO-initialised -> v_hat = out_proj(attn) = 0 at step 0,
-        # so the fusion starts as a pure-LiDAR(-derived) path (no exploding
-        # camera increment). It still receives gradient (proportional to gamma
-        # != 0 below) and learns out of zero.
+        # A2b: multi-head attention output projection W_O (1x1). DEFAULT init
+        # (no zero-init): the camera increment is live from step 0 -- the module
+        # is faithful and does NOT suppress the camera branch.
         self.out_proj = nn.Conv2d(embed_dims, embed_dims, kernel_size=1)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
-        # ReZero-style learnable scale on the camera increment. Init 0.05
-        # (NONZERO on purpose): gamma=0 together with a zero-init out_proj would
-        # freeze the camera path (grad to gamma is proportional to v_hat=0, grad
-        # to out_proj is proportional to gamma=0). 0.05 keeps the increment
-        # small while letting both learn.
-        self.gamma = nn.Parameter(torch.full((1, ), 0.05))
-        # Final activation: match ConvFuser's Conv-BN-ReLU (non-negative) output
-        # distribution, removing the extreme negative values DGF produced.
-        self.out_relu = nn.ReLU(inplace=True)
 
         # --- Eq.(4) aggregation: two norms + conv-FFN ---
-        self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
-        self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
+        # A8: default N = channel-wise LayerNorm (LayerNorm2d). An explicit
+        # norm_cfg (GN/BN2d) still overrides via build_norm_layer.
+        if norm_cfg is None:
+            self.norm1 = LayerNorm2d(embed_dims)
+            self.norm2 = LayerNorm2d(embed_dims)
+        else:
+            self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
+            self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
         ffn_channels = ffn_channels or embed_dims  # A9
         self.ffn = nn.Sequential(
             nn.Conv2d(embed_dims, ffn_channels, kernel_size=3, padding=1),
@@ -248,6 +259,7 @@ class DGFFuser(nn.Module):
         self._de = None
         self._cached_hw = None
         self._dbg_calls = 0  # [dgf-debug] forward counter for env-guarded prints
+        self._nan_reported = False  # [dgf-nan] localizer fires once per run
         # [dgf-perf] env-guarded (DGF_PERF=1) counters/timers; default zero impact.
         self._pe_builds = 0   # times P/D were actually (re)built -> proves cache
         self._attn_calls = 0  # SDPA calls -> proves one attention per forward
@@ -271,9 +283,11 @@ class DGFFuser(nn.Module):
         """Multi-head cross-attention via SDPA (DepthFusion Eq.3).
 
         Inputs are (B, C, H, W); reshaped to (B, heads, H*W, head_dim) and fed
-        to ``scaled_dot_product_attention`` (scaling 1/sqrt(head_dim), which
-        deviates from the paper's 1/sqrt(C) -- ASSUMPTION A6). On CUDA the call
-        is wrapped to use the flash / mem-efficient backend only.
+        to ``scaled_dot_product_attention``. Head config (A5/A6): C=256 -> 8
+        heads -> head_dim=32 -> scaling 1/sqrt(32). Eq.(3) writes 1/sqrt(C);
+        in the multi-head realisation the "real head dim" (head_dim) is the
+        correct per-head scale, self-consistent at C=256. On CUDA the call is
+        wrapped to use the flash / mem-efficient backend only.
         """
         self._attn_calls += 1  # [dgf-perf] proves one SDPA call per forward
 
@@ -338,25 +352,21 @@ class DGFFuser(nn.Module):
         v_hat = self._cross_attention(q, k, v, B, Hl, Wl)  # V̂_GB at (Hl,Wl)
         if _perf:
             _e1.record()
-        v_hat = self.out_proj(v_hat)  # zero-init -> 0 at step 0 (camera off)
-        if do_up:  # upsample the camera increment back to full res (zero stays 0)
+        v_hat = self.out_proj(v_hat)  # W_O (default init): camera live from step 0
+        if do_up:  # upsample the camera increment back to full res
             v_hat = F.interpolate(v_hat, size=(H, W), mode='bilinear',
                                   align_corners=False)
 
-        # (5) DepthFusion Eq.(4) + [module-C/fix-residual-stability]:
-        #   ASSUMPTION (A10): aggregation in (B,C,H,W) layout (FFN = convs);
-        #   ASSUMPTION (A12): residual base is V_GB (lidar_proj) -> lidar-centric.
-        #   gamma (ReZero) gates the camera increment; out_relu aligns the output
-        #   distribution with ConvFuser (non-negative).
-        # Intermediates are NAMED (not re-computed) so the DGF_DEBUG block below
-        # can print per-step stats WITHOUT re-calling norm1/norm2/ffn. Re-calling
-        # a BatchNorm in train mode would update its running_mean/var a second
-        # time and corrupt training; this naming is numerically identical to
-        # `out = self.out_relu(self.norm2(self.ffn(x) + x))`.
-        x = self.norm1(v_gb + self.gamma * v_hat)
-        ffn_out = self.ffn(x)
-        pre_relu = self.norm2(ffn_out + x)
-        out = self.out_relu(pre_relu)
+        # (5) DepthFusion Eq.(4): U = N(V̂_GB + V_GB) ; F_GB = N(FFN(U) + U).
+        #   A10: aggregation in (B,C,H,W) layout (FFN = convs);
+        #   A12: residual base is V_GB (lidar_proj) -> lidar-centric, 256 ch.
+        # V̂_GB and V_GB are added 1:1 -- NO gamma gate, NO out_relu. LayerNorm
+        # (norm1/norm2) symmetrically bounds the sum so the camera cannot
+        # explode. Intermediates are NAMED (not re-computed) so the DGF_DEBUG
+        # block below reads per-step stats without re-calling norm1/norm2/ffn.
+        u = self.norm1(v_gb + v_hat)
+        ffn_out = self.ffn(u)
+        out = self.norm2(ffn_out + u)
 
         if _perf:
             _e2 = torch.cuda.Event(enable_timing=True)
@@ -369,16 +379,18 @@ class DGFFuser(nn.Module):
             if _rank0 and self._attn_calls % _every == 1:
                 print(
                     f'[DGF-PERF] fwd attn={_e0.elapsed_time(_e1):.1f}ms '
-                    f'aggregation(out_proj+norm+ffn+relu)={_e1.elapsed_time(_e2):.1f}ms '
+                    f'aggregation(out_proj+norm+ffn)={_e1.elapsed_time(_e2):.1f}ms '
                     f'| attn_calls={self._attn_calls} pe_builds={self._pe_builds}',
                     flush=True)
 
         # [dgf-debug] env-guarded diagnostics (set DGF_DEBUG=1). No effect on the
-        # forward result, params, or normal/no-env runs. Reads:
-        #   eff_ratio = |gamma*v_hat| / |v_gb| -> effective camera vs lidar base
-        #     (was up to ~390 pre-fix; should now start ~0 and grow controlled)
-        #   attn_entropy << uniform / max_prob -> 1 -> attention collapse (#1c)
-        #   out min should now be >= 0 (out_relu) -> aligned with ConvFuser (#2)
+        # forward result, params, or normal/no-env runs. Two parts:
+        #   (a) nan/inf LOCALIZER -- every step, cheap; reports the FIRST
+        #       non-finite tensor (fwd) and the FIRST non-finite GRAD (bwd, via
+        #       hooks). It only LOCALIZES -- no suppression.
+        #   (b) periodic STATS (every DGF_DEBUG_EVERY) -- attention collapse,
+        #       camera-contribution probe, and the LayerNorm sparse-background
+        #       observables.
         if os.environ.get('DGF_DEBUG') == '1':
             self._dbg_calls += 1
             every = int(os.environ.get('DGF_DEBUG_EVERY', '50'))
@@ -392,11 +404,42 @@ class DGFFuser(nn.Module):
                     f'mem_efficient={torch.backends.cuda.mem_efficient_sdp_enabled()} '
                     f'math={torch.backends.cuda.math_sdp_enabled()}',
                     flush=True)
+
+            # (a) nan/inf localizer. Scan fwd tensors in compute order; the
+            # first non-finite one is where it first breaks. q/k proxy the
+            # attention logits; v_hat = attention output; u/ffn_out/out =
+            # aggregation. Reported once per run (self._nan_reported) to avoid
+            # spam; backward hooks catch grad nan/inf in reverse order.
+            named = [('q', q), ('k', k), ('v_hat', v_hat),
+                     ('u', u), ('ffn_out', ffn_out), ('out', out)]
+            if not self._nan_reported:
+                for nm, t in named:
+                    if not torch.isfinite(t.detach()).all():
+                        self._nan_reported = True
+                        if rank0:
+                            print(f'[DGF-NAN] forward: FIRST non-finite tensor '
+                                  f'= {nm} @ call={self._dbg_calls} '
+                                  f'shape={tuple(t.shape)}', flush=True)
+                        break
+            if not self._nan_reported:
+                def _mk_hook(nm, call):
+                    def _hook(g):
+                        if (g is not None and not self._nan_reported
+                                and not torch.isfinite(g).all()):
+                            self._nan_reported = True
+                            if rank0:
+                                print(f'[DGF-NAN] backward: FIRST non-finite '
+                                      f'GRAD = {nm} @ call={call}', flush=True)
+                    return _hook
+                for nm, t in named:
+                    if t.requires_grad:
+                        t.register_hook(_mk_hook(nm, self._dbg_calls))
+
+            # (b) periodic stats.
             if rank0 and self._dbg_calls % every == 1:
                 with torch.no_grad():
                     base = v_gb.norm().item()
                     incr = v_hat.norm().item()
-                    g = float(self.gamma.detach())
 
                     # q/k live on the (Hl,Wl) attention grid, not (H,W)
                     Nl = Hl * Wl
@@ -413,11 +456,6 @@ class DGFFuser(nn.Module):
                     ent = -(attn * (attn + 1e-12).log()).sum(-1).mean().item()
                     maxp = attn.max(-1).values.mean().item()
 
-                    # [dgf-step-norms] per-step stats of the LiDAR-base path
-                    # (v_gb -> norm1 -> ffn -> norm2 -> out_relu). With the
-                    # zero-init out_proj, the camera increment v_hat=0 early on,
-                    # so an exploding/NaN output must arise in THIS path; these
-                    # prints localise which step (norm1/ffn/norm2) blows up.
                     def _stat(name, t):
                         tf = t.float()
                         return (f'{name}: norm={tf.norm().item():.3f} '
@@ -430,22 +468,63 @@ class DGFFuser(nn.Module):
                         f'[DGF-DEBUG step-norms] call={self._dbg_calls} | '
                         + ' | '.join([
                             _stat('1.v_gb(in)', v_gb),
-                            _stat('2.x=norm1(v_gb+g*vhat)', x),
+                            _stat('2.u=norm1(v_gb+vhat)', u),
                             _stat('3.ffn_out', ffn_out),
-                            _stat('4.pre_relu=norm2(ffn+x)', pre_relu),
-                            _stat('5.out=relu', out),
+                            _stat('4.out=norm2(ffn+u)', out),
                         ]),
                         flush=True)
+
+                    # Camera-contribution probe. F_lidar is a COUNTERFACTUAL
+                    # reference recomputed with v_hat:=0 -- it is NOT a path the
+                    # model uses and does NOT mean "camera off at step 0" (the
+                    # camera is live from step 1; gamma is gone). It is purely a
+                    # yardstick for how far the camera moves the fused output:
+                    # rel_cam = ||F - F_lidar|| / ||F_lidar||, want stably >0.05.
+                    # Skipped for BatchNorm overrides (re-calling BN in train
+                    # mode would double-update its running stats).
+                    rel_cam = float('nan')
+                    if not isinstance(self.norm1,
+                                      (nn.BatchNorm2d, nn.SyncBatchNorm)):
+                        u_l = self.norm1(v_gb)
+                        f_lidar = self.norm2(self.ffn(u_l) + u_l)
+                        rel_cam = ((out - f_lidar).norm()
+                                   / max(f_lidar.norm().item(), 1e-6)).item()
+
+                    # LayerNorm sparse-background observables (the LN-axis risk):
+                    # empty cells = raw LiDAR BEV cells with ~0 channel-vector.
+                    # Report their share, the post-norm magnitude THERE, and the
+                    # fg/bg contrast before (v_gb) vs after (u) norm1 -- a big
+                    # drop = LN compressed background contrast.
+                    cell = lidar_bev.float().norm(dim=1)          # (B,H,W)
+                    empty = cell < 1e-6
+                    er = empty.float().mean().item()
+                    vgb_c = v_gb.float().norm(dim=1)
+                    u_c = u.float().norm(dim=1)
+
+                    def _mm(t, m):
+                        return t[m].mean().item() if bool(m.any()) else float('nan')
+
+                    bg_pre, fg_pre = _mm(vgb_c, empty), _mm(vgb_c, ~empty)
+                    bg_post, fg_post = _mm(u_c, empty), _mm(u_c, ~empty)
+                    c_pre = fg_pre / max(bg_pre, 1e-6)
+                    c_post = fg_post / max(bg_post, 1e-6)
+
                     print(
                         f'[DGF-DEBUG] call={self._dbg_calls} '
-                        f'|vhat(cam-incr)|={incr:.3f} '
-                        f'|vgb(lidar-base)|={base:.3f} gamma={g:.4f} '
-                        f'raw_ratio={incr / max(base, 1e-6):.4f} '
-                        f'eff_ratio={g * incr / max(base, 1e-6):.4f} | '
+                        f'|vhat(cam)|={incr:.3f} |vgb(lidar)|={base:.3f} '
+                        f'raw_ratio={incr / max(base, 1e-6):.4f} | '
+                        f'rel_cam(||F-Flidar||/||Flidar||)={rel_cam:.4f} | '
                         f'attn_entropy={ent:.3f} (uniform={math.log(Nl):.3f}) '
-                        f'max_prob={maxp:.4f} | out mean={out.mean().item():.3f} '
-                        f'std={out.std().item():.3f} min={out.min().item():.3f} '
-                        f'norm={out.norm().item():.3f}',
+                        f'max_prob={maxp:.4f} | '
+                        f'out mean={out.mean().item():.3f} '
+                        f'std={out.std().item():.3f} norm={out.norm().item():.3f}',
+                        flush=True)
+                    print(
+                        f'[DGF-DEBUG ln-sparse] call={self._dbg_calls} '
+                        f'empty_ratio={er:.3f} '
+                        f'bg|post-norm1|={bg_post:.3f} fg|post-norm1|={fg_post:.3f} '
+                        f'contrast_pre(fg/bg)={c_pre:.3f} '
+                        f'contrast_post(fg/bg)={c_post:.3f}',
                         flush=True)
 
         # Return a contiguous NCHW tensor (like ConvFuser's Conv2d output): the

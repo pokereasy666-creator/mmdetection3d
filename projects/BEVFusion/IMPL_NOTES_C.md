@@ -14,43 +14,50 @@
   cross-attention. query=`(lidar+P)⊙D`, key=`img+P`, value=`img`.
 - **Eq.(4)** `F_GB = N( FFN(N(V̂_GB+V_GB)) + N(V̂_GB+V_GB) )` — residual conv-FFN aggregation.
 
-## Final structure of DGFFuser
+## Final structure of DGFFuser (FAITHFUL — no camera suppression)
 ```
 inputs = [img_bev (B,80,H,W), lidar_bev (B,256,H,W)]        # baseline ConvFuser order
  ├ lidar_proj : Conv2d(256→256,1x1)   = V_GB  (= W_Q)
  ├ img_proj   : Conv2d( 80→256,1x1)   = I_GB  (= W_K = W_V, shared)
  ├ P : 2D sine positional enc (256,H,W), param-free       # added to V_GB and I_GB (not value)
  ├ D : sin/cos of dist-to-centre matrix (256,H,W), param-free   # ⊙ onto the query
- ├ cross-attention (heads=8, head_dim=32) via F.scaled_dot_product_attention
- │     q=(V_GB+P)⊙D , k=I_GB+P , v=I_GB  → V̂_GB (B,256,H,W)
- ├ V̂_GB = out_proj(V̂_GB)              # 1x1, ZERO-init -> 0 at step 0  [fix-residual-stability]
- ├ x   = Norm1(V_GB + gamma * V̂_GB)    # gamma=ReZero scalar init 0.05  [fix-residual-stability]
- ├ out = Norm2(FFN(x) + x)             # FFN = Conv3x3→ReLU→Conv3x3
- └ out = ReLU(out)                     # non-negative, matches ConvFuser ; out (B,256,H,W)  [fix-residual-stability]
+ ├ cross-attention (heads=8, head_dim=32) via F.scaled_dot_product_attention, scale 1/√32
+ │     q=(V_GB+P)⊙D , k=I_GB+P , v=I_GB  → V̂_GB (B,256,H,W)        # FULL 180 (attn_resolution=None)
+ ├ V̂_GB = out_proj(V̂_GB)              # 1x1 W_O, DEFAULT init (camera live from step 0)
+ ├ U   = Norm1(V̂_GB + V_GB)            # added 1:1 — NO gamma gate
+ └ F   = Norm2(FFN(U) + U)             # FFN = Conv3x3→ReLU→Conv3x3 ; out (B,256,H,W), signed
 ```
-P and D are built lazily from the actual (H,W), cached as **plain tensors** (not
-`nn.Parameter`, not buffers) so they never appear in `parameters()` or `state_dict`.
+`Norm1`/`Norm2` `N` = **channel-wise LayerNorm (`LayerNorm2d`)**: per BEV cell over C, per-sample,
+no batch stats, no cross-GPU sync. No final ReLU (faithful output is LayerNorm-ended/signed).
+P and D are built lazily from the actual (H,W), cached as **plain tensors** (not `nn.Parameter`,
+not buffers) so they never appear in `parameters()` or `state_dict`.
+
+> **No official DepthFusion code exists** (web search 2026-06 returned only the paper + unrelated
+> repos), so Eq.(4)'s `N` follows the transformer "Add & Norm" reading → LayerNorm. The earlier
+> GroupNorm/ReZero/zero-init/ReLU were a stability workaround for a SyncBN+fp16 nan and a
+> camera-explosion; the faithful fix is LayerNorm (kills the SyncBN path AND symmetrically bounds
+> `V̂+V_B`, so no gate is needed). The camera is **never** suppressed.
 
 ## ASSUMPTIONs (paper-unspecified → chosen value + reason). Tagged in code.
 | ID | Decision | Reason |
 | --- | --- | --- |
 | **A1** | `embed_dims = 256` | Paper uses C=128; we use 256 to match the baseline LiDAR-BEV / `pts_backbone(in_channels=256)` and **avoid an extra output projection**. |
 | **A2** | Channel-align 1×1 convs ARE the attention projections: `W_Q=lidar_proj`, `W_K=W_V=img_proj` (key & value share the img projection). No separate per-head QKV linears. | Eq.(3) writes the attention directly on `(V_GB+P)⊙D`, `I_GB+P`, `I_GB`; the per-modality C-dim projection is the only learnable projection the paper shows. |
-| **A2b** | Output projection `W_O` (`out_proj`, 1×1) is **always on and ZERO-initialised** (weight & bias = 0). | [module-C/fix-residual-stability] Makes the camera increment `V̂_GB = out_proj(attn) = 0` at step 0 → fusion starts as a pure-LiDAR(-derived) path, killing the camera-increment explosion (|v_hat| was up to ~390× |v_gb|). `out_proj` still gets gradient (∝ gamma≠0) and learns out of zero. (Replaces the earlier optional `use_out_proj`; arg removed.) |
-| **A2c** | **ReZero scalar `gamma`** on the camera increment: `Norm1(V_GB + gamma·V̂)`, `gamma` init **0.05 (nonzero)**. | [module-C/fix-residual-stability] Gates camera-increment magnitude. **NONZERO on purpose**: `gamma=0` *with* zero-init `out_proj` would freeze the camera path (∂L/∂gamma ∝ v_hat=0 and ∂L/∂out_proj ∝ gamma=0). 0.05 keeps the increment small while letting both learn. New param in state_dict (only under +C). |
-| **A2d** | **Final `ReLU`** after `Norm2`. | [module-C/fix-residual-stability] Matches ConvFuser's Conv-BN-**ReLU** non-negative output; removes the extreme negative values (e.g. −92) DGF produced that mismatched `pts_backbone`'s expected distribution. |
+| **A2b** | Output projection `W_O` (`out_proj`, 1×1) is **always on, DEFAULT-initialised** (no zero-init). | Standard multi-head-attention output projection. Default init ⇒ the camera increment `V̂_GB` is **live from step 0** — the module is faithful and does **not** suppress the camera. (The earlier zero-init was a stability hack; removed.) |
+| **A2c** | ~~ReZero scalar `gamma`~~ — **REMOVED**. Aggregation is `Norm1(V̂_GB + V_GB)` (added **1:1**). | Faithful Eq.(4) has no gate. LayerNorm symmetrically bounds `V̂+V_B`, so the camera cannot explode — the gate is unnecessary, and a gate is exactly what collapsed the camera (γ→0.014). No `gamma` param. |
+| **A2d** | ~~Final `ReLU`~~ — **REMOVED**. Output is `Norm2(FFN(U)+U)` (LayerNorm-ended, **signed**). | Faithful Eq.(4) ends with `N` (LayerNorm), which is zero-mean/signed. `pts_backbone`'s first conv accepts signed input; matching ConvFuser's non-negativity was a cosmetic hack, not in the paper. |
 | **A3** | `P` = parameter-free 2D sinusoidal PE (128 ch for y + 128 for x, temperature 1e4); added to query & key streams, **not** to value. | Paper says "positional encoding … added through element-wise addition" without details; value term in Eq.(3) is `I_GB` (no +P). |
 | **A4** | `D` = sin/cos embedding (temperature 1e4) of the per-cell Euclidean distance to the centre cell `(H//2,W//2)`; **distance in BEV-cell-index units**. | Eq.(1)/(2) + "apply sine and cosine to the depth matrix"; units unspecified → cell units (resolution-agnostic). |
 | **A5** | `num_heads = 8`, `head_dim = 32`. | Standard MHA; head_dim 32 satisfies flash-attention constraints. |
-| **A6** | Attention scaling = **`1/√head_dim`** (SDPA default), **NOT** the paper's `1/√C`. | `F.scaled_dot_product_attention` applies `1/√head_dim`; per-head scaling is the conventional/correct choice. **This is an explicit deviation from Eq.(3)'s `1/√C`.** If exact paper parity is wanted, pass `scale=1/sqrt(embed_dims)` to SDPA. |
+| **A6** | Attention scaling = **`1/√head_dim` = `1/√32`** (SDPA default). | In the multi-head realisation the **real per-head dim** `head_dim=32` is the correct scale (each head attends in a 32-dim subspace). Eq.(3) writes `1/√C` for the single-stream form; with C=256 split into 8 heads, `1/√32` is the self-consistent per-head equivalent. This is the intended "real head dim" scaling, not a deviation. |
 | **A7** | SDPA forced to flash / mem-efficient backend, **math disabled**, on CUDA. | 180×180 = 32400-token global attention; math backend materialises ~32400² and OOMs 24GB. See "SDPA backend" below. |
-| **A8** | `norm_cfg` default `dict(type='GN', num_groups=32)` → **GroupNorm** (32 groups, 8 ch/group). Configurable. | **NOT BatchNorm2d** [module-C/bn-to-groupnorm]. `norm1` runs on the sparse, low-variance `lidar_proj(lidar_bev)` output (norm~229, std~0.056, lots of zeros); BN's per-channel `(x-μ)/√(σ²+eps)` renormalises std~0.056 to ~1, amplifying the feature norm ~18× (229→~4218) → `grad_norm=NaN`, `loss_heatmap` explodes (~14 vs ~4). Diagnosed via the DGF_DEBUG step-norms (Round 8). GroupNorm is batch-independent (no running stats; also unaffected by `--sync_bn torch`) and does not blow up sparse features; attention/transformer-style blocks normally use GN/LN, not BN. Override to `dict(type='BN2d')` only to restore BN. |
+| **A8** | `norm_cfg` default `None` → **channel-wise LayerNorm** (`LayerNorm2d`): per BEV cell over C, per-sample, no batch stats, no cross-GPU sync. Configurable (GN/BN via explicit cfg). | Faithful "Add & Norm". Removes the **SyncBN+fp16 nan** path (BN renormalised the sparse low-variance LiDAR BEV std~0.056→1, ~18× norm blow-up → `grad_norm=NaN`). LN is unaffected by `--sync_bn torch`. **KNOWN RISK** (gated on smoke, not assumed away): empty cells (~constant = `lidar_proj` bias) map to LN's affine `bias` → background lifted from ~0 to a nonzero constant, possibly compressing fg/bg contrast (LN analogue of the BN blow-up). Smoke observables: empty-cell ratio, post-norm magnitude in empty regions, fg/bg contrast pre vs post norm1 (`[DGF-DEBUG ln-sparse]`). **Mitigation ladder if flagged**: LN with `bias` forced 0 (constant cells→0) → `dict(type='GN', num_groups=32)` → full-sample LN. |
 | **A9** | FFN = `Conv3x3(256→256) → ReLU → Conv3x3(256→256)` (hidden ratio 1). Configurable via `ffn_channels`. | Paper: FFN "contains two convolution operations"; ratio/kernel unspecified → 3×3, ratio 1 (cheap, adds spatial mixing). |
 | **A10** | Eq.(4) aggregation runs in **spatial (B,C,H,W)** layout; attention runs in token layout. | FFN = convolutions ⇒ spatial layout for Eq.(4). |
 | **A11** | Attention dropout = 0. | Unspecified; default off. |
 | **A12** | Residual base in Eq.(4) = `V_GB` (`lidar_proj`); output is lidar-centric, 256 ch. | Matches `V̂_GB + V_GB` in Eq.(4); 256 ch feeds `pts_backbone`. |
 | **A13** | Common dim 256 instead of paper's 128. | Same as A1 (only `d_model` differs from the paper). |
-| **A14** | `attn_resolution` (default `None`=full-res) runs the global attention on a downsampled `R×R` BEV (+C: 135), then bilinearly upsamples the camera increment back; LiDAR residual base / aggregation / output stay full-res (180, 256ch). | [module-C/dgf-attn-downsample] DGF_PERF showed the +C step (~2.5s vs ConvFuser 0.3s) is dominated by the **attention backward** over N=32400 tokens on the torch-2.0.1 SDPA kernel (forward attn only ~43ms). Attention fwd+bwd ∝ N², so cutting spatial resolution is what helps the backward (channel reduction does not — and it introduced a NaN, reverted). `adaptive_avg_pool2d` down before attention, `F.interpolate(bilinear)` up after `out_proj` (kept zero-init at low-res, so the increment is still 0 at step 0). 135: N 32400→18225 (1.78×) → ~3.16× cheaper attention, step ~2.5s→~1.0s; lower `R` is faster/coarser. No new params (pool/interp are param-free); accuracy: the camera increment is at `R×R` then upsampled (LiDAR base full-res) — validate mAP/NDS. |
+| **A14** | `attn_resolution` default `None` = **FULL 180×180** attention (faithful, used by the +C config). The `R×R` downsample (`adaptive_avg_pool2d` → attention → `F.interpolate` up) is kept as a **dormant, off-by-default speed knob** for the later speed task only. | This task prioritises **faithful + stable**; speed is separate. Full res holds 32400 tokens via the forced flash/mem-efficient SDPA backend (math disabled). DGF_PERF showed the +C step is dominated by the attention **backward** ∝ N²; cutting `R` (e.g. 135: N 32400→18225, ~3.16× cheaper) is the lever for later — but it computes the camera increment at `R×R` then upsamples, a deviation from the paper, so it stays off here. No new params (pool/interp param-free). |
 
 ## SDPA backend — how to CONFIRM flash/mem-efficient is used (A7)
 The forward wraps the attention in `efficient_sdpa_ctx()` **only on CUDA**, which enables FLASH +
