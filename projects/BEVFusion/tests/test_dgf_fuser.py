@@ -82,7 +82,7 @@ def test_resolution_agnostic():
 def test_faithful_no_suppression_stack():
     # Faithful DGF (DepthFusion Eq.4) has NO camera-suppression stack: no ReZero
     # gamma, no zero-init out_proj, no final ReLU. out_proj is a normal W_O
-    # (default init -> nonzero), and the LayerNorm-ended output may be negative.
+    # (default init -> nonzero), and the norm-ended output may be negative.
     fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
     assert not hasattr(fuser, 'gamma')          # ReZero gate removed
     assert not hasattr(fuser, 'out_relu')       # final ReLU removed
@@ -90,7 +90,7 @@ def test_faithful_no_suppression_stack():
     assert float(fuser.out_proj.weight.abs().sum()) > 0.0   # NOT zero-init
     out = fuser([torch.randn(1, 80, 16, 16), torch.randn(1, 256, 16, 16)])
     assert out.shape == (1, 256, 16, 16)
-    # faithful output is LayerNorm-ended -> signed (no out_relu clamp)
+    # faithful output is GroupNorm-ended -> signed (no out_relu clamp)
     assert float(out.min()) < 0.0
 
 
@@ -110,21 +110,41 @@ def test_camera_contributes():
     assert float(rel) > 0.05   # camera meaningfully changes the output
 
 
-def test_default_norm_is_layernorm():
-    # Faithful default norm N = channel-wise LayerNorm (LayerNorm2d), NOT GN/BN.
-    # Per-sample, no batch running stats, no cross-GPU sync (removes the SyncBN
-    # fp16-nan path). GN/BN remain available as explicit overrides.
+def test_default_norm_is_groupnorm():
+    # Default norm N = GroupNorm(32) [A8], NOT channel-wise LayerNorm (rejected
+    # by the 850-step smoke: per-cell LN forces fg/bg contrast to 1.000). GN has
+    # no batch running stats / no cross-GPU sync. BN remains an explicit override.
     fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
-    assert isinstance(fuser.norm1, dgf_fuser.LayerNorm2d)
-    assert isinstance(fuser.norm2, dgf_fuser.LayerNorm2d)
-    assert fuser.norm1.normalized_shape == (256, )
+    assert isinstance(fuser.norm1, torch.nn.GroupNorm)
+    assert isinstance(fuser.norm2, torch.nn.GroupNorm)
+    assert fuser.norm1.num_groups == 32
+    assert fuser.norm1.num_channels == 256
     # no BatchNorm running stats anywhere
     assert not any('running_mean' in k or 'running_var' in k
                    for k in fuser.state_dict())
     # explicit override still works
-    gn = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
-                  norm_cfg=dict(type='GN', num_groups=32))
-    assert isinstance(gn.norm1, torch.nn.GroupNorm)
+    bn = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
+                  norm_cfg=dict(type='BN2d'))
+    assert isinstance(bn.norm1, torch.nn.BatchNorm2d)
+
+
+def test_groupnorm_preserves_contrast():
+    # BUG-1 regression guard: GroupNorm (stats shared across space) must NOT
+    # equalize a high-magnitude (foreground) cell with a low-magnitude (empty)
+    # cell -- that fg/bg contrast is exactly what per-cell LayerNorm destroyed
+    # (forcing every cell to norm sqrt(C)). Build a feature map with one bright
+    # column and one ~zero column; after GroupNorm the bright column's per-cell
+    # norm must stay clearly larger than the empty column's.
+    gn = torch.nn.GroupNorm(32, 256)
+    x = torch.zeros(1, 256, 8, 8)
+    x[:, :, :, 0] = 5.0          # bright (foreground) column
+    # column 1 stays ~0 (empty/background)
+    with torch.no_grad():
+        y = gn(x)
+    cell_norm = y.norm(dim=1)    # (1,8,8)
+    fg = cell_norm[:, :, 0].mean()
+    bg = cell_norm[:, :, 1].mean()
+    assert float(fg / bg.clamp_min(1e-6)) > 1.5   # contrast preserved (>1)
 
 
 def test_attn_resolution_downsamples_attention():

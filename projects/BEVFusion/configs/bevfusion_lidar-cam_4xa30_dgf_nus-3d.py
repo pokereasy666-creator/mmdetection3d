@@ -26,18 +26,20 @@ model = dict(
         out_channels=256,        # == embed_dims; feeds pts_backbone(in=256)
         embed_dims=256,          # deliberate adaptation: paper uses C=128; we use
                                  #   256 to match LiDAR BEV / pts_backbone (no extra
-                                 #   projection). 8 heads -> head_dim 32 -> 1/sqrt(32).
+                                 #   projection). 8 heads -> head_dim 32 (A5).
         num_heads=8,             # head_dim = 32 (A5)
         attn_resolution=None,    # FULL 180x180 attention (faithful, no downsample).
                                  #   The avg-pool/interpolate knob stays dormant for
                                  #   the later speed task; None = structural no-op.
-        # norm_cfg default = None -> channel-wise LayerNorm (LayerNorm2d): the
-        #   transformer Add&Norm, per-sample, no batch stats, no cross-GPU sync ->
-        #   removes the SyncBN+fp16 nan path. To experiment: norm_cfg=dict(
-        #   type='GN', num_groups=32) or dict(type='BN2d').
+        # norm_cfg default = None -> dict(type='GN', num_groups=32) = GroupNorm
+        #   (A8): a feature-map norm (stats shared across space) -> preserves the
+        #   fg/bg contrast the heatmap needs. Channel-wise LayerNorm was REJECTED
+        #   by the 850-step smoke (per-cell LN forces contrast=1.000, freezes the
+        #   heatmap). GN has no batch stats / no cross-GPU sync. Override: BN2d.
         # Faithful aggregation: U=N(V̂+V_B), F=N(FFN(U)+U), added 1:1 (no gamma
-        # gate, no zero-init out_proj, no final ReLU). The camera is live from
-        # step 0; stability comes from LayerNorm, never from suppressing camera.
+        # gate, no zero-init out_proj, no final ReLU). BUG-2: attention is
+        # scaled-cosine (q,k L2-norm per head + learnable bounded scale, A15) so
+        # V̂ stays ~ V_B scale -- stability is NEVER from suppressing the camera.
     ))
 
 # [module-C/dgf-stability] loss_scale = 64 is a STARTING point, not a fixed param.

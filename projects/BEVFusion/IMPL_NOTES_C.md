@@ -27,16 +27,19 @@ inputs = [img_bev (B,80,H,W), lidar_bev (B,256,H,W)]        # baseline ConvFuser
  ├ U   = Norm1(V̂_GB + V_GB)            # added 1:1 — NO gamma gate
  └ F   = Norm2(FFN(U) + U)             # FFN = Conv3x3→ReLU→Conv3x3 ; out (B,256,H,W), signed
 ```
-`Norm1`/`Norm2` `N` = **channel-wise LayerNorm (`LayerNorm2d`)**: per BEV cell over C, per-sample,
-no batch stats, no cross-GPU sync. No final ReLU (faithful output is LayerNorm-ended/signed).
-P and D are built lazily from the actual (H,W), cached as **plain tensors** (not `nn.Parameter`,
-not buffers) so they never appear in `parameters()` or `state_dict`.
+`Norm1`/`Norm2` `N` = **GroupNorm(32)** (feature-map norm, stats shared across space → **preserves
+fg/bg contrast**). No final ReLU (output is norm-ended/signed). P and D are built lazily from the
+actual (H,W), cached as **plain tensors** (not `nn.Parameter`, not buffers) so they never appear in
+`parameters()` or `state_dict`.
 
 > **No official DepthFusion code exists** (web search 2026-06 returned only the paper + unrelated
-> repos), so Eq.(4)'s `N` follows the transformer "Add & Norm" reading → LayerNorm. The earlier
-> GroupNorm/ReZero/zero-init/ReLU were a stability workaround for a SyncBN+fp16 nan and a
-> camera-explosion; the faithful fix is LayerNorm (kills the SyncBN path AND symmetrically bounds
-> `V̂+V_B`, so no gate is needed). The camera is **never** suppressed.
+> repos). Round-2 history of `N`: channel-wise **LayerNorm was tried and REJECTED** by the 850-step
+> smoke — per-cell LN normalises every BEV cell to norm √C, forcing fg/bg `contrast≡1.000` and
+> freezing `loss_heatmap` (the heatmap head localises via spatial saliency). Eq.(4)'s "Add & Norm"
+> in a **conv-on-feature-map** module (its FFN is 3×3 convs) is a **feature-map norm**, not per-token
+> LN. → **GroupNorm**: shares stats across space (keeps contrast) and, like LN, has no batch stats /
+> no cross-GPU sync (so it also avoids the SyncBN+fp16 nan). Separately, the `V̂` magnitude is bounded
+> by **scaled-cosine attention** (A15), not by any camera gate. The camera is **never** suppressed.
 
 ## ASSUMPTIONs (paper-unspecified → chosen value + reason). Tagged in code.
 | ID | Decision | Reason |
@@ -51,7 +54,7 @@ not buffers) so they never appear in `parameters()` or `state_dict`.
 | **A5** | `num_heads = 8`, `head_dim = 32`. | Standard MHA; head_dim 32 satisfies flash-attention constraints. |
 | **A6** | Attention scaling = **`1/√head_dim` = `1/√32`** (SDPA default). | In the multi-head realisation the **real per-head dim** `head_dim=32` is the correct scale (each head attends in a 32-dim subspace). Eq.(3) writes `1/√C` for the single-stream form; with C=256 split into 8 heads, `1/√32` is the self-consistent per-head equivalent. This is the intended "real head dim" scaling, not a deviation. |
 | **A7** | SDPA forced to flash / mem-efficient backend, **math disabled**, on CUDA. | 180×180 = 32400-token global attention; math backend materialises ~32400² and OOMs 24GB. See "SDPA backend" below. |
-| **A8** | `norm_cfg` default `None` → **channel-wise LayerNorm** (`LayerNorm2d`): per BEV cell over C, per-sample, no batch stats, no cross-GPU sync. Configurable (GN/BN via explicit cfg). | Faithful "Add & Norm". Removes the **SyncBN+fp16 nan** path (BN renormalised the sparse low-variance LiDAR BEV std~0.056→1, ~18× norm blow-up → `grad_norm=NaN`). LN is unaffected by `--sync_bn torch`. **KNOWN RISK** (gated on smoke, not assumed away): empty cells (~constant = `lidar_proj` bias) map to LN's affine `bias` → background lifted from ~0 to a nonzero constant, possibly compressing fg/bg contrast (LN analogue of the BN blow-up). Smoke observables: empty-cell ratio, post-norm magnitude in empty regions, fg/bg contrast pre vs post norm1 (`[DGF-DEBUG ln-sparse]`). **Mitigation ladder if flagged**: LN with `bias` forced 0 (constant cells→0) → `dict(type='GN', num_groups=32)` → full-sample LN. |
+| **A8** | `norm_cfg` default `None` → **GroupNorm** `dict(type='GN', num_groups=32)`: feature-map norm, stats shared across (group-channels × space). Configurable (BN2d via explicit cfg). | **Channel-wise LayerNorm was REJECTED** (850-step smoke): per-cell LN normalises each BEV cell to norm √C, forcing fg/bg `contrast_post≡1.000` (post-norm cell norms all = √256), `loss_heatmap` frozen 2.5–2.9, `matched_ious` 0.07. The heatmap localises via spatial magnitude → a per-cell-equalising norm destroys it. GN shares stats across space → **preserves contrast** (Stage-A `GN(v_gb)` preview: 2.4–7.2, all >1). Like LN, GN has no batch stats / no cross-GPU sync (avoids the SyncBN+fp16 nan; unaffected by `--sync_bn torch`). Honest: paper doesn't specify `N`; **GN is an adaptation** (a conv-FFN module ⇒ feature-map norm). Hard gate: measured full `contrast_post>1` (`[DGF-DEBUG contrast]`), else reject. |
 | **A9** | FFN = `Conv3x3(256→256) → ReLU → Conv3x3(256→256)` (hidden ratio 1). Configurable via `ffn_channels`. | Paper: FFN "contains two convolution operations"; ratio/kernel unspecified → 3×3, ratio 1 (cheap, adds spatial mixing). |
 | **A10** | Eq.(4) aggregation runs in **spatial (B,C,H,W)** layout; attention runs in token layout. | FFN = convolutions ⇒ spatial layout for Eq.(4). |
 | **A11** | Attention dropout = 0. | Unspecified; default off. |

@@ -120,33 +120,6 @@ def efficient_sdpa_ctx():
             enable_flash=True, enable_mem_efficient=True, enable_math=False)
 
 
-class LayerNorm2d(nn.LayerNorm):
-    """Transformer Add&Norm over the channel (token-feature) dim for NCHW.
-
-    DepthFusion Eq.(4) ``N`` is the transformer "Add & Norm" (LayerNorm). Here
-    each BEV cell is a token and its C-dim feature vector is normalised
-    independently: for every ``(b, h, w)`` location we normalise over ``C``.
-    This is **per-sample**, carries **no batch statistics** and needs **no
-    cross-GPU sync** -- it removes the SyncBN path that caused the fp16 nan at
-    full 180 (BN renormalised the sparse, low-variance LiDAR BEV std~0.056 -> 1,
-    a ~18x norm blow-up). It also symmetrically bounds ``V̂ + V_B``, which is
-    why the faithful module needs no camera gate (gamma).
-
-    KNOWN RISK (validated in smoke, not assumed away): on sparse LiDAR many
-    empty cells are ~constant vectors (the ``lidar_proj`` bias); LayerNorm maps
-    a constant vector to its affine ``bias``, i.e. it lifts empty background
-    from ~0 to a nonzero constant and can compress fg/bg contrast -- the LN
-    analogue of the BN blow-up. Mitigation ladder if smoke flags it: LN with
-    ``bias`` forced 0 -> GroupNorm -> full-sample LN (see IMPL_NOTES_C A8).
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.permute(0, 2, 3, 1)  # (B,C,H,W) -> (B,H,W,C)
-        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias,
-                         self.eps)
-        return x.permute(0, 3, 1, 2)  # back to (B,C,H,W)
-
-
 @MODELS.register_module()
 class DGFFuser(nn.Module):
     """Depth-GFusion fuser — DepthFusion (arXiv:2505.07398) Sec. III-B.
@@ -172,11 +145,14 @@ class DGFFuser(nn.Module):
             resolution (byte-identical). E.g. 135 (180->135) cuts N ~1.78x =>
             ~3.16x cheaper attention fwd+bwd; lower values are faster but coarser.
         norm_cfg (dict | None): normalization layer ``N`` in Eq.(4). Default
-            ``None`` -> channel-wise ``LayerNorm2d`` (A8): the transformer
-            "Add & Norm", per-sample, no batch stats, no cross-GPU sync. This is
-            the faithful choice and removes the SyncBN+fp16 nan path. Pass an
-            explicit cfg (e.g. ``dict(type='GN', num_groups=32)`` or
-            ``dict(type='BN2d')``) to override for experiments.
+            ``None`` -> ``dict(type='GN', num_groups=32)`` = **GroupNorm** (A8):
+            a feature-map norm whose stats are shared across space, so it
+            preserves the fg/bg magnitude contrast the detection heatmap needs.
+            Channel-wise LayerNorm was REJECTED by the 850-step smoke -- it
+            normalises each BEV cell to norm sqrt(C), forcing contrast to 1.000
+            and freezing loss_heatmap. GN, like LN, has no batch stats / no
+            cross-GPU sync (so it also avoids the SyncBN+fp16 nan). Pass an
+            explicit cfg (e.g. ``dict(type='BN2d')``) to override for experiments.
         ffn_channels (int | None): conv-FFN hidden channels. Default
             ``embed_dims`` (A9).
         pe_temperature / depth_temperature (float): sin/cos frequency bases.
@@ -184,9 +160,10 @@ class DGFFuser(nn.Module):
     Faithful aggregation (DepthFusion Eq.4): ``U = N(V̂_GB + V_GB)`` then
     ``F_GB = N(FFN(U) + U)`` -- the camera increment ``V̂_GB`` and the LiDAR
     base ``V_GB`` are added **1:1** (no ReZero ``gamma``, no zero-init
-    ``out_proj``, no final ``ReLU``). ``LayerNorm`` symmetrically bounds the sum,
-    so the camera branch cannot explode and needs no gate; it participates from
-    step 0.
+    ``out_proj``, no final ``ReLU``). The attention is **scaled-cosine** (q,k
+    L2-normalised per head, learnable bounded scale) so ``V̂_GB`` stays the same
+    order as ``V_GB`` and cannot broadcast-explode -- the camera branch needs no
+    gate and participates from step 0.
     """
 
     def __init__(self,
@@ -222,7 +199,13 @@ class DGFFuser(nn.Module):
         self.attn_resolution = attn_resolution
         self.pe_temperature = pe_temperature
         self.depth_temperature = depth_temperature
-        self.norm_cfg = norm_cfg  # A8: None -> faithful channel-wise LayerNorm
+        # A8: default N = GroupNorm (feature-map norm, stats shared across space
+        # -> preserves fg/bg contrast). NOT channel-wise LayerNorm (rejected by
+        # the 850-step smoke: per-cell LN forces contrast to 1.000 and freezes
+        # the heatmap). GN has no batch stats / no cross-GPU sync.
+        if norm_cfg is None:
+            norm_cfg = dict(type='GN', num_groups=32)
+        self.norm_cfg = norm_cfg
 
         # --- channel-align projections (DepthFusion Sec. III-B) ---
         # ASSUMPTION (A2): these 1x1 convs ARE the attention projections:
@@ -236,14 +219,10 @@ class DGFFuser(nn.Module):
         self.out_proj = nn.Conv2d(embed_dims, embed_dims, kernel_size=1)
 
         # --- Eq.(4) aggregation: two norms + conv-FFN ---
-        # A8: default N = channel-wise LayerNorm (LayerNorm2d). An explicit
-        # norm_cfg (GN/BN2d) still overrides via build_norm_layer.
-        if norm_cfg is None:
-            self.norm1 = LayerNorm2d(embed_dims)
-            self.norm2 = LayerNorm2d(embed_dims)
-        else:
-            self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
-            self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
+        # N built from norm_cfg (default GN, see above); GN/BN2d both go through
+        # build_norm_layer.
+        self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
+        self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
         ffn_channels = ffn_channels or embed_dims  # A9
         self.ffn = nn.Sequential(
             nn.Conv2d(embed_dims, ffn_channels, kernel_size=3, padding=1),
@@ -496,11 +475,12 @@ class DGFFuser(nn.Module):
                         rel_cam = ((out - f_lidar).norm()
                                    / max(f_lidar.norm().item(), 1e-6)).item()
 
-                    # LayerNorm sparse-background observables (the LN-axis risk):
-                    # empty cells = raw LiDAR BEV cells with ~0 channel-vector.
-                    # Report their share, the post-norm magnitude THERE, and the
-                    # fg/bg contrast before (v_gb) vs after (u) norm1 -- a big
-                    # drop = LN compressed background contrast.
+                    # JOINT contrast observable: empty cells = raw LiDAR BEV
+                    # cells with ~0 channel-vector. fg/bg contrast before (v_gb)
+                    # vs after (u=norm1, now GN) -- contrast_post is the JOINT
+                    # outcome (norm1=GN applied to v_gb+v_hat, so it reflects both
+                    # the GN axis AND whether BUG-2's v_hat is tamed). GATE:
+                    # contrast_post>1 (per-cell LN forced it to 1.000).
                     cell = lidar_bev.float().norm(dim=1)          # (B,H,W)
                     empty = cell < 1e-6
                     er = empty.float().mean().item()
@@ -526,11 +506,11 @@ class DGFFuser(nn.Module):
                         f'std={out.std().item():.3f} norm={out.norm().item():.3f}',
                         flush=True)
                     print(
-                        f'[DGF-DEBUG ln-sparse] call={self._dbg_calls} '
+                        f'[DGF-DEBUG contrast] call={self._dbg_calls} '
                         f'empty_ratio={er:.3f} '
                         f'bg|post-norm1|={bg_post:.3f} fg|post-norm1|={fg_post:.3f} '
                         f'contrast_pre(fg/bg)={c_pre:.3f} '
-                        f'contrast_post(fg/bg)={c_post:.3f}',
+                        f'contrast_post(fg/bg, JOINT, GATE>1)={c_post:.3f}',
                         flush=True)
 
                     # [bug2-probe] Stage-A localization of the |vhat|/|vgb|
@@ -560,11 +540,12 @@ class DGFFuser(nn.Module):
                         f'ref |vgb(lidar)|={base:.3f}',
                         flush=True)
 
-                    # [bug1-preview] GN(v_gb) contrast look-ahead (nice-to-have,
-                    # zero footprint): manual GroupNorm (32 groups, weight=1/
-                    # bias=0, axis-only) on v_gb -> does GN preserve fg/bg
-                    # contrast (unlike per-cell LN, which forces it to 1.000)?
-                    # This previews BUG 1's fix WITHOUT changing the live norm1.
+                    # [bug1-isolated] ISOLATED BUG-1 probe (separable attribution
+                    # in the joint smoke): manual GroupNorm (32 groups, weight=1/
+                    # bias=0, axis-only) on v_gb ALONE (pre-attention, no v_hat)
+                    # -> reads GN's contrast effect INDEPENDENT of BUG-2. Stays >1
+                    # whenever GN's axis works, even if the joint contrast_post is
+                    # still contaminated by an un-tamed v_hat. (LN forced 1.000.)
                     G = 32
                     vg = v_gb.float()
                     Bv, Cv, Hv, Wv = vg.shape
@@ -577,9 +558,9 @@ class DGFFuser(nn.Module):
                     gn_bg, gn_fg = _mm(gn_c, empty), _mm(gn_c, ~empty)
                     gn_contrast = gn_fg / max(gn_bg, 1e-6)
                     print(
-                        f'[DGF-DEBUG bug1-preview gn(v_gb)] call={self._dbg_calls} '
+                        f'[DGF-DEBUG bug1-isolated gn(v_gb)] call={self._dbg_calls} '
                         f'bg|gn|={gn_bg:.3f} fg|gn|={gn_fg:.3f} '
-                        f'contrast_gn(fg/bg)={gn_contrast:.3f} '
+                        f'contrast_gn(fg/bg, BUG1-only)={gn_contrast:.3f} '
                         f'(LN forces 1.000; GN should be >1)',
                         flush=True)
 

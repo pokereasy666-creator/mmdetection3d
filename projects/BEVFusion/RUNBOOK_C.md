@@ -29,8 +29,9 @@ pytest projects/BEVFusion/tests/test_dgf_fuser.py -q
 ```
 Checks output shape, that D/P carry no trainable params, backward runs,
 resolution-agnostic, the faithful contract (no `gamma`, no `out_relu`, `out_proj`
-NOT zero-init, signed output), that the camera contributes, and that the default
-norm is `LayerNorm2d`. (Needs `pytest`; if unavailable, run the module directly.)
+NOT zero-init, signed output), that the camera contributes, that the default norm
+is **GroupNorm(32)** and that GroupNorm **preserves fg/bg contrast** (LN's
+rejection guard). (Needs `pytest`; if unavailable, run the module directly.)
 
 ## 3. Baseline-untouched check (needs compiled ops; CPU is fine)
 ```bash
@@ -117,19 +118,20 @@ DGF's full-resolution global attention is the main memory risk.
 3. **last resort, ask first**: downsample the BEV before DGF attention (deviates
    from the paper) — do NOT do this without approval.
 
-## 9. DGF norm = LayerNorm (default; faithful Add&Norm, kills the SyncBN nan)
-The DGF norm `N` is **channel-wise LayerNorm (`LayerNorm2d`) by default**, set in
-`DGFFuser.__init__` (A8). It is per-sample, has no batch running stats and needs
-no cross-GPU sync — removing the **SyncBN+fp16 nan** path (BN renormalised the
-sparse, low-variance `lidar_proj(lidar_bev)` std~0.056→1, ~18× norm blow-up →
-`grad_norm=NaN`). It also symmetrically bounds `V̂+V_B`, which is why the faithful
-module needs no `gamma` gate.
-**Known LN risk to watch in smoke** (see `[DGF-DEBUG ln-sparse]`, IMPL_NOTES_C A8):
-empty cells (~constant = `lidar_proj` bias) map to LN's affine `bias`, lifting
-background from ~0 to a nonzero constant — possibly compressing fg/bg contrast.
-If flagged, mitigation ladder: LN with bias-0 → GroupNorm
-(`--cfg-options model.fusion_layer.norm_cfg.type=GN model.fusion_layer.norm_cfg.num_groups=32`)
-→ full-sample LN. (BN can still be forced via `norm_cfg.type=BN2d` — not recommended.)
+## 9. DGF norm = GroupNorm (default; preserves fg/bg contrast; LayerNorm rejected)
+The DGF norm `N` is **GroupNorm(32) by default**, set in `DGFFuser.__init__` (A8).
+GroupNorm shares stats across (group-channels × space), so it **preserves the
+fg/bg magnitude contrast** the heatmap head needs; and like LN it has no batch
+stats / no cross-GPU sync, so it also avoids the SyncBN+fp16 nan (unaffected by
+`--sync_bn torch`).
+**Why not LayerNorm:** the 850-step smoke REJECTED channel-wise LN — it normalises
+each BEV cell to norm √C, forcing `contrast_post≡1.000` (post-norm cell norms all
+= √256) and freezing `loss_heatmap` (2.5–2.9, `matched_ious` 0.07). Watch in smoke
+(`[DGF-DEBUG contrast]` + `[DGF-DEBUG bug1-isolated]`): the GATE is full
+`contrast_post>1`; the isolated `contrast_gn(v_gb)` reads GN alone (BUG-1) even
+while BUG-2 is being tamed. If GN ever gives `contrast_post≈1`, reject it.
+BN can be forced via `--cfg-options model.fusion_layer.norm_cfg.type=BN2d`
+(not recommended — reintroduces the SyncBN/sparse risk).
 
 ## 10. Hard offline rules (checklist)
 - [ ] No `wget` / `mim download` / online URL in any command or config.
