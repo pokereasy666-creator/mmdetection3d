@@ -218,6 +218,22 @@ class DGFFuser(nn.Module):
         # is faithful and does NOT suppress the camera branch.
         self.out_proj = nn.Conv2d(embed_dims, embed_dims, kernel_size=1)
 
+        # A15 [bug2/qk-norm] scaled-cosine attention scale. The attention
+        # L2-normalises q,k per head (cos in [-1,1]); logits = g*(q̂·k̂), where
+        # g = exp(logit_scale) is a learnable PER-HEAD scale. init g=√head_dim
+        # (=> unit-std logits for unit vectors -> well-conditioned softmax, the
+        # known-good entropy~10.3 regime). Clamp logit_scale <= ln(4√head_dim)
+        # => g <= 4√head_dim (selectivity headroom, far below the CLIP/Swin-V2
+        # ceiling of 100 that one-hot-broadcasts over 32400 tokens). No floor
+        # (the entropy/rel_cam gates catch over-uniform). This bounds the logits
+        # independent of feature magnitude -> kills the peaked-softmax broadcast
+        # that blew |vhat| up 7-139x. Modality-neutral (same op on q and k); V is
+        # untouched, so the camera is never suppressed. Adaptation: Eq.3 is bare
+        # softmax(QK/√C); needed for our C=256 feature-magnitude regime.
+        self.logit_scale = nn.Parameter(
+            torch.full((num_heads, ), 0.5 * math.log(self.head_dim)))
+        self._logit_scale_max = math.log(4.0) + 0.5 * math.log(self.head_dim)
+
         # --- Eq.(4) aggregation: two norms + conv-FFN ---
         # N built from norm_cfg (default GN, see above); GN/BN2d both go through
         # build_norm_layer.
@@ -258,15 +274,27 @@ class DGFFuser(nn.Module):
                       flush=True)
         return self._pe.to(dtype), self._de.to(dtype)
 
-    def _cross_attention(self, q, k, v, B, H, W):
-        """Multi-head cross-attention via SDPA (DepthFusion Eq.3).
+    def _qk_scale(self):
+        # A15 [bug2/qk-norm] per-head g = exp(clamp(logit_scale, max)). Clamp
+        # bounds g at 4*sqrt(head_dim); when a head pins there its grad is 0
+        # (it stops growing) -> a pinned g in the smoke = ceiling too low /
+        # broadcast pressure persisting. Returned shape (heads,).
+        return self.logit_scale.clamp(max=self._logit_scale_max).exp()
 
-        Inputs are (B, C, H, W); reshaped to (B, heads, H*W, head_dim) and fed
-        to ``scaled_dot_product_attention``. Head config (A5/A6): C=256 -> 8
-        heads -> head_dim=32 -> scaling 1/sqrt(32). Eq.(3) writes 1/sqrt(C);
-        in the multi-head realisation the "real head dim" (head_dim) is the
-        correct per-head scale, self-consistent at C=256. On CUDA the call is
-        wrapped to use the flash / mem-efficient backend only.
+    def _cross_attention(self, q, k, v, B, H, W):
+        """Multi-head scaled-cosine cross-attention via SDPA (DepthFusion Eq.3
+        + A15).
+
+        Inputs are (B, C, H, W); reshaped to (B, heads, H*W, head_dim). q,k are
+        L2-normalised per head (cos in [-1,1]); target logits = g*(q̂·k̂).
+        torch 2.0.x SDPA has NO ``scale`` kwarg (added in 2.1), so we fold
+        ``g*sqrt(head_dim)`` into q and let SDPA apply its default
+        ``1/sqrt(head_dim)``: ``(g*sqrt(d)*q̂)·k̂ / sqrt(d) = g*(q̂·k̂)`` —
+        version-robust, no kwarg. This decouples logits from feature magnitude
+        (cures the peaked-softmax broadcast). Pre-normalised q,k are ordinary
+        tensors, so on CUDA the flash / mem-efficient backend runs unchanged at
+        O(N) memory (no 32400^2 matrix); the math backend stays DISABLED, so an
+        ineligible kernel raises rather than silently materialising it.
         """
         self._attn_calls += 1  # [dgf-perf] proves one SDPA call per forward
 
@@ -276,6 +304,12 @@ class DGFFuser(nn.Module):
                              H * W).permute(0, 1, 3, 2).contiguous()
 
         qh, kh, vh = to_heads(q), to_heads(k), to_heads(v)
+        # scaled-cosine: unit q,k per head; fold g*sqrt(head_dim) into q so the
+        # default SDPA scale (1/sqrt(head_dim)) yields net logits g*(q̂·k̂).
+        qh = F.normalize(qh, dim=-1)
+        kh = F.normalize(kh, dim=-1)
+        g = self._qk_scale().to(qh.dtype).reshape(1, self.num_heads, 1, 1)
+        qh = qh * (g * (self.head_dim**0.5))
         ctx = efficient_sdpa_ctx() if q.is_cuda else nullcontext()
         with ctx:
             out = F.scaled_dot_product_attention(qh, kh, vh)  # (B,heads,HW,hd)
@@ -433,13 +467,25 @@ class DGFFuser(nn.Module):
                         return t.reshape(B, self.num_heads, self.head_dim,
                                          Nl).permute(0, 1, 3, 2)
 
+                    # match the REAL attention (A15 scaled-cosine): L2-norm q,k
+                    # per head, fold per-head g, no /sqrt(d). So logged entropy/
+                    # max_prob reflect what the model actually computes.
                     qh, kh = _th(q.float()), _th(k.float())
+                    qh = F.normalize(qh, dim=-1)
+                    kh = F.normalize(kh, dim=-1)
+                    g_dbg = self._qk_scale().float()                  # (heads,)
+                    qh = qh * g_dbg.reshape(1, self.num_heads, 1, 1)
                     s = min(64, Nl)
                     idx = torch.randperm(Nl, device=q.device)[:s]
-                    attn = ((qh[:, :, idx, :] @ kh.transpose(-2, -1))
-                            / (self.head_dim**0.5)).softmax(-1)
+                    attn = (qh[:, :, idx, :] @ kh.transpose(-2, -1)).softmax(-1)
                     ent = -(attn * (attn + 1e-12).log()).sum(-1).mean().item()
                     maxp = attn.max(-1).values.mean().item()
+                    # per-head g observable: pinned at g_max + entropy sliding to
+                    # ~7.7 => broadcast pressure persists / ceiling too low.
+                    g_max = math.exp(self._logit_scale_max)
+                    g_min_h = g_dbg.min().item()
+                    g_max_h = g_dbg.max().item()
+                    g_pinned = int((g_dbg >= g_max - 1e-3).sum().item())
 
                     def _stat(name, t):
                         tf = t.float()
@@ -502,6 +548,8 @@ class DGFFuser(nn.Module):
                         f'rel_cam(||F-Flidar||/||Flidar||)={rel_cam:.4f} | '
                         f'attn_entropy={ent:.3f} (uniform={math.log(Nl):.3f}) '
                         f'max_prob={maxp:.4f} | '
+                        f'qk_scale g[min={g_min_h:.3f} max={g_max_h:.3f} '
+                        f'max_allowed={g_max:.3f} pinned={g_pinned}/{self.num_heads}] | '
                         f'out mean={out.mean().item():.3f} '
                         f'std={out.std().item():.3f} norm={out.norm().item():.3f}',
                         flush=True)

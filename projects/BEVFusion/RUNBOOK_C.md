@@ -66,17 +66,21 @@ Confirm in the log (the new `fusion_layer.*` DGF weights are expected in
   fix the cause. If overflow only (inf), drop `loss_scale 64 → 32` via
   `--cfg-options optim_wrapper.loss_scale=32.0` and re-smoke. (64 is a starting
   point; if healthy, keep it.)
-- **Attention not collapsed**: `[DGF-DEBUG] … attn_entropy …/ max_prob …` — RED if
-  `max_prob → ~1` or `entropy → ~0` (near one-hot).
-- **Camera contributes**: `rel_cam(||F-Flidar||/||Flidar||)` **stably > 0.05**.
-  RED if it sits at ~0.
-- **No camera gating**: structurally guaranteed (no `gamma`).
-- **LayerNorm-axis health** (`[DGF-DEBUG ln-sparse]`): note `empty_ratio`,
-  `bg|post-norm1|`, and `contrast_pre` vs `contrast_post`. If `contrast_post` is
-  much smaller than `contrast_pre` (LN compressed background contrast) or it
-  destabilises, apply the norm mitigation ladder (IMPL_NOTES_C A8): LN bias-0 →
-  `--cfg-options model.fusion_layer.norm_cfg.type=GN model.fusion_layer.norm_cfg.num_groups=32`.
-- **Memory fits** (no CUDA OOM at full 180) — note the peak (step 6).
+- **BUG-2 / attention magnitude** (`[DGF-DEBUG bug2]` + `[DGF-DEBUG]`): `raw_ratio`
+  `|vhat|/|vgb|` must be **O(1) (~0.3–3) and STABLE** across the entropy swing — NOT
+  the old erratic 7–139×. RED if `max_prob → ~1` / `attn_entropy → ~0` (one-hot), or
+  if per-head `qk_scale g` is **pinned at `max_allowed`** (`pinned=8/8`) with entropy
+  sliding to ~7.7 (ceiling too low / broadcast persists). `|attn_out| ≈ |vhat|`
+  should now track `|i_gb|`, not explode.
+- **BUG-1 / contrast** (`[DGF-DEBUG contrast]` + `[DGF-DEBUG bug1-isolated]`): the GATE
+  is `contrast_post(fg/bg) > 1` (JOINT, from GN norm1). The isolated
+  `contrast_gn(v_gb)` reads GN ALONE (>1 whenever GN works) — use it to attribute if
+  the joint number lags while BUG-2 settles. If `contrast_post ≈ 1` once BUG-2 is
+  stable → GN failed, reject (IMPL_NOTES_C A8).
+- **Camera contributes**: `rel_cam(||F-Flidar||/||Flidar||)` **stably > 0.05**. RED at ~0.
+- **No camera gating**: structurally guaranteed (no `gamma`; QK-norm is modality-neutral).
+- **Memory fits** (no CUDA OOM at full 180) — note the peak (step 6). QK-norm keeps the
+  SDPA flash/mem-efficient path (O(N)), so memory is unchanged vs the pre-fix run.
 - **loss finite and trending down**; send the loss / grad_norm curves + the gate
   table for sign-off BEFORE the long run.
 

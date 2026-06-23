@@ -147,6 +147,40 @@ def test_groupnorm_preserves_contrast():
     assert float(fg / bg.clamp_min(1e-6)) > 1.5   # contrast preserved (>1)
 
 
+def test_qk_norm_scale_init_and_clamp():
+    # A15 [bug2/qk-norm]: per-head learnable scale g=exp(logit_scale). init
+    # g=sqrt(head_dim) (well-conditioned softmax); clamped at 4*sqrt(head_dim).
+    import math
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
+    assert fuser.logit_scale.shape == (8, )
+    g0 = fuser._qk_scale()
+    assert torch.allclose(g0, torch.full((8, ), math.sqrt(32.0)), atol=1e-4)
+    # blow logit_scale far past the ceiling -> effective g must cap at 4*sqrt(d)
+    with torch.no_grad():
+        fuser.logit_scale.fill_(100.0)
+    g = fuser._qk_scale()
+    assert torch.all(g <= 4 * math.sqrt(32.0) + 1e-3)
+
+
+def test_qk_norm_is_query_magnitude_invariant():
+    # The core of the BUG-2 fix: logits are decoupled from feature magnitude.
+    # Scaling the query by 100x must NOT change the attention output (q,k are
+    # L2-normalized -> only their direction/cosine matters), i.e. no oversized
+    # logits -> no peaked-softmax broadcast.
+    torch.manual_seed(0)
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8).eval()
+    B, C, H, W = 1, 256, 8, 8
+    q = torch.randn(B, C, H, W)
+    k = torch.randn(B, C, H, W)
+    v = torch.randn(B, C, H, W)
+    with torch.no_grad():
+        o1 = fuser._cross_attention(q, k, v, B, H, W)
+        o2 = fuser._cross_attention(q * 100.0, k, v, B, H, W)
+        o3 = fuser._cross_attention(q, k * 100.0, v, B, H, W)
+    assert torch.allclose(o1, o2, atol=1e-4)   # query magnitude does not matter
+    assert torch.allclose(o1, o3, atol=1e-4)   # key magnitude does not matter
+
+
 def test_attn_resolution_downsamples_attention():
     # [module-C/dgf-attn-downsample] with attn_resolution set, the attention runs
     # on a downsampled grid but the output stays at the input resolution and
