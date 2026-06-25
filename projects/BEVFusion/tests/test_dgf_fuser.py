@@ -181,6 +181,38 @@ def test_qk_norm_is_query_magnitude_invariant():
     assert torch.allclose(o1, o3, atol=1e-4)   # key magnitude does not matter
 
 
+def test_qk_norm_zero_norm_query_has_finite_grad():
+    # Regression for the QK-norm zero-norm BACKWARD NaN: ~99% of BEV cells are
+    # empty -> q/k token rows are ~0 after W_q/W_k. F.normalize's backward is
+    # x/||x|| = 0/0 = NaN on a zero row (forward survived on its eps-clamp); the
+    # forward-only invariance test above MISSED this. l2norm_safe (eps inside the
+    # sum-of-squares) must keep ALL grads finite. _cross_attention is the surface
+    # that lets us feed EXACT zero rows (forward() can't: the lidar_proj bias
+    # makes empty cells non-zero).
+    torch.manual_seed(0)
+    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8)
+    B, C, H, W = 2, 256, 4, 4
+    q = torch.randn(B, C, H, W)
+    k = torch.randn(B, C, H, W)
+    v = torch.randn(B, C, H, W)
+    # exact zero token rows in BOTH query and key (empty BEV cells)
+    q[:, :, 0, 0] = 0.0
+    q[:, :, 1, 2] = 0.0
+    k[:, :, 1, 1] = 0.0
+    k[:, :, 3, 3] = 0.0
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+    out = fuser._cross_attention(q, k, v, B, H, W)
+    out.float().sum().backward()
+    # gradients on the zero-row inputs AND the QK-norm param must all be finite
+    assert torch.isfinite(q.grad).all(), 'q.grad has nan/inf at a zero-norm row'
+    assert torch.isfinite(k.grad).all(), 'k.grad has nan/inf at a zero-norm row'
+    assert torch.isfinite(v.grad).all()
+    assert fuser.logit_scale.grad is None or \
+        torch.isfinite(fuser.logit_scale.grad).all()
+
+
 def test_attn_resolution_downsamples_attention():
     # [module-C/dgf-attn-downsample] with attn_resolution set, the attention runs
     # on a downsampled grid but the output stays at the input resolution and

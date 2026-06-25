@@ -30,6 +30,21 @@ from torch import nn
 from mmdet3d.registry import MODELS
 
 
+def l2norm_safe(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
+    """L2-normalise with eps INSIDE the sum-of-squares (RMSNorm-style).
+
+    Unlike ``F.normalize`` (= ``x / x.norm(dim).clamp_min(eps)``), whose ``norm``
+    node has backward ``x/‖x‖`` = 0/0 = NaN at a zero vector (and ~1/‖x‖ near
+    zero), here the normaliser is ``rsqrt(sum(x²)+eps)`` whose argument is
+    ``>= eps > 0`` — so the value AND its derivative are finite even at ``x=0``.
+
+    Needed for DGF's scaled-cosine attention: ~99% of BEV cells are empty, so the
+    q/k rows are ≈0 after ``W_q``/``W_k``; ``F.normalize`` survived the forward on
+    its eps-clamp but produced NaN gradients on those zero rows.
+    """
+    return x * torch.rsqrt(x.pow(2).sum(dim, keepdim=True) + eps)
+
+
 def _sinusoidal_embedding(values: torch.Tensor,
                           dim: int,
                           temperature: float = 10000.0) -> torch.Tensor:
@@ -175,7 +190,8 @@ class DGFFuser(nn.Module):
                  norm_cfg: Optional[dict] = None,
                  ffn_channels: Optional[int] = None,
                  pe_temperature: float = 10000.0,
-                 depth_temperature: float = 10000.0) -> None:
+                 depth_temperature: float = 10000.0,
+                 qk_norm_eps: float = 1e-6) -> None:
         super().__init__()
         assert len(in_channels) == 2, \
             'in_channels must be [img_bev_ch, lidar_bev_ch]'
@@ -199,6 +215,9 @@ class DGFFuser(nn.Module):
         self.attn_resolution = attn_resolution
         self.pe_temperature = pe_temperature
         self.depth_temperature = depth_temperature
+        # A15 [bug2/qk-norm] eps for the safe q,k L2-normalisation (inside the
+        # sum-of-squares -> finite backward at zero-norm BEV cells). Tunable.
+        self.qk_norm_eps = qk_norm_eps
         # A8: default N = GroupNorm (feature-map norm, stats shared across space
         # -> preserves fg/bg contrast). NOT channel-wise LayerNorm (rejected by
         # the 850-step smoke: per-cell LN forces contrast to 1.000 and freezes
@@ -306,8 +325,10 @@ class DGFFuser(nn.Module):
         qh, kh, vh = to_heads(q), to_heads(k), to_heads(v)
         # scaled-cosine: unit q,k per head; fold g*sqrt(head_dim) into q so the
         # default SDPA scale (1/sqrt(head_dim)) yields net logits g*(q̂·k̂).
-        qh = F.normalize(qh, dim=-1)
-        kh = F.normalize(kh, dim=-1)
+        # l2norm_safe (NOT F.normalize): empty BEV cells -> zero-norm q/k rows;
+        # F.normalize's backward is NaN there, l2norm_safe's is finite.
+        qh = l2norm_safe(qh, dim=-1, eps=self.qk_norm_eps)
+        kh = l2norm_safe(kh, dim=-1, eps=self.qk_norm_eps)
         g = self._qk_scale().to(qh.dtype).reshape(1, self.num_heads, 1, 1)
         qh = qh * (g * (self.head_dim**0.5))
         ctx = efficient_sdpa_ctx() if q.is_cuda else nullcontext()
@@ -471,8 +492,8 @@ class DGFFuser(nn.Module):
                     # per head, fold per-head g, no /sqrt(d). So logged entropy/
                     # max_prob reflect what the model actually computes.
                     qh, kh = _th(q.float()), _th(k.float())
-                    qh = F.normalize(qh, dim=-1)
-                    kh = F.normalize(kh, dim=-1)
+                    qh = l2norm_safe(qh, dim=-1, eps=self.qk_norm_eps)
+                    kh = l2norm_safe(kh, dim=-1, eps=self.qk_norm_eps)
                     g_dbg = self._qk_scale().float()                  # (heads,)
                     qh = qh * g_dbg.reshape(1, self.num_heads, 1, 1)
                     s = min(64, Nl)
