@@ -123,16 +123,28 @@ def detect_training_processes():
                 suspects.append('[ps] ' + line.strip()[:200])
     except Exception as e:
         suspects.append('[ps] 进程扫描失败（按"无法确认"处理，拒绝执行）: %r' % e)
+    # 尊重 CUDA_VISIBLE_DEVICES：多租户机上只检查本任务可见的 GPU，避免误把
+    # 邻居容器/其他任务在别的卡上的进程当成"训练在跑"而拒绝执行。
+    #   - 变量未设置          → 扫全部 GPU（维持原行为）；
+    #   - 变量为非空（索引/UUID）→ nvidia-smi -i 过滤到这些卡；
+    #   - 变量显式为空字符串    → 本任务无可见 GPU，跳过 GPU 进程检查。
+    cvd = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    if cvd is not None and cvd.strip() == '':
+        return suspects  # 无可见 GPU，无需检查 GPU 占用
     try:
-        r = subprocess.run(
-            ['nvidia-smi',
-             '--query-compute-apps=pid,process_name,used_memory',
-             '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=15)
+        cmd = ['nvidia-smi',
+               '--query-compute-apps=pid,process_name,used_memory',
+               '--format=csv,noheader']
+        if cvd is not None and cvd.strip():
+            cmd += ['-i', cvd.strip()]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
+            scope = ('可见 GPU [%s]' % cvd.strip()) if (cvd and cvd.strip()) \
+                else '全部 GPU'
             for line in r.stdout.strip().splitlines():
                 if line.strip():
-                    suspects.append('[gpu] compute 进程: ' + line.strip())
+                    suspects.append('[gpu] compute 进程(%s): %s'
+                                    % (scope, line.strip()))
     except FileNotFoundError:
         pass  # 无 nvidia-smi：仅凭 ps 判断
     except Exception as e:
@@ -167,7 +179,16 @@ def build_model_from_cfg(config_path):
     init_default_scope(cfg.get('default_scope', 'mmdet3d'))
     from mmdet3d.registry import MODELS
     # BEVFusion.__init__ 会 pop data_preprocessor.voxelize_cfg，deepcopy 保 cfg 可复用
-    model = MODELS.build(copy.deepcopy(cfg.model))
+    model_cfg = copy.deepcopy(cfg.model)
+    # 离线兼容（铁律 15）：置空 img_backbone.init_cfg，阻止 BEVFusion.init_weights()
+    # → img_backbone.init_weights() 触发 Swin 预训练权重的联网下载（离线环境会
+    # URLError: name resolution 而整个 build 失败）。探针只测形状/显存/通路，
+    # 不依赖主干"初始"权重；真正权重由 --repro-ckpt / load_from 在外部提供。
+    # 用链式 .get 安全判断，字段不存在不报错。
+    img_bb = model_cfg.get('img_backbone', None)
+    if isinstance(img_bb, dict) and img_bb.get('init_cfg', None) is not None:
+        img_bb['init_cfg'] = None
+    model = MODELS.build(model_cfg)
     return cfg, model
 
 
@@ -353,17 +374,11 @@ def probe_p3(args):
         print('无 CUDA，跳过 P3')
         return
     cfg, model = build_model_from_cfg(args.config)
-    ckpt = args.repro_ckpt if (args.repro_ckpt and os.path.isfile(
-        args.repro_ckpt)) else args.official_ckpt
-    if ckpt and os.path.isfile(ckpt):
-        sd = torch.load(ckpt, map_location='cpu')
-        sd = sd.get('state_dict', sd)
-        sd = {(k[7:] if k.startswith('module.') else k): v
-              for k, v in sd.items()}
-        model.load_state_dict(sd, strict=False)
-        print('已加载 ckpt: %s' % ckpt)
-    else:
-        print('警告：无可用 ckpt，用随机初始化前向（形状结论不受影响）')
+    # 不加载训练 ckpt：P3 只测张量【形状】，与权重数值无关；且裸 load_state_dict
+    # 与 BEVFusion 的 spconv 权重布局不兼容（spconv 卷积权重输出通道维序相反，
+    # 复现 ckpt 形如 [16,3,3,3,5] vs 模型期望 [3,3,3,5,16]），strict=False 也会因
+    # size mismatch 直接 RuntimeError。权重兼容性核验交给 P2 的 load_ckpt_report。
+    print('P3 跳过加载训练 ckpt（只测形状；spconv 布局不兼容，兼容性见 P2）')
     model = model.to(args.device).eval()
 
     from mmengine.runner import Runner
@@ -434,14 +449,8 @@ def probe_p4(args):
             tag = 'batch=%d amp=%s' % (bs, amp)
             try:
                 cfg, model = build_model_from_cfg(args.config)
-                ckpt = args.repro_ckpt if (args.repro_ckpt and os.path.isfile(
-                    args.repro_ckpt)) else args.official_ckpt
-                if ckpt and os.path.isfile(ckpt):
-                    sd = torch.load(ckpt, map_location='cpu')
-                    sd = sd.get('state_dict', sd)
-                    sd = {(k[7:] if k.startswith('module.') else k): v
-                          for k, v in sd.items()}
-                    model.load_state_dict(sd, strict=False)
+                # 不加载训练 ckpt：P4 只测【显存/走时】，与权重数值无关；spconv 权重
+                # 布局不兼容（见 P3 注释）。随机初始化的显存/走时与加载权重后一致。
                 model = model.to(args.device)
                 # 模拟 M0 可训练集合（铁律 1/10 的探针级模拟）
                 n_train = n_frozen = 0

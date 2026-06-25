@@ -1,1 +1,1 @@
-2026-06-13 docs: backfill repro baseline (NDS 0.696/mAP 0.665 @baseline1 epoch_19); fix max_epochs 6->20; lock teacher ckpt epoch_19
+2026-06-25 backfill P1-P6 probe results into RECON/PLAN; permanent offline fixes in m0_probe.py (null img init_cfg, respect CUDA_VISIBLE_DEVICES, P3/P4 skip ckpt); add offline-pitfalls appendix

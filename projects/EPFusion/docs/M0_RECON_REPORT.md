@@ -2,7 +2,8 @@
 
 > VERSION: 2026-06-12 M0-recon+probe+plan ｜ 基线 commit: 833592f（claude/jolly-wozniak-c4YMQ 同步点）
 > 本报告所有结论给出 file:line 级引用，均来自仓库源码直读；
-> 凡需 GPU / 数据 / 训练日志 / 已安装环境的项一律标【待探针 Px】，由 scripts/m0_probe.py 回填。
+> 需 GPU/数据/日志/已装环境的项原标占位，**已于 2026-06-25 由 scripts/m0_probe.py 六项实跑回填**
+> （P1-P6，原始报告见 m0_probe_report_20260625*.txt）；离线适配经验见文末附录。
 
 ---
 
@@ -38,7 +39,9 @@ mmengine 运行时行为（P1–P6，见 scripts/m0_probe.py）。
 | mmengine 兼容窗 | ≥0.8.0, <1.0.0 | mmdet3d/__init__.py:13-14 |
 | mmcv 兼容窗 | ≥2.0.0rc4, <2.2.0 | mmdet3d/__init__.py:9-10 |
 | mmdet 兼容窗 | ≥3.0.0rc5, <3.4.0 | mmdet3d/__init__.py:17-18 |
-| PyTorch / CUDA 实际版本 | 【待探针 P1】 | 服务器 conda 环境 |
+| PyTorch / CUDA 实际版本 | **torch 2.0.1+cu118 / CUDA 11.8 / cuDNN 8700** | 探针 P1 实测 |
+| 实测依赖版本（白名单关键项） | mmengine **0.10.5** / mmcv **2.1.0** / mmdet **3.2.0** / numpy 1.23.5 / torchvision 0.15.2+cu118 / matplotlib 3.5.3 / python 3.8.20 | 探针 P1（共 157 个发行版，全清单见 m0_probe_report_run1.txt） |
+| GPU（探针时可见） | **3 × NVIDIA A30 23.5GB sm_80**（CLAUDE.md 标称 4 卡；本轮探针仅 3 卡可见，估时与 DDP 按 3 卡计） | 探针 P1 |
 
 **复现 config**：`projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py`
 （仅 override `train_dataloader.batch_size=2/num_workers=4`（:20）与
@@ -90,13 +93,17 @@ M0 的走/停判据改以本机 R0 冻结对照为锚（M0_PLAN.md H 章）。
 - **调用点**：`projects/BEVFusion/bevfusion/bevfusion.py:275-276`
   `x = self.fusion_layer(features)`，其中 `features = [img_feature, pts_feature]`
   （:271 append 图像 BEV 在前、:273 append 点云 BEV 在后）。
-- **通道/空间尺寸推导**（均【待探针 P3 实测确认】）：
+- **通道/空间尺寸推导**（✅ 探针 P3 实测确认，与静态推导完全一致）：
   - 相机 BEV：view_transform=DepthLSSTransform `out_channels=80`（fusion config:48），
     xbound/ybound=[-54,54,0.3]（:51-52）→ (54−(−54))/0.3 = 360 格，`downsample=2`（:55）→ 180。
-    **[B, 80, 180, 180]**
+    **[B, 80, 180, 180]**（P3 实测 [1,80,180,180]）
   - LiDAR BEV：voxel 0.075 → 1440 格，BEVFusionSparseEncoder 8× 下采 → 180，输出 256 通道。
-    **[B, 256, 180, 180]**
-  - fusion 输出 **[B, 256, 180, 180]**。
+    **[B, 256, 180, 180]**（P3 实测 [1,256,180,180]）
+  - fusion 输出 **[B, 256, 180, 180]**（P3 实测 [1,256,180,180]）；fusion 输入顺序实测
+    = `[[相机BEV(80), LiDAR BEV(256)]]`（img 在前，坐实 bevfusion.py:271/273）。
+  - P3 实测属性名：`view_transform / pts_middle_encoder / fusion_layer / pts_backbone /
+    pts_neck` 全部存在 → **B 章 proj_C(80→256)/proj_L(256→256)/D=256/PoEFuser 接入点
+    全部确认无需改动**。
 - **fusion 之后**：`pts_backbone` = SECOND（in 256 → [128,256]，lidar base config:67-70）→
   `pts_neck` = SECONDFPN（→[256,256] concat = 512，:75-78）→
   `bbox_head` = TransFusionHead（`transfusion_head.py:45` 起；num_proposals=200, in_channels=512,
@@ -167,17 +174,22 @@ e) **注入点方案与干净副本携带机制**：
      （相机分支并非纯相机！）。后果：corrupt_lidar 会经深度输入污染相机 BEV；
      教师干净前向在该模式下必须同时重算 view_transform（用干净点）与点云分支——
      但 2D 图像特征（img_backbone+img_neck）不变可复用。详见 M0_PLAN.md C 章。
-   - 点云"随机抽线"依赖 ring index：load_dim=5/use_dim=5（config:66-69），合并 9 sweep 后
-     第 5 维语义存疑（关键帧为 ring，sweep 合并后可能为时间戳）【待探针 P5】；
-     无 ring 时回退按俯仰角 32 分箱抽线。
+   - 点云"随机抽线"依赖 ring index：load_dim=5/use_dim=5（config:66-69）。
+     ✅ **探针 P5 实测：第 5 维全为 0（unique=1, min=max=0）→ ring index 不可用**。
+     故 beam_drop **正式采用俯仰角分箱回退方案**（arctan(z/√(x²+y²)) 32 分箱整 bin 丢弃），
+     退化管线删除 ring 分支或仅保留回退（M0_PLAN.md D 章已定）。
+     P5 另确认：inputs keys=[points, img]；metainfo 含 img_aug_matrix / lidar_aug_matrix /
+     gt_instances_3d（铁律 3 的几何矩阵齐备）。
 
 ---
 
 ## §4 冻结机制核查
 
-- **model.train() 调用时机**：属 mmengine（EpochBasedTrainLoop 每 epoch 开始、val 结束后恢复）；
-  mmengine 源码不在本机，**【待探针 P6】直接打印 EpochBasedTrainLoop.run/run_epoch 与
-  ValLoop.run 源码验证**（探针 P6 已落地脚本，待服务器实跑）。
+- **model.train() 调用时机**（✅ 探针 P6 源码实证）：EpochBasedTrainLoop.run_epoch 每 epoch
+  开头 `self.runner.model.train()`（在 before_train_epoch hook 之后）；ValLoop.run 开头
+  `self.runner.model.eval()` → val 后下一 epoch 的 run_epoch 再 `.train()` 恢复。
+  **结论坐实铁律 10**：冻结子模块必须在 EPFusion.train() override 中强制 .eval()，
+  因 mmengine 每 epoch 都会把整模型切回 train 模式。
 - **max_epochs（已按复现实跑修正）**：**实际复现采用 max_epochs=20**
   （work_dirs/baseline1 dumped config:703 实证）。注意 in-repo 静态 fusion config:217 声明的是
   `max_epochs=6`（首次 6 轮 run 即用此值，已弃用，见 I.1），二者为不同 run——本条修正即纠正
@@ -193,9 +205,10 @@ e) **注入点方案与干净副本携带机制**：
   （freeze_img_branch 模式下 train() 中强制图像分支 eval）。
 - **优化器只纳入可训练参数**：fusion config 无 paramwise_cfg（optim_wrapper config:221-224）；
   paramwise_cfg 先例 configs/groupfree3d/groupfree3d_head-L12-O256_4xb8_scannet-seg.py:199-208
-  （custom_keys + lr_mult）。requires_grad=False 参数是否被 mmengine 优化器跳过
-  （不更新、不吃 weight decay）**【待探针 P6 实测：3 步更新后冻结参数位级不变断言】**；
-  M0 采取 requires_grad_(False) + paramwise_cfg 分组双保险。
+  （custom_keys + lr_mult）。✅ **探针 P6 实测：requires_grad=False 参数被优化器跳过 =
+  PASS**——在 weight_decay=0.5 放大下 3 步更新后冻结参数仍位级不变，证明 OptimWrapper
+  确实不更新无梯度参数（开放问题闭合=是）。M0 仍采取 requires_grad_(False) +
+  paramwise_cfg 分组双保险。
 - **AMP 启用方式**：`tools/train.py --amp`（:93-105）把 `optim_wrapper.type` 从 OptimWrapper
   改为 **AmpOptimWrapper（loss_scale='dynamic'）**；`--sync_bn torch`（:107-109）。
   4xA30 config 注释明确保留 type='OptimWrapper' 以便 --amp 生效（4xa30 config:25-27）。
@@ -212,7 +225,8 @@ EPFusion 继承 BEVFusion 即继承此行为，Λ 均值用非 'loss' 键记录�
 
 两点注意：
 1. mmengine `BaseModel.train_step` 调用的是 `self.parse_losses`（即上述 override 版）
-   ——此链路【待探针 P6 打印 train_step 源码佐证】；
+   ——✅ 探针 P6 打印 train_step 源码佐证：其内 `parsed_losses, log_vars =
+   self.parse_losses(losses)`，链路成立；
 2. :106-111 对 log_vars **每个 key 做 dist.all_reduce** → 多卡下各 rank 的 key 集合必须
    完全一致，否则集合通信死锁。M0 的 Λ 日志因此采用"每步恒定 12 key（sum/cnt 对）"方案
    （见 M0_PLAN.md E 章）。
@@ -251,6 +265,51 @@ bash scripts/m0_probe.sh \
 # 可选：--skip p4（先快速拿 P1-P3/P5/P6）、--batch-sizes 1,2、--out 自定义报告名
 ```
 
-回填闭环：P1→§1 版本表 + 依赖白名单（铁律 15）；P2→§1 复现指标与 Δ 门、ckpt 兼容性；
-P3→§2 形状确认；P4→M0_PLAN.md F 章估时；P5→§3 管线实证 + 抽线 ring 语义；
+回填闭环（✅ 2026-06-25 全部完成）：P1→§1 版本表 + 依赖白名单（铁律 15）；P2→§1 复现指标与
+Δ 门、ckpt 兼容性；P3→§2 形状确认；P4→M0_PLAN.md F 章估时；P5→§3 管线实证 + 抽线 ring 语义；
 P6→§4/§5 mmengine 行为 + R0WeightCopyHook 时机依据。
+
+> 探针运行细节：P1/P6 在无数据/无网下也能跑通；P3/P4 需 GPU；P5 需 data/nuscenes infos。
+> 首次全量跑（run1）因下列三坑导致 P2/P3/P4/P5 报错，已据此把三条适配修复永久写入
+> scripts/m0_probe.py（不再依赖服务器临时手改），见下附录。修复后 P3 实测形状、P4 实测显存/走时
+> 均正常产出（见 m0_probe_report_20260625.txt）。
+
+---
+
+## 附录：离线环境踩坑记录（供后续会话避坑）
+
+> 三条均为"本地无 torch/网络、py_compile 抓不到"的运行期/环境坑，已永久修复进 scripts/m0_probe.py
+> （commit 见 VERSION 行），并同步影响块 1 实现注意事项。
+
+### 坑 1：Swin 主干 init_cfg 触发联网下载 → 离线 build 直接失败
+- **现象**：`MODELS.build(cfg.model)` 时报 `urllib.error.URLError: <urlopen error [Errno -3]
+  Temporary failure in name resolution>`；栈底是 `BEVFusion.init_weights()`（bevfusion.py:117）
+  → `img_backbone.init_weights()`（mmdet swin.py:689）去拉
+  `github.com/.../swin_tiny_patch4_window7_224.pth`。P2/P3/P4 全部因此崩在 build 阶段。
+- **根因**：fusion config 的 `img_backbone.init_cfg=dict(type='Pretrained', checkpoint=<url>)`；
+  构造模型即触发联网。离线服务器无外网 DNS。
+- **解法（永久）**：`build_model_from_cfg` 在 `MODELS.build` 前用链式 `.get()` 安全置空
+  `cfg.model.img_backbone.init_cfg`（字段不存在不报错）。探针只测形状/显存/通路，不依赖主干
+  "初始"权重；真正权重由 --repro-ckpt / load_from 外部提供。**块 1 注意**：EPFusion 训练时
+  若需 Swin 预训练，应由 deploy 提供本地 swint-nuimages ckpt 并以 `--cfg-options
+  model.img_backbone.init_cfg.checkpoint=<本地路径>` 注入，切勿留 url。
+
+### 坑 2：nvidia-smi 进程自检误拦邻居 GPU
+- **现象**：多租户机上，探针的训练进程自检可能因【其他容器/邻居任务】在别的卡上跑而被
+  `--query-compute-apps` 扫到，误判"有训练在跑"而拒绝执行。
+- **根因**：`nvidia-smi --query-compute-apps` 默认列全部物理 GPU 的 compute 进程，不区分本任务可见性。
+- **解法（永久）**：`detect_training_processes` 读 `CUDA_VISIBLE_DEVICES`——非空则 `nvidia-smi -i
+  <列表>` 仅查可见卡；显式空串则跳过 GPU 检查；未设置维持扫全部。（本轮探针机 device_count=3，
+  即 CVD 限定 3 卡。）
+
+### 坑 3：spconv 稀疏卷积权重布局不兼容 → 裸 load_state_dict 报 size mismatch
+- **现象**：P3/P4 若对复现 ckpt 裸 `load_state_dict`，spconv 卷积权重维序相反
+  （复现 ckpt 形如 `[16,3,3,3,5]` vs 模型期望 `[3,3,3,5,16]`），即使 strict=False 也因
+  size mismatch 抛 RuntimeError。
+- **根因**：不同 spconv 版本/构建对稀疏卷积 kernel 的 [out,*,in] vs [*,in,out] 维序约定不同；
+  复现 ckpt 与当前环境 spconv 布局不一致。
+- **解法（永久）**：P3（测形状）、P4（测显存/走时）均**跳过加载训练 ckpt**——结论与权重数值无关。
+  权重兼容性的 missing/unexpected/size 报告交给 P2 的 `load_ckpt_report`（官方 ckpt 可正常加载；
+  复现 ckpt 的 spconv 差异在 P2 暴露）。**块 1 注意**：EPFusion 用 load_from 加载教师/主干时，
+  须确保 spconv 布局与训练环境一致（建议直接用本环境训出的 baseline1/epoch_19.pth；若跨环境
+  搬权重需走 spconv 的 key/布局转换），否则 load_from 会静默 size mismatch 或加载失败。

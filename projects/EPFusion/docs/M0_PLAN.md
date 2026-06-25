@@ -2,7 +2,8 @@
 
 > VERSION: 2026-06-12 M0-recon+probe+plan ｜ 静态依据见同目录 M0_RECON_REPORT.md
 > 本文为唯一权威版本（用户审查修订 7+1 点与三项追加已物理并入正文）。
-> 凡依赖探针的数字一律标【待探针 Px】，禁止编造；探针报告回传后回填。
+> 依赖探针的数字原标占位，**已于 2026-06-25 由探针 P1-P6 实跑回填**（无未决占位；详见
+> M0_RECON_REPORT.md §1/§3/§4 与本文 B/D/E/F 章）。
 > 约束总纲：projects/BEVFusion/CLAUDE.md 铁律 1–18 + M0 范围纪律（只做逐格标量 Λ、
 > 教师对照 NLL + 退化演练、PoE 融合；不做 NIG/CI/通道组 Λ/任务误差路线/nuScenes-C 正式评测/
 > 注意力融合基线/DAL）。
@@ -60,8 +61,8 @@ config 要点：
 ### B.1 PoEFuser（poe_fuser.py；全部新参数收于此，ckpt 命名空间干净）
 
 - **proj_C**：1×1 Conv，80 → D；**proj_L**：1×1 Conv，256 → D；共享维 **D=256**
-  （= pts_backbone 输入通道，免出口投影）【待探针 P3 确认 80/256/256】。
-  若 P3 推翻：在 PoE 输出后补 1×1 out-proj（兜底，不推荐——多一层非必要可学习变换）。
+  （= pts_backbone 输入通道，免出口投影）。✅ 探针 P3 实测确认：相机 BEV 80ch、LiDAR BEV
+  256ch、fusion 入/出 256ch，**80/256/256 全部坐实，无需 out-proj 兜底**。
 - **lambda_head_C / lambda_head_L**（结构相同、不共享权重）：
   `Conv3×3(C_in→64) → GN(8,64) → ReLU → Conv3×3(64→64) → GN(8,64) → ReLU → Conv1×1(64→1)`，
   输出 1 通道 **log-precision**，`clamp(logΛ, −7, 7)`；**末层 weight 与 bias 零初始化**
@@ -72,7 +73,7 @@ config 要点：
     Λ 评估"原始模态证据质量"；若用投影后特征，proj 缩放与 Λ 存在互相补偿的退化解。
     预埋 `lambda_input='raw'|'projected'` 开关（开放问题 I-6）。
 - **PoE 闭式融合**：`μ_F = (Λ_C·P_C(F_C) + Λ_L·P_L(F_L)) / (Λ_C + Λ_L + eps)`，eps=1e-6（铁律 6）；
-  Λ_m 形状 [B,1,H,W] 广播到 D 通道；输出 [B,256,180,180]【待探针 P3】直接喂 pts_backbone。
+  Λ_m 形状 [B,1,H,W] 广播到 D 通道；输出 [B,256,180,180]（✅ P3 实测 fusion 出 256ch/180²）直接喂 pts_backbone。
 - forward 返回 dict：`{mu_F, log_lambda_C, log_lambda_L, pc, pl}`（pc/pl=投影后分支特征，供 L_teach）。
 - **PoE 与 L_teach 一律 fp32 计算**（局部 `autocast(enabled=False)` + 显式 .float()，见 I-10）。
 
@@ -85,7 +86,8 @@ config 要点：
   ckpt 加载：mmengine `load_from` 非严格加载，`poe_fuser.*` 仅 missing 警告（恰用零/随机初始化）
   ——加载行为由探针 P2/P6 佐证。备选"init_cfg/load hook 重映射 key"复杂无收益，否决。
 - **override `extract_feat`**（结构参照父类 bevfusion.py:240-284 在新文件重写，铁律 11 不破）：
-  1. 冻结分支前向整体包 `torch.no_grad()`（免建图，显存红利【待探针 P4】；默认仍 batch2/accum4 保配方）；
+  1. 冻结分支前向整体包 `torch.no_grad()`（免建图，显存红利已由 P4 证实——冻结主干后
+     可训练仅 5.61M/冻结 35.19M，bs2+AMP 峰值仅 4.70GB，显存极宽裕，详见 F 章）；
   2. 父类 extract_img_feat 拆成两个子方法：`_img_feats_2d(imgs)`（backbone+neck+reshape，
      对应父类 :141-151）与 `_img_bev(feats_2d, points, ...)`（fp32 autocast 包 view_transform，
      对应 :153-163）——**corrupt_lidar 模式复用 2D 特征、只重跑 view_transform 的前提**（C 章）；
@@ -162,8 +164,8 @@ config 要点：
 | img.zero_image | **整路置零特殊条目；severity 无关** | 见 D.2 |
 | pts.random_drop | 丢弃率 0.8s（至少保留 20% 点） | |
 | pts.xyz_jitter | σ_xyz = 0.2s 米（仅 dim0-2） | |
-| pts.beam_drop | 丢 round(24s)/32 线 | ring 语义【待探针 P5】；无 ring 回退按俯仰角 arctan(z/√(x²+y²)) 32 分箱整 bin 丢弃（多 sweep 聚合云上为近似，注释说明） |
-| pts.intensity_noise | σ = 0.2s·强度刻度 | 刻度【待探针 P5】 |
+| pts.beam_drop | 丢 round(24s)/32 线 | ✅ P5 实测第 5 维全 0 → **ring 不可用，正式采用俯仰角 arctan(z/√(x²+y²)) 32 分箱整 bin 丢弃**（删 ring 分支或仅保留回退；多 sweep 聚合云上为近似，注释说明） |
+| pts.intensity_noise | σ = 0.2s·强度 robust scale | 强度=dim3；本轮 P5 仅确认第 5 维(ring)，未单独回填 dim3 刻度 → 实现时按样本内 intensity 的鲁棒尺度（分位距/std）自适应，免硬编码 |
 | pts.zero_points | **整路置零特殊条目；severity 无关；保留 0.5% 随机点** | 防 voxelize/稀疏卷积空输入崩溃 |
 
 **整路置零 = 注册表特殊条目**（'zero_image'/'zero_points'），隶属对应 corrupt_* 模式
@@ -237,8 +239,9 @@ losses[<Λ 与坍缩预警键>]                                        # 仅日�
       'pts_neck':     dict(lr_mult=0.1),
       'bbox_head':    dict(lr_mult=0.1)}))
   ```
-  冻结参数是否被 mmengine 优化器跳过（不更新、不吃 weight decay）【待探针 P6：param group
-  打印 + 3 步更新后冻结参数位级不变断言】；若 P6 FAIL，为冻结模块补 lr_mult=0 兜底。
+  ✅ 探针 P6 实测：requires_grad=False 参数被优化器跳过（weight_decay=0.5 放大下 3 步更新
+  仍位级不变 = PASS）→ 双保险充分，无需为冻结模块额外补 lr_mult=0；paramwise_cfg 的
+  custom_keys lr_mult 也经 P6.6 核验生效（lr=2e-5 与 2e-4 两档如期出现）。
 - **轮数：建议 3 epochs**（≤6）：主干冻结，从零学的只有小容量 Λ 头与 1×1 投影；
   pts_backbone/neck/head 自已收敛 ckpt 以 0.1×LR 微调。`--cfg-options train_cfg.max_epochs=`
   可调（一次 zip 往返内可加训）。**param_scheduler 端点须同步覆盖**：LinearLR warmup 500 iter
@@ -261,16 +264,24 @@ losses[<Λ 与坍缩预警键>]                                        # 仅日�
   选型 = 自定义 **`R0WeightCopyHook`**（epfusion/hooks.py，注册进 R0 config custom_hooks，
   `before_train` 时机）。时机论证：mmengine `Runner.train()` 中 `load_or_resume()` 先于
   `train_loop.run()`，而 `before_train` 是 loop.run() 内首个 hook 点 ⇒ before_train 必然晚于
-  load_from 权重加载【待探针 P6：打印 Runner.train 源码并自动判定顺序】。
-  **兜底**：若 P6 推翻顺序，改为 EPFusion 内首步惰性拷贝（首次 loss() 调用时检查标志位执行）。
+  load_from 权重加载。✅ **探针 P6 实证：Runner.train 中 load_or_resume(L63) 早于
+  train_loop.run(L75) → before_train 时机方案成立**（机器判定 PASS）。
+  **兜底**：万一未来 mmengine 改顺序，改为 EPFusion 内首步惰性拷贝（首次 loss() 调用时检查标志位执行）。
   **resume 守卫**：Hook 仅在 `runner.iter == 0` 时执行拷贝（resume 续训时学生权重已训练，
   严禁覆写）；拷贝与跳过两条路径**各打印一行**带 run 信息（iter/epoch/VERSION）的日志。
 - R0 单独 config 文件；R1-R3 共用主 config 仅改 `--cfg-options model.w_teach=`。
-- **估时：【待探针 P4 后填写】**（P4 给单 iter 走时与峰值显存）。粗推理框架（不写绝对数）：
-  冻结分支免反传（SwinT/稀疏编码器的反传开销省去）；教师额外前向 = 25% 批次 +1 次相机
-  2D+VT、25% 批次 +1 次 VT+点云分支（2D 复用）⇒ 每 iter 成本 ≈ (0.9–1.3)×复现 iter；
-  3 epochs ⇒ 单 run ≈ (0.45–0.65)×T_repro（T_repro = 复现 6 epoch 实测总时长）；4 run 串行。
-  P4 实测回填后才允许写进 EXPERIMENTS.md。
+- **估时（✅ 探针 P4 实测回填）**：
+  - 显存（冻结主干，可训练 5.61M / 冻结 35.19M，峰值 reserved）：bs1+AMP **2.52GB**、
+    bs2+AMP **4.70GB**、bs2 非AMP **4.95GB** → 24GB A30 **极宽裕**；线性外推 **batch 可设 4**
+    （≈9GB），仍远低于卡容量。
+  - 走时（稳态/iter）：bs2+AMP **0.50s**、bs2 非AMP **0.64s** → **AMP 比非AMP 快 ~20%，
+    沿用 `--amp`**。
+  - 单 epoch（28130 样本，CBGS 后）：bs2 单卡 ≈ 14065 iter × 0.5s ≈ **1.95h/单卡**；
+    **3 卡 DDP ≈ 40–45min/epoch**。3 epochs ≈ **2–2.5h/run**（R0/baseline 形状）。
+  - ⚠️ 注意：P4 测的是"冻结主干 + 训 BEV encoder/头"的 R0 形状（stock BEVFusion，无教师
+    额外前向）。R1-R3 的 EPFusion 每 iter 还要加 corrupt_cam/corrupt_lidar 模式下的教师
+    干净前向（各 ~25% 批次），实际 iter 走时会高于 0.50s，**单 run 估时上浮**——以首个 EP run
+    实测为准，回填 EXPERIMENTS.md。batch 设 4 可部分抵消（吞吐↑）。
 - 每 run：`randomness=dict(seed=2026)`（R0-R3 同 seed 保证数据序可比）；启动前更新 VERSION
   （日期 + run 名 + 部署 SHA）；训练命令与 work_dir 名记入 EXPERIMENTS.md（铁律 9/16）。
 - 全部训练命令从全新解压目录出发：
@@ -306,7 +317,7 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
 2. **sanity_p1.py**：`--num-frames 50 --corruption downsample_blur --severities 0,0.2,0.4,0.6,0.8,1.0`。
    仅用 TRAIN 族损坏（铁律 5，**禁用 nuScenes-C 损坏**）；50 个 val 帧逐严重度强制 corrupt_cam
    （经 preprocessor force_*），抽 Λ_C/Λ_L 全图均值，输出均值-严重度曲线 PNG
-   （matplotlib【待探针 P1 白名单确认】）。**量化判据**：
+   （matplotlib ✅ P1 白名单确认在列，版本 3.5.3）。**量化判据**：
    Λ_C：Spearman ρ ≤ −0.9 且置换检验 p < 0.05（numpy 手算，1000 次置换）；
    Λ_L：|ρ| < 0.5 **或** 其相对变化 < Λ_C 相对降幅的 20%。
    报告 `sanity_p1_<日期>.json` + PNG。
@@ -346,7 +357,8 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
    永久弃用**（暴跌为 CBGS 调度端点固有行为，见 RECON §4）。复现 Δ≈−1.8 NDS（< 官方）经
    双 run 自洽 + SyncBN 归因判定为已知系统性差异、非 bug；因 M0 锚点是本机 R0 冻结对照
    （H 章）而非官方分，该差异不影响相对比较，故不阻塞。
-2. **共享投影维 D**：默认 256（= pts_backbone 入口）【待探针 P3】；压小 D 需 out-proj，M1 再议。
+2. **共享投影维 D**：**256（= pts_backbone 入口，✅ P3 实测 fusion 入/出 256ch 坐实）**；
+   压小 D 需 out-proj，M1 再议。
 3. **投影后是否加 norm 及位置**：默认无 norm（线性投影 + 对齐由 L_teach 驱动）；
    **BN 高危否决**（整批单模式 micro-batch 使 BN 统计随模式震荡）；GN 为备选 config 开关。
 4. **BEV encoder 全量 vs 部分解冻**：默认 pts_backbone+pts_neck+bbox_head 全解冻（0.1×LR）；
