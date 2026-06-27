@@ -1,0 +1,1 @@
+2026-06-25 backfill P1-P6 probe results into RECON/PLAN; permanent offline fixes in m0_probe.py (null img init_cfg, respect CUDA_VISIBLE_DEVICES, P3/P4 skip ckpt); add offline-pitfalls appendix
