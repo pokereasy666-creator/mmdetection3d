@@ -171,6 +171,13 @@ class DGFFuser(nn.Module):
         ffn_channels (int | None): conv-FFN hidden channels. Default
             ``embed_dims`` (A9).
         pe_temperature / depth_temperature (float): sin/cos frequency bases.
+        depth_after_qknorm (bool): WHERE the depth encoding ``D`` modulates the
+            query relative to the per-head L2-normalisation (A16). ``False``
+            (default == current behaviour): ``D`` multiplies the query BEFORE
+            l2norm, so l2norm then strips ``D``'s magnitude modulation. ``True``:
+            l2norm the feature query FIRST, then multiply ``D`` -> Eq.(3)'s
+            near/far depth sharpening survives into the logits. Boolean for a
+            clean single-variable A/B.
 
     Faithful aggregation (DepthFusion Eq.4): ``U = N(V̂_GB + V_GB)`` then
     ``F_GB = N(FFN(U) + U)`` -- the camera increment ``V̂_GB`` and the LiDAR
@@ -191,7 +198,8 @@ class DGFFuser(nn.Module):
                  ffn_channels: Optional[int] = None,
                  pe_temperature: float = 10000.0,
                  depth_temperature: float = 10000.0,
-                 qk_norm_eps: float = 1e-6) -> None:
+                 qk_norm_eps: float = 1e-6,
+                 depth_after_qknorm: bool = False) -> None:
         super().__init__()
         assert len(in_channels) == 2, \
             'in_channels must be [img_bev_ch, lidar_bev_ch]'
@@ -218,6 +226,12 @@ class DGFFuser(nn.Module):
         # A15 [bug2/qk-norm] eps for the safe q,k L2-normalisation (inside the
         # sum-of-squares -> finite backward at zero-norm BEV cells). Tunable.
         self.qk_norm_eps = qk_norm_eps
+        # A16 [bug3/depth-after-qknorm] order of D vs the query l2norm. False ==
+        # current behaviour (D before l2norm -> l2norm strips D's depth
+        # modulation, Eq.3 near/far sharpening half-lost); True == l2norm the
+        # feature query first, then multiply D (modulation survives). Single
+        # boolean -> clean A/B; default False keeps existing config/tests intact.
+        self.depth_after_qknorm = depth_after_qknorm
         # A8: default N = GroupNorm (feature-map norm, stats shared across space
         # -> preserves fg/bg contrast). NOT channel-wise LayerNorm (rejected by
         # the 850-step smoke: per-cell LN forces contrast to 1.000 and freezes
@@ -300,12 +314,14 @@ class DGFFuser(nn.Module):
         # broadcast pressure persisting. Returned shape (heads,).
         return self.logit_scale.clamp(max=self._logit_scale_max).exp()
 
-    def _cross_attention(self, q, k, v, B, H, W):
+    def _cross_attention(self, q, k, v, de, B, H, W):
         """Multi-head scaled-cosine cross-attention via SDPA (DepthFusion Eq.3
-        + A15).
+        + A15/A16).
 
-        Inputs are (B, C, H, W); reshaped to (B, heads, H*W, head_dim). q,k are
-        L2-normalised per head (cos in [-1,1]); target logits = g*(q̂·k̂).
+        Inputs are (B, C, H, W) (``de`` is (1, C, H, W)); reshaped to
+        (B, heads, H*W, head_dim). q,k are L2-normalised per head (cos in
+        [-1,1]); the depth encoding ``D`` modulates the query before (A16
+        False) or after (A16 True) that l2norm. target logits = g*(q̂·k̂).
         torch 2.0.x SDPA has NO ``scale`` kwarg (added in 2.1), so we fold
         ``g*sqrt(head_dim)`` into q and let SDPA apply its default
         ``1/sqrt(head_dim)``: ``(g*sqrt(d)*q̂)·k̂ / sqrt(d) = g*(q̂·k̂)`` —
@@ -318,17 +334,27 @@ class DGFFuser(nn.Module):
         self._attn_calls += 1  # [dgf-perf] proves one SDPA call per forward
 
         def to_heads(x):
-            # (B,C,H,W) -> (B, heads, head_dim, H*W) -> (B, heads, H*W, head_dim)
-            return x.reshape(B, self.num_heads, self.head_dim,
+            # (b,C,H,W) -> (b, heads, head_dim, H*W) -> (b, heads, H*W, head_dim).
+            # batch is x.shape[0] (B for q/k/v, 1 for de) so the same reshape
+            # splits channels->heads identically and de broadcasts over batch.
+            return x.reshape(x.shape[0], self.num_heads, self.head_dim,
                              H * W).permute(0, 1, 3, 2).contiguous()
 
         qh, kh, vh = to_heads(q), to_heads(k), to_heads(v)
+        de_h = to_heads(de)  # (1, heads, H*W, head_dim) -- same split as q
+        # A16: D modulates the QUERY. False -> D BEFORE l2norm (== old
+        # (V_GB+P)*D then normalise; byte-identical, l2norm strips D's
+        # magnitude). True -> D AFTER l2norm (depth modulation survives).
+        if not self.depth_after_qknorm:
+            qh = qh * de_h
         # scaled-cosine: unit q,k per head; fold g*sqrt(head_dim) into q so the
         # default SDPA scale (1/sqrt(head_dim)) yields net logits g*(q̂·k̂).
         # l2norm_safe (NOT F.normalize): empty BEV cells -> zero-norm q/k rows;
         # F.normalize's backward is NaN there, l2norm_safe's is finite.
         qh = l2norm_safe(qh, dim=-1, eps=self.qk_norm_eps)
         kh = l2norm_safe(kh, dim=-1, eps=self.qk_norm_eps)
+        if self.depth_after_qknorm:
+            qh = qh * de_h
         g = self._qk_scale().to(qh.dtype).reshape(1, self.num_heads, 1, 1)
         qh = qh * (g * (self.head_dim**0.5))
         ctx = efficient_sdpa_ctx() if q.is_cuda else nullcontext()
@@ -372,7 +398,9 @@ class DGFFuser(nn.Module):
 
         # (2)/(3) DepthFusion Eq.(3): depth-modulated cross-attention
         #   query = (V_GB + P) ⊙ D ; key = I_GB + P ; value = I_GB
-        q = (v_gb_a + pe) * de
+        # A16: build the FEATURE query (V_GB + P) only; D is applied INSIDE
+        # _cross_attention (before or after the l2norm per depth_after_qknorm).
+        q = v_gb_a + pe
         k = i_gb_a + pe
         v = i_gb_a
         # [dgf-perf] env-guarded forward timing: attention vs the rest (aggregation).
@@ -383,7 +411,7 @@ class DGFFuser(nn.Module):
             _e0 = torch.cuda.Event(enable_timing=True)
             _e1 = torch.cuda.Event(enable_timing=True)
             _e0.record()
-        v_hat = self._cross_attention(q, k, v, B, Hl, Wl)  # V̂_GB at (Hl,Wl)
+        v_hat = self._cross_attention(q, k, v, de, B, Hl, Wl)  # V̂_GB at (Hl,Wl)
         if _perf:
             _e1.record()
         # [dgf-debug/bug2-probe] name the pre-out_proj attention output (softmax·V)
@@ -485,15 +513,21 @@ class DGFFuser(nn.Module):
                     Nl = Hl * Wl
 
                     def _th(t):
-                        return t.reshape(B, self.num_heads, self.head_dim,
-                                         Nl).permute(0, 1, 3, 2)
+                        return t.reshape(t.shape[0], self.num_heads,
+                                         self.head_dim, Nl).permute(0, 1, 3, 2)
 
-                    # match the REAL attention (A15 scaled-cosine): L2-norm q,k
-                    # per head, fold per-head g, no /sqrt(d). So logged entropy/
-                    # max_prob reflect what the model actually computes.
+                    # match the REAL attention (A15/A16 scaled-cosine): L2-norm
+                    # q,k per head, applying D before/after l2norm per
+                    # depth_after_qknorm (mirror the real order, else the logged
+                    # entropy is for the wrong path), fold per-head g, no /sqrt(d).
+                    de_h = _th(de.float())
                     qh, kh = _th(q.float()), _th(k.float())
+                    if not self.depth_after_qknorm:
+                        qh = qh * de_h
                     qh = l2norm_safe(qh, dim=-1, eps=self.qk_norm_eps)
                     kh = l2norm_safe(kh, dim=-1, eps=self.qk_norm_eps)
+                    if self.depth_after_qknorm:
+                        qh = qh * de_h
                     g_dbg = self._qk_scale().float()                  # (heads,)
                     qh = qh * g_dbg.reshape(1, self.num_heads, 1, 1)
                     s = min(64, Nl)

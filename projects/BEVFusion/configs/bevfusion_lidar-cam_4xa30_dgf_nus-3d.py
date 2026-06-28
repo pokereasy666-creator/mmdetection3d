@@ -31,6 +31,13 @@ model = dict(
         attn_resolution=None,    # FULL 180x180 attention (faithful, no downsample).
                                  #   The avg-pool/interpolate knob stays dormant for
                                  #   the later speed task; None = structural no-op.
+        depth_after_qknorm=False,  # A16: order of depth-encoding D vs the query
+                                 #   l2norm. False (default) = current behaviour (D
+                                 #   before l2norm -> l2norm strips D's depth
+                                 #   modulation). Override for the A/B with
+                                 #   `--cfg-options model.fusion_layer.depth_after_qknorm=True`
+                                 #   to keep D AFTER l2norm (Eq.3 near/far sharpening
+                                 #   survives into the logits).
         # norm_cfg default = None -> dict(type='GN', num_groups=32) = GroupNorm
         #   (A8): a feature-map norm (stats shared across space) -> preserves the
         #   fg/bg contrast the heatmap needs. Channel-wise LayerNorm was REJECTED

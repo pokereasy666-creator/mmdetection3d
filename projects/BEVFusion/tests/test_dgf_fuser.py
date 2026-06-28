@@ -163,22 +163,27 @@ def test_qk_norm_scale_init_and_clamp():
 
 
 def test_qk_norm_is_query_magnitude_invariant():
-    # The core of the BUG-2 fix: logits are decoupled from feature magnitude.
-    # Scaling the query by 100x must NOT change the attention output (q,k are
-    # L2-normalized -> only their direction/cosine matters), i.e. no oversized
-    # logits -> no peaked-softmax broadcast.
+    # The core of the BUG-2 fix: logits are decoupled from FEATURE magnitude.
+    # Scaling the feature query/key by 100x must NOT change the attention output
+    # (q,k are L2-normalized -> only direction matters). Holds for BOTH
+    # depth_after_qknorm settings: D is passed separately (unscaled), so scaling
+    # the feature query never touches D's channel (A16) -- if this ever fails
+    # under True it means the test is actually scaling de, not the feature.
     torch.manual_seed(0)
-    fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8).eval()
     B, C, H, W = 1, 256, 8, 8
     q = torch.randn(B, C, H, W)
     k = torch.randn(B, C, H, W)
     v = torch.randn(B, C, H, W)
-    with torch.no_grad():
-        o1 = fuser._cross_attention(q, k, v, B, H, W)
-        o2 = fuser._cross_attention(q * 100.0, k, v, B, H, W)
-        o3 = fuser._cross_attention(q, k * 100.0, v, B, H, W)
-    assert torch.allclose(o1, o2, atol=1e-4)   # query magnitude does not matter
-    assert torch.allclose(o1, o3, atol=1e-4)   # key magnitude does not matter
+    de = torch.randn(1, C, H, W)
+    for flag in (False, True):
+        fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
+                         depth_after_qknorm=flag).eval()
+        with torch.no_grad():
+            o1 = fuser._cross_attention(q, k, v, de, B, H, W)
+            o2 = fuser._cross_attention(q * 100.0, k, v, de, B, H, W)
+            o3 = fuser._cross_attention(q, k * 100.0, v, de, B, H, W)
+        assert torch.allclose(o1, o2, atol=1e-4)   # query magnitude irrelevant
+        assert torch.allclose(o1, o3, atol=1e-4)   # key magnitude irrelevant
 
 
 def test_qk_norm_zero_norm_query_has_finite_grad():
@@ -195,6 +200,7 @@ def test_qk_norm_zero_norm_query_has_finite_grad():
     q = torch.randn(B, C, H, W)
     k = torch.randn(B, C, H, W)
     v = torch.randn(B, C, H, W)
+    de = torch.randn(1, C, H, W)
     # exact zero token rows in BOTH query and key (empty BEV cells)
     q[:, :, 0, 0] = 0.0
     q[:, :, 1, 2] = 0.0
@@ -203,7 +209,7 @@ def test_qk_norm_zero_norm_query_has_finite_grad():
     q.requires_grad_(True)
     k.requires_grad_(True)
     v.requires_grad_(True)
-    out = fuser._cross_attention(q, k, v, B, H, W)
+    out = fuser._cross_attention(q, k, v, de, B, H, W)
     out.float().sum().backward()
     # gradients on the zero-row inputs AND the QK-norm param must all be finite
     assert torch.isfinite(q.grad).all(), 'q.grad has nan/inf at a zero-norm row'
@@ -211,6 +217,31 @@ def test_qk_norm_zero_norm_query_has_finite_grad():
     assert torch.isfinite(v.grad).all()
     assert fuser.logit_scale.grad is None or \
         torch.isfinite(fuser.logit_scale.grad).all()
+
+
+def test_depth_after_qknorm_restores_depth_modulation():
+    # A16: D's MAGNITUDE modulation (depth -> attention sharpness, Eq.3) is what
+    # the per-head l2norm strips. Scaling the depth encoding D by a scalar must
+    #   - change the output when depth_after_qknorm=True  (D applied AFTER l2norm
+    #     -> the scale survives into the logits -> sharpness changes), and
+    #   - NOT change it when False (default; D applied BEFORE l2norm -> l2norm
+    #     strips the scalar). This is exactly the wiped/restored depth channel.
+    torch.manual_seed(0)
+    B, C, H, W = 1, 256, 8, 8
+    q = torch.randn(B, C, H, W)
+    k = torch.randn(B, C, H, W)
+    v = torch.randn(B, C, H, W)
+    de = torch.randn(1, C, H, W)
+    for flag, expect_change in ((False, False), (True, True)):
+        fuser = DGFFuser(in_channels=[80, 256], embed_dims=256, num_heads=8,
+                         depth_after_qknorm=flag).eval()
+        with torch.no_grad():
+            o_lo = fuser._cross_attention(q, k, v, de * 0.2, B, H, W)
+            o_hi = fuser._cross_attention(q, k, v, de * 5.0, B, H, W)
+        changed = not torch.allclose(o_lo, o_hi, atol=1e-5)
+        assert changed == expect_change, (
+            f'depth_after_qknorm={flag}: D-scaling changed output={changed}, '
+            f'expected {expect_change}')
 
 
 def test_attn_resolution_downsamples_attention():
