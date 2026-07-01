@@ -29,9 +29,19 @@ def make_generator(seed, rank, it):
     return g
 
 
+def _randn_like_shape(shape, ref, gen):
+    return torch.randn(
+        shape, generator=gen, dtype=ref.dtype, device='cpu').to(ref.device)
+
+
+def _randperm(n, ref, gen):
+    return torch.randperm(
+        n, generator=gen, device='cpu').to(ref.device)
+
+
 # ------------------------------------------------------------------ 图像损坏
 def gaussian_noise(img, s, gen):
-    noise = torch.randn(img.shape, generator=gen, dtype=img.dtype) * (50.0 * s)
+    noise = _randn_like_shape(img.shape, img, gen) * (50.0 * s)
     return torch.clamp(img + noise, 0.0, 255.0)
 
 
@@ -86,7 +96,7 @@ def random_drop(points, s, gen):
     rate = min(max(0.8 * s, 0.0), 0.8)
     n_keep = max(int(round((1.0 - rate) * n)), max(1, int(round(0.2 * n))))
     n_keep = min(n_keep, n)
-    perm = torch.randperm(n, generator=gen)[:n_keep]
+    perm = _randperm(n, points, gen)[:n_keep]
     return points[perm]
 
 
@@ -94,8 +104,8 @@ def xyz_jitter(points, s, gen):
     if points.shape[0] == 0:
         return points
     points = points.clone()
-    noise = torch.randn((points.shape[0], 3), generator=gen,
-                        dtype=points.dtype) * (0.2 * s)
+    noise = _randn_like_shape(
+        (points.shape[0], 3), points, gen) * (0.2 * s)
     points[:, :3] = points[:, :3] + noise
     return points
 
@@ -113,8 +123,9 @@ def beam_drop(points, s, gen):
     if (emax - emin) < 1e-6:
         return points
     bin_idx = ((elev - emin) / (emax - emin) * (n_bins - 1)).long().clamp(0, n_bins - 1)
-    drop_bins = torch.randperm(n_bins, generator=gen)[:min(n_drop, n_bins)]
-    drop_mask = torch.zeros(points.shape[0], dtype=torch.bool)
+    drop_bins = _randperm(n_bins, points, gen)[:min(n_drop, n_bins)]
+    drop_mask = torch.zeros(
+        points.shape[0], dtype=torch.bool, device=points.device)
     for b in drop_bins.tolist():
         drop_mask |= (bin_idx == b)
     keep = ~drop_mask
@@ -131,13 +142,15 @@ def intensity_noise(points, s, gen):
     # 鲁棒尺度自适应（分位距优先，退化到 std），不硬编码刻度（P5 未回填 dim3 刻度）
     try:
         q = torch.quantile(inten.float(),
-                           torch.tensor([0.25, 0.75], dtype=torch.float32))
+                           torch.tensor([0.25, 0.75], dtype=torch.float32,
+                                        device=inten.device))
         scale = float(q[1] - q[0])
     except Exception:
         scale = 0.0
     if scale < 1e-6:
         scale = float(inten.float().std()) + 1e-6
-    noise = torch.randn(inten.shape, generator=gen, dtype=points.dtype) * (0.2 * s * scale)
+    noise = _randn_like_shape(
+        inten.shape, inten, gen) * (0.2 * s * scale)
     points[:, 3] = inten + noise
     return points
 
@@ -148,7 +161,7 @@ def zero_points(points, s, gen):
     if n == 0:
         return points
     n_keep = max(1, int(round(0.005 * n)))
-    perm = torch.randperm(n, generator=gen)[:n_keep]
+    perm = _randperm(n, points, gen)[:n_keep]
     return points[perm]
 
 

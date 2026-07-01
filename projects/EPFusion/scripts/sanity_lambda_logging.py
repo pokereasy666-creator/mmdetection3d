@@ -36,6 +36,8 @@ REPO_ROOT = os.path.dirname(
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from mmengine.config import Config, DictAction
+
 
 class Tee(object):
     def __init__(self, path):
@@ -59,11 +61,33 @@ def read_version():
         return 'unknown'
 
 
-def build_model_from_cfg(config_path):
+def apply_data_root(cfg, data_root):
+    if data_root is None:
+        return
+    cfg.data_root = data_root
+
+    def _patch(value):
+        if isinstance(value, dict):
+            if 'data_root' in value:
+                value['data_root'] = data_root
+            for child in value.values():
+                _patch(child)
+        elif isinstance(value, list):
+            for child in value:
+                _patch(child)
+
+    for key in ('train_dataloader', 'val_dataloader', 'test_dataloader'):
+        if key in cfg:
+            _patch(cfg[key])
+
+
+def build_model_from_cfg(config_path, cfg_options=None, data_root=None):
     """构建模型（离线兼容：置空 img_backbone.init_cfg，阻止 Swin 联网下载）。"""
-    from mmengine.config import Config
     from mmengine.registry import init_default_scope
     cfg = Config.fromfile(config_path)
+    if cfg_options:
+        cfg.merge_from_dict(cfg_options)
+    apply_data_root(cfg, data_root)
     ci = cfg.get('custom_imports', None)
     if ci:
         from mmengine.utils import import_modules_from_strings
@@ -142,7 +166,13 @@ def main():
     p.add_argument('--data-root', default=None)
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--out-dir', default='.')
-    p.add_argument('--cfg-options', nargs='+', default=None)
+    p.add_argument(
+        '--cfg-options',
+        nargs='+',
+        action=DictAction,
+        default=None,
+        help='Override config options, e.g. model.w_teach=0.01 '
+             'randomness.seed=1')
     args = p.parse_args()
 
     out = os.path.join(
@@ -159,7 +189,10 @@ def main():
     report = []
 
     # ---- 构建 EP（poe）模型 + 载 ckpt ----
-    cfg, model = build_model_from_cfg(args.config)
+    cfg, model = build_model_from_cfg(
+        args.config,
+        cfg_options=args.cfg_options,
+        data_root=args.data_root)
     load_ckpt_loose(model, args.checkpoint)
     model = model.to(args.device)
     model.train()  # 触发 override train()：冻结子模块强制 eval
@@ -222,6 +255,7 @@ def main():
     # (g) 整路置零强制路径冒烟
     def _g():
         msgs = []
+        all_ok = True
         for fm, fc in (('corrupt_cam', 'zero_image'),
                        ('corrupt_lidar', 'zero_points')):
             model.data_preprocessor.force_mode = fm
@@ -229,13 +263,22 @@ def main():
             try:
                 data = model.data_preprocessor(copy.deepcopy(batch), True)
                 ls = model.loss(data['inputs'], data['data_samples'])
-                has = all(k in ls for k in
-                          ['lambda_C_%s_sum' % fm, 'loss_teach'])
-                msgs.append('%s/%s ok(keys=%s)' % (fm, fc, has))
+                need = [
+                    'lambda_C_%s_sum' % fm,
+                    'lambda_C_%s_cnt' % fm,
+                    'lambda_L_%s_sum' % fm,
+                    'lambda_L_%s_cnt' % fm,
+                    'loss_teach',
+                    'teach_nll_raw',
+                ]
+                missing = [k for k in need if k not in ls]
+                all_ok = all_ok and not missing
+                msgs.append('%s/%s missing=%s'
+                            % (fm, fc, missing or 'none'))
             finally:
                 model.data_preprocessor.force_mode = None
                 model.data_preprocessor.force_corruption = None
-        return True, '; '.join(msgs)
+        return all_ok, '; '.join(msgs)
     check(report, 'g_zero_paths_smoke', _g)
 
     # (h) 优化器 param-group LR + param_scheduler 端点
@@ -297,7 +340,10 @@ def main():
         if not args.r0_config:
             return True, 'SKIP（未提供 --r0-config）'
         from projects.EPFusion.epfusion.hooks import copy_weights
-        _, r0 = build_model_from_cfg(args.r0_config)
+        _, r0 = build_model_from_cfg(
+            args.r0_config,
+            cfg_options=args.cfg_options,
+            data_root=args.data_root)
         load_ckpt_loose(r0, args.checkpoint)
         ok_copy = copy_weights(r0)  # 显式调用（脚本不经 Runner.train）
         eq = True
