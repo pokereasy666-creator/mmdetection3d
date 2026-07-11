@@ -19,6 +19,9 @@ from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
 
+from .proposal_utils import build_proposal_pack
+from .structures import ProposalPack
+
 
 def clip_sigmoid(x, eps=1e-4):
     y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
@@ -224,55 +227,11 @@ class TransFusionHead(nn.Module):
         #################################
         # query initialization
         #################################
-        with torch.autocast('cuda', enabled=False):
-            dense_heatmap = self.heatmap_head(fusion_feat.float())
-        heatmap = dense_heatmap.detach().sigmoid()
-        padding = self.nms_kernel_size // 2
-        local_max = torch.zeros_like(heatmap)
-        # equals to nms radius = voxel_size * out_size_factor * kenel_size
-        local_max_inner = F.max_pool2d(
-            heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0)
-        local_max[:, :, padding:(-padding),
-                  padding:(-padding)] = local_max_inner
-        # for Pedestrian & Traffic_cone in nuScenes
-        if self.test_cfg['dataset'] == 'nuScenes':
-            local_max[:, 8, ] = F.max_pool2d(
-                heatmap[:, 8], kernel_size=1, stride=1, padding=0)
-            local_max[:, 9, ] = F.max_pool2d(
-                heatmap[:, 9], kernel_size=1, stride=1, padding=0)
-        elif self.test_cfg[
-                'dataset'] == 'Waymo':  # for Pedestrian & Cyclist in Waymo
-            local_max[:, 1, ] = F.max_pool2d(
-                heatmap[:, 1], kernel_size=1, stride=1, padding=0)
-            local_max[:, 2, ] = F.max_pool2d(
-                heatmap[:, 2], kernel_size=1, stride=1, padding=0)
-        heatmap = heatmap * (heatmap == local_max)
-        heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
-
-        # top num_proposals among all classes
-        top_proposals = heatmap.view(batch_size, -1).argsort(
-            dim=-1, descending=True)[..., :self.num_proposals]
-        top_proposals_class = top_proposals // heatmap.shape[-1]
-        top_proposals_index = top_proposals % heatmap.shape[-1]
-        query_feat = fusion_feat_flatten.gather(
-            index=top_proposals_index[:, None, :].expand(
-                -1, fusion_feat_flatten.shape[1], -1),
-            dim=-1,
-        )
-        self.query_labels = top_proposals_class
-
-        # add category embedding
-        one_hot = F.one_hot(
-            top_proposals_class,
-            num_classes=self.num_classes).permute(0, 2, 1)
-        query_cat_encoding = self.class_encoding(one_hot.float())
-        query_feat += query_cat_encoding
-
-        query_pos = bev_pos.gather(
-            index=top_proposals_index[:, None, :].permute(0, 2, 1).expand(
-                -1, -1, bev_pos.shape[-1]),
-            dim=1,
-        )
+        proposals = self._extract_proposals_from_shared_feature(
+            fusion_feat, bev_pos=bev_pos)
+        query_feat = proposals.query_feat_post.transpose(1, 2).contiguous()
+        query_pos = proposals.ref_xy
+        self.query_labels = proposals.labels
         #################################
         # transformer decoder layer (Fusion feature as K,V)
         #################################
@@ -295,13 +254,9 @@ class TransFusionHead(nn.Module):
             # for next level positional embedding
             query_pos = res_layer['center'].detach().clone().permute(0, 2, 1)
 
-        ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
-            index=top_proposals_index[:,
-                                      None, :].expand(-1, self.num_classes,
-                                                      -1),
-            dim=-1,
-        )  # [bs, num_classes, num_proposals]
-        ret_dicts[0]['dense_heatmap'] = dense_heatmap
+        ret_dicts[0]['query_heatmap_score'] = proposals.class_scores.transpose(
+            1, 2).contiguous()
+        ret_dicts[0]['dense_heatmap'] = proposals.dense_heatmap
 
         if self.auxiliary is False:
             # only return the results of last decoder layer
@@ -318,6 +273,34 @@ class TransFusionHead(nn.Module):
             else:
                 new_res[key] = ret_dicts[0][key]
         return [new_res]
+
+    def extract_proposals(self,
+                          inputs: torch.Tensor,
+                          num_proposals: int = None) -> ProposalPack:
+        """Extract proposals from the post-neck TransFusion input feature."""
+        fusion_feat = self.shared_conv(inputs)
+        return self._extract_proposals_from_shared_feature(
+            fusion_feat, num_proposals=num_proposals)
+
+    def _extract_proposals_from_shared_feature(
+            self,
+            fusion_feat: torch.Tensor,
+            num_proposals: int = None,
+            bev_pos: torch.Tensor = None) -> ProposalPack:
+        """Extract proposals from a feature already mapped to hidden size."""
+        with torch.autocast('cuda', enabled=False):
+            dense_heatmap = self.heatmap_head(fusion_feat.float())
+        return build_proposal_pack(
+            feature=fusion_feat,
+            dense_heatmap=dense_heatmap,
+            bev_pos=self.bev_pos if bev_pos is None else bev_pos,
+            class_encoding=self.class_encoding,
+            num_proposals=(self.num_proposals
+                           if num_proposals is None else num_proposals),
+            nms_kernel_size=self.nms_kernel_size,
+            dataset=self.test_cfg['dataset'],
+            source='fusion',
+        )
 
     def forward(self, feats, metas):
         """Forward pass.

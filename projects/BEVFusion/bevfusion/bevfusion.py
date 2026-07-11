@@ -14,6 +14,7 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures import Det3DDataSample
 from mmdet3d.utils import OptConfigType, OptMultiConfig, OptSampleList
 from .ops import Voxelization
+from .structures import BEVGeometry, FeatureBundle, SensorMeta
 
 
 @MODELS.register_module()
@@ -31,6 +32,8 @@ class BEVFusion(Base3DDetector):
         img_neck: Optional[dict] = None,
         pts_neck: Optional[dict] = None,
         bbox_head: Optional[dict] = None,
+        instance_refiner: Optional[dict] = None,
+        bev_geometry: Optional[dict] = None,
         init_cfg: OptMultiConfig = None,
         seg_head: Optional[dict] = None,
         **kwargs,
@@ -59,6 +62,9 @@ class BEVFusion(Base3DDetector):
         self.pts_neck = MODELS.build(pts_neck)
 
         self.bbox_head = MODELS.build(bbox_head)
+        self.instance_refiner = MODELS.build(
+            instance_refiner) if instance_refiner is not None else None
+        self._bev_geometry_cfg = bev_geometry
 
         self.init_weights()
 
@@ -127,6 +133,11 @@ class BEVFusion(Base3DDetector):
         """
         return hasattr(self, 'seg_head') and self.seg_head is not None
 
+    @property
+    def with_instance_refiner(self):
+        return (hasattr(self, 'instance_refiner')
+                and self.instance_refiner is not None)
+
     def extract_img_feat(
         self,
         x,
@@ -137,18 +148,36 @@ class BEVFusion(Base3DDetector):
         img_aug_matrix,
         lidar_aug_matrix,
         img_metas,
-    ) -> torch.Tensor:
+        return_raw_img_feats=False,
+    ):
         B, N, C, H, W = x.size()
         x = x.view(B * N, C, H, W).contiguous()
 
         x = self.img_backbone(x)
         x = self.img_neck(x)
 
-        if not isinstance(x, torch.Tensor):
-            x = x[0]
+        if not return_raw_img_feats:
+            if not isinstance(x, torch.Tensor):
+                x = x[0]
+            BN, C, H, W = x.size()
+            x = x.view(B, int(BN / B), C, H, W)
+            with torch.autocast(device_type='cuda', dtype=torch.float32):
+                return self.view_transform(
+                    x,
+                    points,
+                    lidar2image,
+                    camera_intrinsics,
+                    camera2lidar,
+                    img_aug_matrix,
+                    lidar_aug_matrix,
+                    img_metas,
+                )
 
-        BN, C, H, W = x.size()
-        x = x.view(B, int(BN / B), C, H, W)
+        raw_img_feats = (x, ) if isinstance(x, torch.Tensor) else tuple(x)
+        raw_img_feats = tuple(
+            level.view(B, N, level.shape[1], level.shape[2], level.shape[3])
+            for level in raw_img_feats)
+        x = raw_img_feats[0]
 
         with torch.autocast(device_type='cuda', dtype=torch.float32):
             x = self.view_transform(
@@ -161,7 +190,7 @@ class BEVFusion(Base3DDetector):
                 lidar_aug_matrix,
                 img_metas,
             )
-        return x
+        return x, raw_img_feats
 
     def extract_pts_feat(self, batch_inputs_dict) -> torch.Tensor:
         points = batch_inputs_dict['points']
@@ -282,6 +311,104 @@ class BEVFusion(Base3DDetector):
         x = self.pts_neck(x)
 
         return x
+
+    def _get_bev_geometry(self) -> BEVGeometry:
+        geometry = self._bev_geometry_cfg
+        if geometry is None:
+            train_cfg = self.bbox_head.train_cfg
+            if train_cfg is None:
+                raise ValueError('bev_geometry is required without train_cfg')
+            point_cloud_range = train_cfg['point_cloud_range']
+            voxel_size = train_cfg['voxel_size']
+            out_size_factor = train_cfg['out_size_factor']
+        else:
+            point_cloud_range = geometry['point_cloud_range']
+            voxel_size = geometry['voxel_size']
+            out_size_factor = geometry['out_size_factor']
+        return BEVGeometry(
+            point_cloud_range=tuple(float(v) for v in point_cloud_range),
+            voxel_size=tuple(float(v) for v in voxel_size),
+            out_size_factor=int(out_size_factor),
+            feature_stride=(float(voxel_size[0]) * out_size_factor,
+                            float(voxel_size[1]) * out_size_factor),
+        )
+
+    def extract_feature_bundle(self, batch_inputs_dict,
+                               batch_input_metas) -> FeatureBundle:
+        """Extract feature taps for an enabled detector extension.
+
+        The baseline ``extract_feat`` path does not call this method, so raw
+        image pyramid tensors are not kept alive when no extension is active.
+        """
+        if not self.with_instance_refiner:
+            raise RuntimeError(
+                'FeatureBundle extraction requires an enabled extension')
+
+        imgs = batch_inputs_dict.get('imgs', None)
+        points = batch_inputs_dict.get('points', None)
+        if imgs is None:
+            raise ValueError('FeatureBundle requires multi-view images')
+        imgs = imgs.contiguous()
+
+        lidar2image, camera_intrinsics, camera2lidar = [], [], []
+        img_aug_matrix, lidar_aug_matrix = [], []
+        for meta in batch_input_metas:
+            lidar2image.append(meta['lidar2img'])
+            camera_intrinsics.append(meta['cam2img'])
+            camera2lidar.append(meta['cam2lidar'])
+            img_aug_matrix.append(meta.get('img_aug_matrix', np.eye(4)))
+            lidar_aug_matrix.append(meta.get('lidar_aug_matrix', np.eye(4)))
+
+        lidar2image = imgs.new_tensor(np.asarray(lidar2image))
+        camera_intrinsics = imgs.new_tensor(np.asarray(camera_intrinsics))
+        camera2lidar = imgs.new_tensor(np.asarray(camera2lidar))
+        img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
+        lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
+
+        image_bev, raw_img_feats = self.extract_img_feat(
+            imgs,
+            deepcopy(points),
+            lidar2image,
+            camera_intrinsics,
+            camera2lidar,
+            img_aug_matrix,
+            lidar_aug_matrix,
+            batch_input_metas,
+            return_raw_img_feats=True,
+        )
+        lidar_bev = self.extract_pts_feat(batch_inputs_dict)
+        if self.fusion_layer is not None:
+            fused_bev = self.fusion_layer([image_bev, lidar_bev])
+        else:
+            raise ValueError('FeatureBundle requires a fusion_layer')
+        head_feat = self.pts_neck(self.pts_backbone(fused_bev))
+
+        camera_masks = [meta.get('camera_mask') for meta in batch_input_metas]
+        camera_mask = None
+        if all(mask is not None for mask in camera_masks):
+            camera_mask = imgs.new_tensor(
+                np.asarray(camera_masks), dtype=torch.bool)
+        sensor_meta = SensorMeta(
+            lidar2image=lidar2image,
+            camera_intrinsics=camera_intrinsics,
+            camera2lidar=camera2lidar,
+            img_aug_matrix=img_aug_matrix,
+            lidar_aug_matrix=lidar_aug_matrix,
+            image_shapes=tuple(
+                meta.get('img_shape', tuple(imgs.shape[-2:]))
+                for meta in batch_input_metas),
+            camera_mask=camera_mask,
+        )
+        return FeatureBundle(
+            raw_img_feats=raw_img_feats,
+            image_bev=image_bev,
+            lidar_bev=lidar_bev,
+            fused_bev=fused_bev,
+            head_feat=head_feat,
+            sensor_meta=sensor_meta,
+            bev_geometry=self._get_bev_geometry(),
+            depth_aux=None,
+        )
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
              batch_data_samples: List[Det3DDataSample],
