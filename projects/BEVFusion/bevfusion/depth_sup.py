@@ -66,7 +66,7 @@ def depth_bce_loss(
     feature_size: Tuple[int, int],
     dbound: Tuple[float, float, float],
     num_bins: int,
-    weight: float = 0.5,
+    weight: float = 3.0,
 ) -> torch.Tensor:
     """Masked softmax + BCE depth loss, activation-matched to the forward LSS.
 
@@ -76,16 +76,23 @@ def depth_bce_loss(
     (A previous version used per-bin BCE-with-logits, which mismatched the
     forward softmax and diluted the supervision; see [module-A/fix-softmax-bce].)
 
+    Normalization follows official BEVDepth (`bevdepth/exps/nuscenes/
+    base_exp.py::get_depth_loss`): the per-bin BCE is SUMMED over the D bins of
+    each valid pixel and averaged over valid pixels only -- NOT meaned over
+    ``n_valid * D`` elements, which would shrink the loss (and its gradients)
+    by a factor of D (see [module-A/fix-loss-norm]).
+
     Args:
         logits (Tensor): ``(M, D, fH, fW)`` PRE-softmax depth logits; softmaxed
             over the bin dim (dim=1) inside this function.
         gt_depth (Tensor): ``(M, 1, iH, iW)`` sparse LiDAR depth GT.
         image_size / feature_size / dbound / num_bins: see ``downsample_gt_depth``.
-        weight (float): loss weight (``depth_loss_weight``).
+        weight (float): loss weight (``depth_loss_weight``); the default 3.0 is
+            official BEVDepth's ``return 3.0 * depth_loss``.
 
     Returns:
-        Tensor: scalar ``weight * mean_BCE`` over valid pixels, or a graph-
-        connected zero if there is no valid LiDAR pixel in the batch.
+        Tensor: scalar ``weight * sum_over_bins_BCE / n_valid_pixels``, or a
+        graph-connected zero if there is no valid LiDAR pixel in the batch.
     """
     one_hot, valid = downsample_gt_depth(gt_depth, image_size, feature_size,
                                          dbound, num_bins)
@@ -103,5 +110,9 @@ def depth_bce_loss(
         # forward lift; then (M,D,fH,fW) -> (M,fH,fW,D) and mask to valid pixels.
         pred_prob = logits.float().softmax(dim=1).permute(0, 2, 3, 1)[valid]
         tgt = one_hot[valid].float()
-        loss = F.binary_cross_entropy(pred_prob, tgt, reduction='mean')
+        # official BEVDepth normalization: sum the per-bin BCE over each valid
+        # pixel's D bins, average over valid pixels (`.sum() / fg_mask.sum()`);
+        # the early return above guarantees the denominator is >= 1.
+        loss = F.binary_cross_entropy(
+            pred_prob, tgt, reduction='none').sum() / pred_prob.shape[0]
     return weight * loss

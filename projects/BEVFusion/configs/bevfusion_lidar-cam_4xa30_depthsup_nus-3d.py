@@ -29,7 +29,9 @@ _base_ = ['./bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py']
 model = dict(
     view_transform=dict(
         use_depth_sup=True,
-        depth_loss_weight=0.5,  # BEVDepth-style default; tune if it imbalances
+        # Official BEVDepth default (base_exp.py: `3.0 * depth_loss`, with the
+        # sum-over-bins / n-valid-pixels normalization). Tune if it imbalances.
+        depth_loss_weight=3.0,
     ))
 
 # Runtime products MUST live outside the (re-extracted) source tree.

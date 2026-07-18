@@ -28,7 +28,9 @@ cd <repo-root>
 pytest projects/BEVFusion/tests/test_depth_sup.py -q
 ```
 Covers: GT bin discretization, min-pool of nearest non-zero, **sparse mask
-(no-point pixels not supervised)**, BCE consumes **logits not probs**, weight
+(no-point pixels not supervised)**, **softmax-over-bins + BCE on the
+probabilities** (activation-matched to the forward LSS lift), the **official
+BEVDepth normalization** (per-valid-pixel sum over bins / n_valid), weight
 scaling. The `DepthLSSTransform`-level tests (caching only when enabled; zero
 new params) run if the ops are importable, else skip.
 
@@ -57,9 +59,12 @@ bash tools/dist_train.sh ${CFG} 4 \
 Confirm in the log:
 - a **`loss_depth`** term appears and **trends down**; total loss has **no
   NaN/Inf**;
-- **`loss_depth` vs `loss_bbox` are not wildly imbalanced.** If `loss_depth`
-  dwarfs the detection losses (and harms them), lower the weight:
-  `--cfg-options model.view_transform.depth_loss_weight=0.2` (or 0.1);
+- **`loss_depth` vs `loss_bbox` are not wildly imbalanced.** With the official
+  BEVDepth normalization + weight 3.0, early `loss_depth` lands around ~15-20
+  (near-uniform depth probs: per-pixel BCE sum ≈ log(D) + 1 ≈ 5.8, × 3.0) and
+  should trend well below that. If it dwarfs the detection losses (and harms
+  them), lower the weight:
+  `--cfg-options model.view_transform.depth_loss_weight=1.0` (or 0.5);
 - the two pretrained checkpoints load (sensible `missing/unexpected_keys`; the
   detection/depth weights already exist in the LiDAR/Swin ckpts as applicable);
 - it fits in memory (module A adds **no parameters**; only a small extra
@@ -86,10 +91,10 @@ Load the official fusion checkpoint into the **baseline** config model
 baseline number ⇒ the +A work did not perturb the baseline path. Result `PENDING`.
 
 ## 7. Tuning note
-`depth_loss_weight` (default 0.5) is the main knob. If detection metrics regress
-because the depth term dominates, reduce it; if depth supervision seems to have
-no effect, the loss may be tiny relative to detection losses — inspect the
-logged `loss_depth` magnitude. (Keep batch2/accum4/amp/sync_bn unchanged so +A
+`depth_loss_weight` (default 3.0 = official BEVDepth) is the main knob. If
+detection metrics regress because the depth term dominates, reduce it; if depth
+supervision seems to have no effect, the loss may be tiny relative to detection
+losses — inspect the logged `loss_depth` magnitude. (Keep batch2/accum4/amp/sync_bn unchanged so +A
 stays comparable to the baseline.)
 
 ## 8. Hard offline rules (checklist)

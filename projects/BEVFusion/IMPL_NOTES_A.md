@@ -9,7 +9,7 @@
 | File | Change | Guarded? |
 | --- | --- | --- |
 | `bevfusion/depth_sup.py` | **NEW** torch-only helpers: `downsample_gt_depth`, `depth_bce_loss`. | n/a (only used when on) |
-| `bevfusion/depth_lss.py` | `DepthLSSTransform.__init__` gains `use_depth_sup=False`, `depth_loss_weight=0.5`; `get_cam_feats` stashes logits+GT; new `get_depth_loss`. | yes (`if self.use_depth_sup`) |
+| `bevfusion/depth_lss.py` | `DepthLSSTransform.__init__` gains `use_depth_sup=False`, `depth_loss_weight=3.0`; `get_cam_feats` stashes logits+GT; new `get_depth_loss`. | yes (`if self.use_depth_sup`) |
 | `bevfusion/bevfusion.py` | `loss()` adds `loss_depth` only when the view transform's `use_depth_sup` is True. | yes (`getattr(..., False)`) |
 | `configs/bevfusion_lidar-cam_4xa30_depthsup_nus-3d.py` | **NEW** +A config (inherits 4xA30 baseline, sets the flag, out-of-repo work_dir). | n/a |
 
@@ -59,8 +59,15 @@ Re-implements BEVDepth's `get_downsampled_gt_depth`, self-contained:
 - `F.binary_cross_entropy` is NOT autocast-safe, so it runs inside
   `torch.cuda.amp.autocast(enabled=False)` with fp32 inputs (`logits.float()`,
   `one_hot.float()`) to avoid fp16 instability.
+- **Normalization = official BEVDepth** (`bevdepth/exps/nuscenes/base_exp.py::
+  get_depth_loss`): per-bin BCE **summed over the D bins of each valid pixel,
+  divided by the number of valid pixels** (`reduction='none'` → `.sum() /
+  n_valid`). ([module-A/fix-loss-norm] — previously `reduction='mean'` over
+  `n_valid × D` elements, which silently shrank the loss and its gradients by
+  a factor of D=118 vs the official code.)
 - No valid pixel in a batch ⇒ returns a graph-connected `0` (no NaN).
-- Weighted by `depth_loss_weight` (config, default `0.5`).
+- Weighted by `depth_loss_weight` (config, default `3.0` = official BEVDepth's
+  `return 3.0 * depth_loss`).
 - Added to total loss as `losses['loss_depth']`.
 
 ## ASSUMPTIONs (paper/instruction-unspecified → chosen value + reason)
@@ -69,7 +76,7 @@ Re-implements BEVDepth's `get_downsampled_gt_depth`, self-contained:
 | **A-D1** | Loss = **softmax over bins (dim=1) + `F.binary_cross_entropy` on probs**, in fp32 under `autocast(enabled=False)`. | [module-A/fix-softmax-bce] Activation matched to the forward LSS lift (`logits.softmax(dim=1)`); the earlier per-bin `binary_cross_entropy_with_logits` used independent sigmoids that mismatched the forward softmax and diluted supervision. `binary_cross_entropy` needs fp32 (not autocast-safe). |
 | **A-D2** | Bin index = `floor((d - d_min)/d_step)`, range `[0, D-1]` (clamped); `valid = d∈[d_min,d_max)`. | Simple, deterministic mapping over `dbound`; out-of-range LiDAR points are masked out (not clamped into edge bins for supervision). |
 | **A-D3** | Downsample = **min-pool of nearest non-zero** over the `8x8` patch. | BEVDepth convention; keeps the closest real depth, ignores empty pixels. |
-| **A-D4** | `depth_loss_weight` default **0.5**. | Task-specified default; a common BEVDepth-range weight. Tune down if `loss_depth` dwarfs `loss_bbox` (RUNBOOK §3). |
+| **A-D4** | `depth_loss_weight` default **3.0**, normalization = per-valid-pixel **sum over bins / n_valid**. | [module-A/fix-loss-norm] Matches official BEVDepth exactly (`3.0 * BCE(...).sum() / fg_mask.sum()`); the earlier `0.5` + mean-over-all-elements was ~`D × 6 ≈ 708×` weaker than the official signal. Tune down if `loss_depth` dwarfs `loss_bbox` (RUNBOOK §4/§7). |
 | **A-D5** | Logits source = `depthnet` output channels `[:D]` (`depth_lss.py`), captured **before** the softmax at the (former) `:416` line. | `PROBE_A_depth.md` Q3: that is the predicted depth distribution; BCE needs the pre-softmax logits. |
 | **A-D6** | Switch + weight live on the **view transform** (`DepthLSSTransform`); `BEVFusion.loss` reads them via `getattr(self.view_transform, ...)`. | Keeps all depth config in one place; BEVFusion change stays a minimal guarded read. |
 | **A-D7** | Depth loss computed in the resolution the logits are produced at (`feature_size=[32,88]`), GT downsampled to match. | Logits are at feature resolution; matches BEVDepth. |

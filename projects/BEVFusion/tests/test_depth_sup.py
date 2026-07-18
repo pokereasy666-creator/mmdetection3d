@@ -80,6 +80,9 @@ def test_only_valid_pixels_are_supervised():
 def test_uses_softmax_then_bce():
     # [module-A/fix-softmax-bce] loss must equal BCE on the softmax-over-bins
     # probabilities (matching the forward LSS lift), NOT per-bin BCE-with-logits.
+    # [module-A/fix-loss-norm] normalization is official BEVDepth's: per-pixel
+    # SUM over the D bins / n_valid_pixels (here n_valid = 1), NOT mean over
+    # n_valid * D elements.
     img, feat, D = (2, 2), (1, 1), 4
     gt = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])  # depth 1.0 -> bin 0
     logits = torch.tensor([[[[3.0]], [[-1.0]], [[0.0]], [[2.0]]]])  # (1,4,1,1)
@@ -87,10 +90,32 @@ def test_uses_softmax_then_bce():
     flat = logits.permute(0, 2, 3, 1).reshape(1, D).float()
     tgt = torch.zeros(1, D)
     tgt[0, 0] = 1.0
-    ref_softmax = F.binary_cross_entropy(flat.softmax(1), tgt, reduction='mean')
+    ref_softmax = F.binary_cross_entropy(
+        flat.softmax(1), tgt, reduction='none').sum() / 1
     assert torch.allclose(loss, ref_softmax)          # softmax(dim=bins) + BCE
-    ref_logits = F.binary_cross_entropy_with_logits(flat, tgt, reduction='mean')
-    assert not torch.allclose(loss, ref_logits)       # NOT the old per-bin logits-BCE
+    ref_mean = F.binary_cross_entropy(flat.softmax(1), tgt, reduction='mean')
+    assert not torch.allclose(loss, ref_mean)         # NOT meaned over bins too
+    ref_logits = F.binary_cross_entropy_with_logits(flat, tgt, reduction='none')
+    assert not torch.allclose(loss, ref_logits.sum())  # NOT per-bin logits-BCE
+
+
+def test_official_bevdepth_normalization():
+    # [module-A/fix-loss-norm] with n_valid pixels, loss = weight *
+    # sum-over-(pixels, bins) BCE / n_valid — the exact official BEVDepth
+    # reduction (base_exp.py: `.sum() / max(1.0, fg_mask.sum())`, `3.0 *`).
+    img, feat = (4, 4), (2, 2)
+    gt = torch.zeros(1, 1, 4, 4)
+    gt[0, 0, 0, 0] = 2.0   # valid cell (0,0)
+    gt[0, 0, 2, 2] = 30.0  # valid cell (1,1)  -> n_valid = 2
+    torch.manual_seed(0)
+    logits = torch.randn(1, NUM_BINS, 2, 2)
+    loss = depth_sup.depth_bce_loss(logits, gt, img, feat, DBOUND, NUM_BINS, 3.0)
+    one_hot, valid = depth_sup.downsample_gt_depth(gt, img, feat, DBOUND, NUM_BINS)
+    assert int(valid.sum()) == 2
+    probs = logits.float().softmax(dim=1).permute(0, 2, 3, 1)[valid]
+    ref = F.binary_cross_entropy(
+        probs, one_hot[valid], reduction='none').sum() / valid.sum()
+    assert torch.allclose(loss, 3.0 * ref)
 
 
 def test_dummy_forward_no_nan_and_softmax_dim():

@@ -347,7 +347,7 @@ class DepthLSSTransform(BaseDepthTransform):
         dbound: Tuple[float, float, float],
         downsample: int = 1,
         use_depth_sup: bool = False,
-        depth_loss_weight: float = 0.5,
+        depth_loss_weight: float = 3.0,
     ) -> None:
         """Compared with `LSSTransform`, `DepthLSSTransform` adds sparse depth
         information from lidar points into the inputs of the `depthnet`.
@@ -454,9 +454,11 @@ class DepthLSSTransform(BaseDepthTransform):
     def get_depth_loss(self):
         """[module-A/depth-sup] BEVDepth (arXiv:2206.10092) depth supervision.
 
-        Masked per-bin BCE-with-logits between the stashed pre-softmax depth
-        logits and the discretized sparse LiDAR depth GT. Only pixels with a
-        LiDAR point in ``[d_min, d_max)`` are supervised (the sparse mask).
+        Softmax (over the depth-bin dim, matching the forward lift) + BCE
+        between the stashed pre-softmax depth logits and the discretized sparse
+        LiDAR depth GT, with official BEVDepth normalization (per-valid-pixel
+        sum over bins, averaged over valid pixels). Only pixels with a LiDAR
+        point in ``[d_min, d_max)`` are supervised (the sparse mask).
         Reads AND clears the caches; returns the weighted scalar loss.
         """
         logits, gt = self._depth_pred_logits, self._depth_gt
