@@ -14,11 +14,9 @@ model = dict(
         zero_init_out_proj=False,
     ))
 
-optim_wrapper = dict(
-    type='AmpOptimWrapper',
-    optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.01),
-    accumulative_counts=4,
-    clip_grad=dict(max_norm=10, norm_type=2),
-    loss_scale=64.0)
+# Training recipe (optimizer, lr, loss_scale, grad accumulation, clip_grad)
+# is inherited UNCHANGED from the 4xA30 baseline config so that the +DGF
+# ablation differs from the baseline in the fusion_layer ONLY. Do not add an
+# optim_wrapper override here.
 
 work_dir = 'work_dirs/dgf_v1_faithful'
