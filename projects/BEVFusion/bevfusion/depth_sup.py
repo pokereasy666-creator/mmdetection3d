@@ -13,6 +13,33 @@ import torch
 import torch.nn.functional as F
 
 
+def drop_depth_input(depth: torch.Tensor, keep_ratio: float) -> torch.Tensor:
+    """[module-A/depth-sup-v2] Randomly zero (1 - keep_ratio) of a sparse depth.
+
+    Closes the input-reconstruction shortcut: when the SAME sparse LiDAR depth
+    is both the ``depthnet`` input and the supervision target, the net can learn
+    to copy the input at supervised pixels instead of inferring depth. Dropping
+    most input points (while the GT keeps the full projection, done by the
+    caller) forces depth *completion* instead. A zeroed entry is exactly "no
+    LiDAR point here", matching the sparse-map convention, so already-empty
+    pixels are unaffected.
+
+    Args:
+        depth (Tensor): sparse depth map (0 where no point). Any shape.
+        keep_ratio (float): fraction of entries to KEEP. ``>= 1.0`` is a no-op
+            and returns ``depth`` unchanged (the exact v1 tensor).
+
+    Returns:
+        Tensor: a NEW dropped tensor (same shape/dtype/device), or ``depth``
+        itself when ``keep_ratio >= 1.0``. The input tensor is never mutated,
+        so a caller that stashed it as the GT keeps the full map.
+    """
+    if keep_ratio >= 1.0:
+        return depth
+    keep = torch.rand_like(depth) < keep_ratio
+    return depth * keep.to(depth.dtype)
+
+
 def downsample_gt_depth(
     gt_depth: torch.Tensor,
     image_size: Tuple[int, int],

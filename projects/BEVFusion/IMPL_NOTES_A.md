@@ -8,10 +8,38 @@
 ## What changed (only these; baseline logic otherwise untouched)
 | File | Change | Guarded? |
 | --- | --- | --- |
-| `bevfusion/depth_sup.py` | **NEW** torch-only helpers: `downsample_gt_depth`, `depth_bce_loss`. | n/a (only used when on) |
-| `bevfusion/depth_lss.py` | `DepthLSSTransform.__init__` gains `use_depth_sup=False`, `depth_loss_weight=3.0`; `get_cam_feats` stashes logits+GT; new `get_depth_loss`. | yes (`if self.use_depth_sup`) |
+| `bevfusion/depth_sup.py` | **NEW** torch-only helpers: `downsample_gt_depth`, `depth_bce_loss`, `drop_depth_input` (v2). | n/a (only used when on) |
+| `bevfusion/depth_lss.py` | `DepthLSSTransform.__init__` gains `use_depth_sup=False`, `depth_loss_weight=3.0`, `depth_input_keep_ratio=1.0` (v2); `get_cam_feats` stashes logits+GT and (train-only, v2) drops input; new `get_depth_loss`. | yes (`if self.use_depth_sup`) |
 | `bevfusion/bevfusion.py` | `loss()` adds `loss_depth` only when the view transform's `use_depth_sup` is True. | yes (`getattr(..., False)`) |
 | `configs/bevfusion_lidar-cam_4xa30_depthsup_nus-3d.py` | **NEW** +A config (inherits 4xA30 baseline, sets the flag, out-of-repo work_dir). | n/a |
+| `configs/bevfusion_lidar-cam_4xa30_depthsup_v2_nus-3d.py` | **NEW** +A v2 config (adds `depth_input_keep_ratio=0.3`). | n/a |
+| `tools/probe_depth_shortcut.py` | **NEW** read-only occlusion probe (measures the copy-vs-infer shortcut). | n/a (analysis) |
+
+## v2 — input dropout to close the leakage shortcut (`depth_input_keep_ratio`)
+The paired 6-epoch ablation (same seed 577127641) showed depth supervision is
+**net-negative at every weight**, and the harm is **monotonic** in the weight:
+
+| run | weight | best NDS | best mAP | ΔNDS | ΔmAP | grad_norm peak |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline | — | 0.7060 | 0.6648 | — | — | ~0.9 |
+| +A w1.0 | 1.0 | 0.7034 | 0.6600 | −0.26 | −0.48 | ~9 |
+| +A w3.0 | 3.0 | 0.6985 | 0.6508 | −0.75 | −1.40 | ~80 |
+
+Tuning the weight only **reduces** the damage; it never crosses into a gain
+(floor = baseline at weight→0). Root cause is **target leakage**: the
+`DepthLSSTransform` feeds the same sparse LiDAR depth as BOTH the depthnet input
+AND (v1) the supervision target, and only observed pixels are supervised, so the
+net can minimise the loss by **copying** the input rather than inferring depth.
+
+**v2 fix (`depth_input_keep_ratio`, default 1.0 = OFF = v1):** during TRAINING,
+`get_cam_feats` drops `1 - keep_ratio` of the input LiDAR points fed to
+`dtransform` (via `drop_depth_input`), while the supervision GT keeps the FULL
+projection. Most supervised pixels then have NO input answer, forcing depth
+*completion*, not copying. At `keep_ratio=0.3`, ~63% of supervised feature cells
+have no input point (measured at production shapes). **Inference is unchanged**
+(dropout is train-only) and **zero parameters** are added. See
+`probe_depth_shortcut.py` to measure the shortcut directly (kept-vs-held-out
+predicted-depth gap) on baseline vs +A checkpoints.
 
 ## Switch carrier = module attributes (not a changed return signature)
 Per the design rule, the depth tensors are surfaced via **plain attributes** on

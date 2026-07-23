@@ -79,11 +79,53 @@ bash tools/dist_train.sh ${CFG} 4 \
   --cfg-options load_from=${LIDAR_CKPT} \
                 model.img_backbone.init_cfg.checkpoint=${SWINT_CKPT}
 ```
-Eval on val, compare vs the 4×A30 **baseline** number (NOT official):
-| metric | baseline (4×A30) | +A (depth-sup) | Δ |
+Eval on val, compare vs the 4×A30 **baseline** number (NOT official). Paired
+6-epoch results (same seed 577127641, best epoch = ep5 for all):
+| metric | baseline | +A w1.0 | +A w3.0 |
 | --- | --- | --- | --- |
-| NDS | `PENDING` | `PENDING` | `PENDING` |
-| mAP | `PENDING` | `PENDING` | `PENDING` |
+| NDS | 0.7060 | 0.7034 (−0.26) | 0.6985 (−0.75) |
+| mAP | 0.6648 | 0.6600 (−0.48) | 0.6508 (−1.40) |
+
+Depth supervision is **net-negative at every weight** and monotonically worse
+with weight ⇒ weight-tuning cannot make it help (floor = baseline). See §5b.
+
+## 5b. Full +A v2 training (input-dropout, closes the leakage shortcut)
+Same command as §5 but launch from the v2 config (adds
+`depth_input_keep_ratio=0.3`), or inject the key via `--cfg-options` on the
+stock 6e config used for the baseline (recommended — keeps the paired recipe):
+```bash
+CFG=projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py
+bash tools/dist_train.sh ${CFG} 4 \
+  --amp --sync_bn torch \
+  --work-dir work_dirs/bevfusion_lidar-cam_official6e_depthsup_v2_seed577127641 \
+  --cfg-options \
+    randomness.seed=577127641 \
+    train_dataloader.batch_size=2 \
+    optim_wrapper.type=AmpOptimWrapper \
+    optim_wrapper.loss_scale=512.0 \
+    optim_wrapper.accumulative_counts=4 \
+    load_from=${LIDAR_CKPT} \
+    model.img_backbone.init_cfg.checkpoint=${SWINT_CKPT} \
+    model.view_transform.use_depth_sup=True \
+    model.view_transform.depth_loss_weight=3.0 \
+    model.view_transform.depth_input_keep_ratio=0.3
+```
+Same seed/recipe as baseline+w3.0, so v2 is paired to both; the only change vs
+w3.0 is the train-time input dropout. Expect `loss_depth` to start HIGHER than
+w3.0 (the completion task is harder) and `grad_norm` similar-to-lower than w3.0.
+| metric | baseline | +A w3.0 | +A v2 (keep 0.3) |
+| --- | --- | --- | --- |
+| NDS | 0.7060 | 0.6985 | `PENDING` |
+| mAP | 0.6648 | 0.6508 | `PENDING` |
+
+**Shortcut probe** (before/after, read-only, needs GPU+val+ops):
+```bash
+python projects/BEVFusion/tools/probe_depth_shortcut.py \
+  --config ${CFG} --checkpoint <ckpt>.pth --num-batches 50 --occlude 0.5 \
+  --out outputs/probe_<name>.json
+```
+Run on baseline, +A w3.0, and +A v2. A large kept-minus-held-out accuracy gap =
+copy/shortcut; v2 should SHRINK that gap vs w3.0.
 
 ## 6. all-off integration check (PENDING)
 Load the official fusion checkpoint into the **baseline** config model

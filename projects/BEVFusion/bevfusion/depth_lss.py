@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from mmdet3d.registry import MODELS
-from .depth_sup import depth_bce_loss
+from .depth_sup import depth_bce_loss, drop_depth_input
 from .ops import bev_pool
 
 
@@ -348,6 +348,7 @@ class DepthLSSTransform(BaseDepthTransform):
         downsample: int = 1,
         use_depth_sup: bool = False,
         depth_loss_weight: float = 3.0,
+        depth_input_keep_ratio: float = 1.0,
     ) -> None:
         """Compared with `LSSTransform`, `DepthLSSTransform` adds sparse depth
         information from lidar points into the inputs of the `depthnet`.
@@ -356,6 +357,19 @@ class DepthLSSTransform(BaseDepthTransform):
         (arXiv:2206.10092) explicit depth supervision. When False, this module
         is byte-identical to the baseline: nothing is cached, no loss is added,
         and no parameters are introduced.
+
+        [module-A/depth-sup-v2] ``depth_input_keep_ratio`` (default 1.0 = OFF,
+        i.e. unchanged v1 behavior) closes the input-reconstruction shortcut.
+        The stock ``DepthLSSTransform`` feeds the *same* sparse LiDAR depth both
+        as the ``depthnet`` INPUT and (under v1 supervision) as the GT TARGET, so
+        the supervised pixels already have their answer in the input -> the net
+        can learn to copy the input instead of inferring depth (leakage). With
+        ``keep_ratio < 1.0``, TRAINING randomly drops ``1 - keep_ratio`` of the
+        input LiDAR points fed to ``dtransform`` while the supervision GT keeps
+        the FULL projection (see ``get_cam_feats``). Most supervised pixels then
+        have NO answer in the input, forcing depth *completion*, not copying.
+        Inference is UNCHANGED (dropout is train-only), and no parameters are
+        added. Only meaningful together with ``use_depth_sup=True``.
         """
         super().__init__(
             in_channels=in_channels,
@@ -419,6 +433,11 @@ class DepthLSSTransform(BaseDepthTransform):
         # are plain attributes -> never enter parameters()/state_dict.
         self.use_depth_sup = use_depth_sup
         self.depth_loss_weight = depth_loss_weight
+        # [module-A/depth-sup-v2] input-dropout keep ratio (1.0 == OFF).
+        assert 0.0 < depth_input_keep_ratio <= 1.0, (
+            f'depth_input_keep_ratio must be in (0, 1], got '
+            f'{depth_input_keep_ratio}')
+        self.depth_input_keep_ratio = depth_input_keep_ratio
         self._depth_pred_logits = None  # (B*N, D, fH, fW), pre-softmax
         self._depth_gt = None           # (B*N, 1, iH, iW), sparse LiDAR depth
 
@@ -430,8 +449,18 @@ class DepthLSSTransform(BaseDepthTransform):
 
         if self.use_depth_sup:
             # [module-A/depth-sup] stash the sparse LiDAR depth GT at full
-            # image resolution BEFORE `dtransform` overwrites `d`.
+            # image resolution BEFORE `dtransform` overwrites `d`. This is the
+            # FULL projection -- the supervision target is never dropped.
             self._depth_gt = d
+            if self.training:
+                # [module-A/depth-sup-v2] drop (1 - keep_ratio) of the input
+                # LiDAR points fed to `dtransform`, so most SUPERVISED pixels
+                # have no answer in the input -> the depthnet must COMPLETE
+                # depth, not copy it (closes the leakage shortcut). `d` is
+                # reassigned to a dropped copy; `self._depth_gt` still refers to
+                # the full tensor above (drop_depth_input never mutates its
+                # input), so the GT is unaffected. keep_ratio >= 1.0 is a no-op.
+                d = drop_depth_input(d, self.depth_input_keep_ratio)
 
         d = self.dtransform(d)
         x = torch.cat([d, x], dim=1)

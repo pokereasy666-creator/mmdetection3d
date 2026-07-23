@@ -146,6 +146,39 @@ def test_weight_scales_loss():
     assert torch.allclose(l05, 0.5 * l1)
 
 
+# ------------- input dropout (v2, closes the leakage shortcut) ---------------
+def test_drop_keep_ratio_one_is_noop():
+    # [module-A/depth-sup-v2] keep_ratio >= 1.0 returns the SAME tensor (v1).
+    d = torch.rand(4, 1, 16, 16)
+    out = depth_sup.drop_depth_input(d, 1.0)
+    assert out is d  # identity: no copy, byte-identical to v1 input path
+
+
+def test_drop_never_mutates_input_so_gt_stays_full():
+    # the caller stashes `d` as the FULL GT then calls drop on the same tensor;
+    # drop must NOT mutate it, or the supervision target would be corrupted.
+    d = torch.rand(2, 1, 32, 32)
+    gt_ref = d.clone()
+    _ = depth_sup.drop_depth_input(d, 0.3)
+    assert torch.equal(d, gt_ref)  # input untouched -> GT unaffected
+
+
+def test_drop_zeros_stay_zero_and_rate_is_right():
+    # only real points (non-zero) can be dropped; empty pixels stay empty.
+    torch.manual_seed(0)
+    d = torch.ones(200, 1, 40, 40)          # all "points" so we can measure rate
+    d[:, :, ::2, :] = 0.0                    # half are empty (stay empty)
+    out = depth_sup.drop_depth_input(d, 0.3)
+    # empty pixels are never resurrected
+    assert torch.all(out[d == 0.0] == 0.0)
+    # kept fraction of the real points is ~0.3
+    real = d > 0.0
+    kept = (out[real] > 0.0).float().mean().item()
+    assert abs(kept - 0.3) < 0.02
+    # kept values are unchanged (masked multiply by 1), not rescaled
+    assert torch.all((out[real] == 1.0) | (out[real] == 0.0))
+
+
 # ------------- DepthLSSTransform level (needs compiled ops) -----------------
 def _load_depth_lss():
     try:
@@ -158,12 +191,13 @@ def _load_depth_lss():
 _DepthLSS = _load_depth_lss()
 
 
-def _make_vt(use_depth_sup):
+def _make_vt(use_depth_sup, keep_ratio=1.0):
     return _DepthLSS(
         in_channels=8, out_channels=4, image_size=[16, 16], feature_size=[2, 2],
         xbound=[-54.0, 54.0, 0.3], ybound=[-54.0, 54.0, 0.3],
         zbound=[-10.0, 10.0, 20.0], dbound=DBOUND, downsample=1,
-        use_depth_sup=use_depth_sup, depth_loss_weight=0.5)
+        use_depth_sup=use_depth_sup, depth_loss_weight=0.5,
+        depth_input_keep_ratio=keep_ratio)
 
 
 @pytest.mark.skipif(_DepthLSS is None,
@@ -197,3 +231,53 @@ def test_no_new_parameters_vs_baseline():
     on = {n for n, _ in _make_vt(True).named_parameters()}
     off = {n for n, _ in _make_vt(False).named_parameters()}
     assert on == off  # depth supervision introduces zero new parameters
+    # v2 input dropout also adds zero parameters (it is a runtime mask)
+    v2 = {n for n, _ in _make_vt(True, keep_ratio=0.3).named_parameters()}
+    assert v2 == off
+
+
+@pytest.mark.skipif(_DepthLSS is None,
+                    reason='DepthLSSTransform needs the compiled BEVFusion ops')
+def test_v2_gt_is_full_while_training_input_is_dropped():
+    # [module-A/depth-sup-v2] with keep_ratio<1 in TRAIN mode, the stashed GT
+    # keeps ALL points (full projection) even though the depthnet input is
+    # dropped. We assert the GT nonzero count equals the original full map.
+    torch.manual_seed(0)
+    d = torch.zeros(1, 1, 1, 16, 16)
+    pts = [(2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15), (1, 1)]
+    for (r, c) in pts:
+        d[0, 0, 0, r, c] = 5.0 + r  # distinct in-range depths
+    n_full = int((d > 0).sum())
+
+    vt = _make_vt(True, keep_ratio=0.25).train()
+    vt.get_cam_feats(torch.randn(1, 1, 8, 2, 2), d.clone())
+    # GT keeps the FULL set of points (supervision target never dropped)
+    assert int((vt._depth_gt > 0).sum()) == n_full
+
+
+@pytest.mark.skipif(_DepthLSS is None,
+                    reason='DepthLSSTransform needs the compiled BEVFusion ops')
+def test_v2_dropout_is_train_only():
+    # in EVAL mode the input is NOT dropped regardless of keep_ratio, so the
+    # produced camera features are identical to keep_ratio=1.0 (inference
+    # unchanged). We compare get_cam_feats outputs with a fixed seed.
+    torch.manual_seed(0)
+    d = torch.zeros(1, 1, 1, 16, 16)
+    d[0, 0, 0, 4, 4] = 7.0
+    d[0, 0, 0, 8, 8] = 20.0
+    x = torch.randn(1, 1, 8, 2, 2)
+
+    vt = _make_vt(True, keep_ratio=0.1).eval()
+    out_drop = vt.get_cam_feats(x.clone(), d.clone())
+    vt_ref = _make_vt(True, keep_ratio=1.0).eval()
+    vt_ref.load_state_dict(vt.state_dict())  # same weights
+    out_full = vt_ref.get_cam_feats(x.clone(), d.clone())
+    assert torch.allclose(out_drop, out_full)  # eval: dropout is a no-op
+
+
+def test_invalid_keep_ratio_raises():
+    if _DepthLSS is None:
+        pytest.skip('DepthLSSTransform needs the compiled BEVFusion ops')
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(AssertionError):
+            _make_vt(True, keep_ratio=bad)
