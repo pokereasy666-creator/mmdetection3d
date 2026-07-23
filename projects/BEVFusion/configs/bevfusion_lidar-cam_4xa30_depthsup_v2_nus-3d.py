@@ -12,7 +12,15 @@
 # depthnet input AND (under v1) the supervision target, and only observed pixels
 # are supervised, so the net can learn to COPY the input instead of inferring
 # depth. v2 drops (1 - keep_ratio) of the INPUT points during training while the
-# supervision GT keeps the FULL projection, forcing depth *completion*.
+# supervision GT keeps the FULL projection, forcing depth *completion*. NB v2
+# kills the copy-EVERYTHING solution but still supervises all valid cells, so the
+# retained ~keep_ratio of cells can still be conditionally copied; set
+# `depth_loss_heldout_only=True` (v3) for the strict no-overlap loss.
+#
+# TWO ORTHOGONAL AXES: v2/v3 fix input-side leakage ONLY. The auxiliary-loss
+# magnitude is a separate axis -- weight 3.0 can still crowd out detection-driven
+# depth -- so sweep the weight (3.0 AND 1.0) for v2/v3 too and monitor
+# loss_depth/loss_bbox and grad_norm (see RUNBOOK_A).
 #
 # Inference is UNCHANGED (dropout is train-only) and NO parameters are added, so
 # the model state_dict is still identical to the baseline's; the only train-time
@@ -39,6 +47,9 @@ model = dict(
         # keep 30% of the input LiDAR points during training (drop 70%); the
         # supervision GT stays the FULL projection. 1.0 == v1 (no dropout).
         depth_input_keep_ratio=0.3,
+        # v3 (strict no-overlap loss): uncomment to supervise ONLY held-out
+        # cells (no copy possible). Needs depth_input_keep_ratio < 1.0.
+        # depth_loss_heldout_only=True,
     ))
 
 # Runtime products MUST live outside the (re-extracted) source tree.

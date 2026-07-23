@@ -179,6 +179,51 @@ def test_drop_zeros_stay_zero_and_rate_is_right():
     assert torch.all((out[real] == 1.0) | (out[real] == 0.0))
 
 
+# ------------- v3 held-out-only loss (strict no-overlap) --------------------
+def test_heldout_only_supervises_only_held_out_cells():
+    # [module-A/depth-sup-v3] with input_depth given, the loss covers ONLY cells
+    # whose (occluded) input has no point; kept-input cells are excluded.
+    img, feat = (4, 4), (2, 2)
+    gt = torch.zeros(1, 1, 4, 4)
+    gt[0, 0, 0, 0] = 2.0    # cell (0,0): keeps its input point -> excluded
+    gt[0, 0, 2, 2] = 10.0   # cell (1,1): held out (no input)   -> supervised
+    input_depth = torch.zeros(1, 1, 4, 4)
+    input_depth[0, 0, 0, 0] = 2.0  # only cell (0,0) has an input point
+
+    one_hot, valid = depth_sup.downsample_gt_depth(gt, img, feat, DBOUND, NUM_BINS)
+    assert int(valid.sum()) == 2   # both cells valid in the FULL GT
+    b00 = one_hot[0, 0, 0].argmax().item()  # correct bin for the KEPT cell
+
+    logits = torch.full((1, NUM_BINS, 2, 2), -10.0)
+    logits[0, b00, 0, 0] = 10.0    # KEPT cell perfectly correct (but excluded)
+    # HELD cell (1,1) left wrong (uniform -10). Held-out-only loss sees only it.
+    loss_full = depth_sup.depth_bce_loss(
+        logits, gt, img, feat, DBOUND, NUM_BINS, 1.0)
+    loss_held = depth_sup.depth_bce_loss(
+        logits, gt, img, feat, DBOUND, NUM_BINS, 1.0, input_depth=input_depth)
+    # dropping the (correct) kept cell leaves only the wrong held cell -> larger
+    assert float(loss_held) > float(loss_full)
+    # invariant to the kept cell's logits (proves the kept cell is excluded)
+    logits2 = logits.clone()
+    logits2[0, :, 0, 0] = torch.randn(NUM_BINS)
+    loss_held2 = depth_sup.depth_bce_loss(
+        logits2, gt, img, feat, DBOUND, NUM_BINS, 1.0, input_depth=input_depth)
+    assert torch.allclose(loss_held, loss_held2)
+
+
+def test_heldout_only_no_held_cells_gives_zero():
+    # if every valid cell keeps its input point, held-out set is empty -> 0.
+    img, feat = (4, 4), (2, 2)
+    gt = torch.zeros(1, 1, 4, 4)
+    gt[0, 0, 0, 0] = 2.0
+    input_depth = gt.clone()  # input == full GT, nothing held out
+    logits = torch.randn(1, NUM_BINS, 2, 2, requires_grad=True)
+    loss = depth_sup.depth_bce_loss(
+        logits, gt, img, feat, DBOUND, NUM_BINS, 1.0, input_depth=input_depth)
+    assert float(loss) == 0.0
+    loss.backward()  # graph stays alive
+
+
 # ------------- DepthLSSTransform level (needs compiled ops) -----------------
 def _load_depth_lss():
     try:
@@ -281,3 +326,34 @@ def test_invalid_keep_ratio_raises():
     for bad in (0.0, -0.1, 1.5):
         with pytest.raises(AssertionError):
             _make_vt(True, keep_ratio=bad)
+
+
+@pytest.mark.skipif(_DepthLSS is None,
+                    reason='DepthLSSTransform needs the compiled BEVFusion ops')
+def test_v3_heldout_only_requires_dropout_and_uses_occluded_input():
+    # heldout_only without dropout (keep_ratio=1.0) is a config error
+    with pytest.raises(AssertionError):
+        _DepthLSS(
+            in_channels=8, out_channels=4, image_size=[16, 16],
+            feature_size=[2, 2], xbound=[-54.0, 54.0, 0.3],
+            ybound=[-54.0, 54.0, 0.3], zbound=[-10.0, 10.0, 20.0],
+            dbound=DBOUND, downsample=1, use_depth_sup=True,
+            depth_input_keep_ratio=1.0, depth_loss_heldout_only=True)
+
+    # valid config: keep_ratio<1 + heldout_only. After a TRAIN forward the
+    # occluded input is stashed; get_depth_loss consumes and clears it.
+    vt = _DepthLSS(
+        in_channels=8, out_channels=4, image_size=[16, 16], feature_size=[2, 2],
+        xbound=[-54.0, 54.0, 0.3], ybound=[-54.0, 54.0, 0.3],
+        zbound=[-10.0, 10.0, 20.0], dbound=DBOUND, downsample=1,
+        use_depth_sup=True, depth_loss_weight=3.0,
+        depth_input_keep_ratio=0.5, depth_loss_heldout_only=True).train()
+    d = torch.zeros(1, 1, 1, 16, 16)
+    for (r, c) in [(2, 3), (5, 6), (8, 9), (11, 12), (14, 15)]:
+        d[0, 0, 0, r, c] = 4.0 + r
+    vt.get_cam_feats(torch.randn(1, 1, 8, 2, 2), d.clone())
+    assert vt._depth_input is not None            # occluded input stashed
+    assert vt._depth_gt is not None               # full GT stashed
+    loss = vt.get_depth_loss()
+    assert vt._depth_input is None and vt._depth_gt is None  # cleared
+    assert torch.isfinite(loss)

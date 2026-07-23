@@ -31,15 +31,32 @@ Tuning the weight only **reduces** the damage; it never crosses into a gain
 AND (v1) the supervision target, and only observed pixels are supervised, so the
 net can minimise the loss by **copying** the input rather than inferring depth.
 
-**v2 fix (`depth_input_keep_ratio`, default 1.0 = OFF = v1):** during TRAINING,
+**v2 (`depth_input_keep_ratio`, default 1.0 = OFF = v1):** during TRAINING,
 `get_cam_feats` drops `1 - keep_ratio` of the input LiDAR points fed to
 `dtransform` (via `drop_depth_input`), while the supervision GT keeps the FULL
-projection. Most supervised pixels then have NO input answer, forcing depth
-*completion*, not copying. At `keep_ratio=0.3`, ~63% of supervised feature cells
-have no input point (measured at production shapes). **Inference is unchanged**
-(dropout is train-only) and **zero parameters** are added. See
-`probe_depth_shortcut.py` to measure the shortcut directly (kept-vs-held-out
-predicted-depth gap) on baseline vs +A checkpoints.
+projection. This **kills the copy-*everything* degenerate solution** and forces
+a completion function. It does **NOT fully close the shortcut**, though: v2 still
+supervises ALL valid cells, and at `keep_ratio=0.3` ~37% of them still have an
+input point (measured at production shapes: 8654 valid → 5485 held-out, 3169
+retained), so those cells can still be solved by *conditional* copy. Inference
+is unchanged (dropout is train-only) and zero parameters are added.
+
+**v3 (`depth_loss_heldout_only`, default False):** the STRICT no-overlap
+version. `depth_bce_loss` takes the occluded `input_depth` and restricts the
+loss to cells whose input has no point (`valid & ~valid_input`), so 100% of the
+supervision requires inference and 0% can be met by copying (5485 supervised,
+0 retained). Requires `depth_input_keep_ratio < 1.0` (asserted). Same zero-param,
+inference-unchanged properties. Use v3 when the strict "no copy possible" claim
+is required; v2 is the softer completion-style regularizer.
+
+**Two ORTHOGONAL failure axes — v2/v3 fix only ONE.** (1) *input-side leakage*
+(this fix); (2) *auxiliary-loss magnitude* — a large `depth_loss_weight` crowds
+out the detection-driven gradient (the monotonic dose-response: w1.0 −0.26 NDS,
+w3.0 −0.75). v2/v3 do nothing about axis (2): the config still uses weight 3.0
+for pairing with +A w3.0, so **each of v2/v3 must still be swept over weight
+(3.0 and 1.0)** and training must monitor `loss_depth` vs `loss_bbox` and total
+`grad_norm`. See `probe_depth_shortcut.py` to measure the shortcut directly
+(kept-vs-held-out predicted-depth gap) on baseline vs +A checkpoints.
 
 ## Switch carrier = module attributes (not a changed return signature)
 Per the design rule, the depth tensors are surfaced via **plain attributes** on

@@ -349,6 +349,7 @@ class DepthLSSTransform(BaseDepthTransform):
         use_depth_sup: bool = False,
         depth_loss_weight: float = 3.0,
         depth_input_keep_ratio: float = 1.0,
+        depth_loss_heldout_only: bool = False,
     ) -> None:
         """Compared with `LSSTransform`, `DepthLSSTransform` adds sparse depth
         information from lidar points into the inputs of the `depthnet`.
@@ -359,17 +360,29 @@ class DepthLSSTransform(BaseDepthTransform):
         and no parameters are introduced.
 
         [module-A/depth-sup-v2] ``depth_input_keep_ratio`` (default 1.0 = OFF,
-        i.e. unchanged v1 behavior) closes the input-reconstruction shortcut.
+        i.e. unchanged v1 behavior) weakens the input-reconstruction shortcut.
         The stock ``DepthLSSTransform`` feeds the *same* sparse LiDAR depth both
         as the ``depthnet`` INPUT and (under v1 supervision) as the GT TARGET, so
         the supervised pixels already have their answer in the input -> the net
         can learn to copy the input instead of inferring depth (leakage). With
         ``keep_ratio < 1.0``, TRAINING randomly drops ``1 - keep_ratio`` of the
         input LiDAR points fed to ``dtransform`` while the supervision GT keeps
-        the FULL projection (see ``get_cam_feats``). Most supervised pixels then
-        have NO answer in the input, forcing depth *completion*, not copying.
-        Inference is UNCHANGED (dropout is train-only), and no parameters are
-        added. Only meaningful together with ``use_depth_sup=True``.
+        the FULL projection (see ``get_cam_feats``). This kills the
+        copy-*everything* degenerate solution and forces a completion function,
+        but does NOT fully close the shortcut: the retained-input cells (~
+        ``keep_ratio`` of the supervised cells) can still be solved by
+        *conditional* copy. Inference is UNCHANGED (dropout is train-only) and no
+        parameters are added.
+
+        [module-A/depth-sup-v3] ``depth_loss_heldout_only`` (default False) is
+        the STRICT version: compute the depth loss ONLY on feature cells whose
+        (occluded) input has no point, so 100% of the supervision requires
+        inference and 0% can be met by copying -- strict no-overlap. Requires
+        ``depth_input_keep_ratio < 1.0`` (else there are no held-out cells).
+
+        NB: neither v2 nor v3 touches the OTHER failure axis -- a large auxiliary
+        ``depth_loss_weight`` can still crowd out the detection-driven gradient
+        (see the monotonic dose-response in RUNBOOK_A). Keep sweeping the weight.
         """
         super().__init__(
             in_channels=in_channels,
@@ -438,8 +451,14 @@ class DepthLSSTransform(BaseDepthTransform):
             f'depth_input_keep_ratio must be in (0, 1], got '
             f'{depth_input_keep_ratio}')
         self.depth_input_keep_ratio = depth_input_keep_ratio
+        # [module-A/depth-sup-v3] strict no-overlap loss (held-out cells only).
+        assert not (depth_loss_heldout_only and depth_input_keep_ratio >= 1.0), (
+            'depth_loss_heldout_only=True needs depth_input_keep_ratio < 1.0 '
+            '(otherwise there are no held-out cells and the loss is always 0)')
+        self.depth_loss_heldout_only = depth_loss_heldout_only
         self._depth_pred_logits = None  # (B*N, D, fH, fW), pre-softmax
-        self._depth_gt = None           # (B*N, 1, iH, iW), sparse LiDAR depth
+        self._depth_gt = None           # (B*N, 1, iH, iW), FULL sparse depth GT
+        self._depth_input = None        # (B*N, 1, iH, iW), occluded depthnet in
 
     def get_cam_feats(self, x, d):
         B, N, C, fH, fW = x.shape
@@ -456,11 +475,15 @@ class DepthLSSTransform(BaseDepthTransform):
                 # [module-A/depth-sup-v2] drop (1 - keep_ratio) of the input
                 # LiDAR points fed to `dtransform`, so most SUPERVISED pixels
                 # have no answer in the input -> the depthnet must COMPLETE
-                # depth, not copy it (closes the leakage shortcut). `d` is
-                # reassigned to a dropped copy; `self._depth_gt` still refers to
-                # the full tensor above (drop_depth_input never mutates its
-                # input), so the GT is unaffected. keep_ratio >= 1.0 is a no-op.
+                # depth rather than copy it wholesale. `d` is reassigned to a
+                # dropped copy; `self._depth_gt` still refers to the full tensor
+                # above (drop_depth_input never mutates its input), so the GT is
+                # unaffected. keep_ratio >= 1.0 is a no-op.
                 d = drop_depth_input(d, self.depth_input_keep_ratio)
+                # [module-A/depth-sup-v3] keep the occluded input so the loss can
+                # restrict to held-out cells (strict no-overlap). Cheap ref; only
+                # read by get_depth_loss when depth_loss_heldout_only is True.
+                self._depth_input = d
 
         d = self.dtransform(d)
         x = torch.cat([d, x], dim=1)
@@ -485,19 +508,24 @@ class DepthLSSTransform(BaseDepthTransform):
 
         Softmax (over the depth-bin dim, matching the forward lift) + BCE
         between the stashed pre-softmax depth logits and the discretized sparse
-        LiDAR depth GT, with official BEVDepth normalization (per-valid-pixel
-        sum over bins, averaged over valid pixels). Only pixels with a LiDAR
-        point in ``[d_min, d_max)`` are supervised (the sparse mask).
+        LiDAR depth GT, with official BEVDepth normalization (per-supervised-cell
+        sum over bins, averaged over supervised cells). v1/v2 supervise every
+        cell with a LiDAR point in ``[d_min, d_max)``; [module-A/depth-sup-v3]
+        with ``depth_loss_heldout_only`` the loss is restricted to cells whose
+        occluded input has no point (strict no-overlap -- no copy possible).
         Reads AND clears the caches; returns the weighted scalar loss.
         """
         logits, gt = self._depth_pred_logits, self._depth_gt
         assert logits is not None and gt is not None, (
             'get_depth_loss called without cached depth tensors; ensure '
             'use_depth_sup=True and a forward ran before loss().')
+        input_depth = self._depth_input if self.depth_loss_heldout_only else None
         self._depth_pred_logits = None
         self._depth_gt = None
+        self._depth_input = None
         return depth_bce_loss(logits, gt, self.image_size, self.feature_size,
-                              self.dbound, self.D, self.depth_loss_weight)
+                              self.dbound, self.D, self.depth_loss_weight,
+                              input_depth=input_depth)
 
     def forward(self, *args, **kwargs):
         x = super().forward(*args, **kwargs)

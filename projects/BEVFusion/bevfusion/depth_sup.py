@@ -16,13 +16,16 @@ import torch.nn.functional as F
 def drop_depth_input(depth: torch.Tensor, keep_ratio: float) -> torch.Tensor:
     """[module-A/depth-sup-v2] Randomly zero (1 - keep_ratio) of a sparse depth.
 
-    Closes the input-reconstruction shortcut: when the SAME sparse LiDAR depth
+    Weakens the input-reconstruction shortcut: when the SAME sparse LiDAR depth
     is both the ``depthnet`` input and the supervision target, the net can learn
     to copy the input at supervised pixels instead of inferring depth. Dropping
     most input points (while the GT keeps the full projection, done by the
-    caller) forces depth *completion* instead. A zeroed entry is exactly "no
-    LiDAR point here", matching the sparse-map convention, so already-empty
-    pixels are unaffected.
+    caller) kills the copy-*everything* degenerate solution and forces a
+    completion function -- but the retained ``keep_ratio`` of supervised cells
+    can still be solved by conditional copy; use the v3 held-out-only loss
+    (``depth_loss_heldout_only``) for strict no-overlap. A zeroed entry is
+    exactly "no LiDAR point here", matching the sparse-map convention, so
+    already-empty pixels are unaffected.
 
     Args:
         depth (Tensor): sparse depth map (0 where no point). Any shape.
@@ -94,6 +97,7 @@ def depth_bce_loss(
     dbound: Tuple[float, float, float],
     num_bins: int,
     weight: float = 3.0,
+    input_depth: torch.Tensor = None,
 ) -> torch.Tensor:
     """Masked softmax + BCE depth loss, activation-matched to the forward LSS.
 
@@ -112,19 +116,35 @@ def depth_bce_loss(
     Args:
         logits (Tensor): ``(M, D, fH, fW)`` PRE-softmax depth logits; softmaxed
             over the bin dim (dim=1) inside this function.
-        gt_depth (Tensor): ``(M, 1, iH, iW)`` sparse LiDAR depth GT.
+        gt_depth (Tensor): ``(M, 1, iH, iW)`` sparse LiDAR depth GT (FULL).
         image_size / feature_size / dbound / num_bins: see ``downsample_gt_depth``.
         weight (float): loss weight (``depth_loss_weight``); the default 3.0 is
             official BEVDepth's ``return 3.0 * depth_loss``.
+        input_depth (Tensor, optional): ``(M, 1, iH, iW)`` the (occluded) depth
+            map actually FED to the depthnet. [module-A/depth-sup-v3] When given,
+            the loss is restricted to feature cells whose input has NO point
+            (``valid & ~valid_input``), i.e. the **held-out** cells only, so the
+            supervision cannot be satisfied by copying the input at all (strict
+            no-overlap). When ``None`` (v1/v2) the loss covers all valid cells --
+            note v2's input dropout only kills the copy-*everything* degenerate
+            solution; the retained-input cells can still be solved by conditional
+            copy. Use ``input_depth`` for the strict version.
 
     Returns:
-        Tensor: scalar ``weight * sum_over_bins_BCE / n_valid_pixels``, or a
-        graph-connected zero if there is no valid LiDAR pixel in the batch.
+        Tensor: scalar ``weight * sum_over_bins_BCE / n_supervised_pixels``, or a
+        graph-connected zero if there is no supervised pixel in the batch.
     """
     one_hot, valid = downsample_gt_depth(gt_depth, image_size, feature_size,
                                          dbound, num_bins)
+    if input_depth is not None:
+        # [module-A/depth-sup-v3] held-out-only: supervise ONLY cells whose
+        # (occluded) input has no point, so 100% of the signal requires
+        # inference and 0% can be met by copying the retained input.
+        _, valid_input = downsample_gt_depth(input_depth, image_size,
+                                             feature_size, dbound, num_bins)
+        valid = valid & (~valid_input)
     if not valid.any():
-        # no LiDAR-hit pixel this batch -> zero loss, but keep the graph alive
+        # no supervised pixel this batch -> zero loss, but keep the graph alive
         return logits.sum() * 0.0
     # Activation MUST match the forward LSS lift: DepthLSSTransform.get_cam_feats
     # lifts features with `logits.softmax(dim=1)` over the depth-bin dim, so the

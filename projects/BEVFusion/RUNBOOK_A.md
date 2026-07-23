@@ -118,6 +118,20 @@ w3.0 (the completion task is harder) and `grad_norm` similar-to-lower than w3.0.
 | NDS | 0.7060 | 0.6985 | `PENDING` |
 | mAP | 0.6648 | 0.6508 | `PENDING` |
 
+**v3 strict no-overlap** (optional, stronger): add
+`model.view_transform.depth_loss_heldout_only=True` to the `--cfg-options` above
+to supervise ONLY held-out cells (no copy possible at all). v2 still lets the
+retained ~30% of cells be conditionally copied; v3 removes that.
+
+**Two orthogonal axes — do NOT conflate.** v2/v3 fix input-side leakage only;
+the auxiliary-loss magnitude is separate. Weight 3.0 above pairs v2/v3 to +A
+w3.0 (only change = the fix), but the dose-response (w1.0 −0.26 / w3.0 −0.75
+NDS) means weight still matters independently. So for v2 (and v3 if run) ALSO do
+a `depth_loss_weight=1.0` arm, and in EVERY run watch:
+- `loss_depth` vs `loss_bbox` (depth must not dwarf detection), and
+- total `grad_norm` (v1 baseline ~0.9; w1.0 peaked ~9; w3.0 ~80 — a sign the
+  depth term is over-driving the shared trunk).
+
 **Shortcut probe** (before/after, read-only, needs GPU+val+ops):
 ```bash
 python projects/BEVFusion/tools/probe_depth_shortcut.py \
