@@ -51,7 +51,7 @@ config 要点：
 - GT-sampling：fusion 管线本就未启用（M0_RECON_REPORT.md §3b）→ 新 config 仅注释说明 +
   sanity_lambda_logging 断言 pipeline 无 'ObjectSample'（铁律 4 防回归）。
 - 主 config 覆盖：`model.type='EPFusion'`、`model.data_preprocessor.type='EPFusionDataPreprocessor'`
-  （dict 合并保留 mean/std/voxelize_cfg）、`load_from=work_dirs/baseline1/epoch_19.pth`、`train_cfg.max_epochs`、
+  （dict 合并保留 mean/std/voxelize_cfg）、`load_from=work_dirs/bevfusion_lidar-cam_official6e_4xa30_amp512_accum4_seed577127641/epoch_5.pth`、`train_cfg.max_epochs`、
   `param_scheduler` 端点、`optim_wrapper.paramwise_cfg`、`randomness=dict(seed=2026)`。
   所有可调项（w_teach、p_zero、严重度区间、模式配比、开关）皆为 model/preprocessor 的 config 字段，
   经 `--cfg-options` 命令行覆盖（铁律 17，零代码迭代）。
@@ -60,9 +60,12 @@ config 要点：
 
 ### B.1 PoEFuser（poe_fuser.py；全部新参数收于此，ckpt 命名空间干净）
 
-- **proj_C**：1×1 Conv，80 → D；**proj_L**：1×1 Conv，256 → D；共享维 **D=256**
+- **proj_C**：3×3 Conv，80 → D；**proj_L**：3×3 Conv，256 → D；共享维 **D=256**
   （= pts_backbone 输入通道，免出口投影）。✅ 探针 P3 实测确认：相机 BEV 80ch、LiDAR BEV
   256ch、fusion 入/出 256ch，**80/256/256 全部坐实，无需 out-proj 兜底**。
+  两个投影由冻结教师 ConvFuser 折叠 BN 后按输入通道切分并乘 2 初始化，Λ≡1 时经
+  输出 ReLU 与教师逐位等价。`proj_C + proj_L` 合计 `336×256×3×3`，与 baseline
+  ConvFuser 融合卷积参数量相同；额外参数仅两个 Λ 头（约 0.17M）。
 - **lambda_head_C / lambda_head_L**（结构相同、不共享权重）：
   `Conv3×3(C_in→64) → GN(8,64) → ReLU → Conv3×3(64→64) → GN(8,64) → ReLU → Conv1×1(64→1)`，
   输出 1 通道 **log-precision**，`clamp(logΛ, −7, 7)`；**末层 weight 与 bias 零初始化**
@@ -73,7 +76,8 @@ config 要点：
     Λ 评估"原始模态证据质量"；若用投影后特征，proj 缩放与 Λ 存在互相补偿的退化解。
     预埋 `lambda_input='raw'|'projected'` 开关（开放问题 I-6）。
 - **PoE 闭式融合**：`μ_F = (Λ_C·P_C(F_C) + Λ_L·P_L(F_L)) / (Λ_C + Λ_L + eps)`，eps=1e-6（铁律 6）；
-  Λ_m 形状 [B,1,H,W] 广播到 D 通道；输出 [B,256,180,180]（✅ P3 实测 fusion 出 256ch/180²）直接喂 pts_backbone。
+  Λ_m 形状 [B,1,H,W] 广播到 D 通道；融合结果经 ReLU 后输出
+  [B,256,180,180]（✅ P3 实测 fusion 出 256ch/180²）直接喂 pts_backbone。
 - forward 返回 dict：`{mu_F, log_lambda_C, log_lambda_L, pc, pl}`（pc/pl=投影后分支特征，供 L_teach）。
 - **PoE 与 L_teach 一律 fp32 计算**（局部 `autocast(enabled=False)` + 显式 .float()，见 I-10）。
 
@@ -242,7 +246,7 @@ losses[<Λ 与坍缩预警键>]                                        # 仅日�
   ✅ 探针 P6 实测：requires_grad=False 参数被优化器跳过（weight_decay=0.5 放大下 3 步更新
   仍位级不变 = PASS）→ 双保险充分，无需为冻结模块额外补 lr_mult=0；paramwise_cfg 的
   custom_keys lr_mult 也经 P6.6 核验生效（lr=2e-5 与 2e-4 两档如期出现）。
-- **轮数：建议 3 epochs**（≤6）：主干冻结，从零学的只有小容量 Λ 头与 1×1 投影；
+- **轮数：建议 3 epochs**（≤6）：主干冻结，从零学的只有小容量 Λ 头；
   pts_backbone/neck/head 自已收敛 ckpt 以 0.1×LR 微调。`--cfg-options train_cfg.max_epochs=`
   可调（一次 zip 往返内可加训）。**param_scheduler 端点须同步覆盖**：LinearLR warmup 500 iter
   保留；CosineAnnealingLR T_max=3/end=3；两段 CosineAnnealingMomentum 端点按比例缩放为
@@ -289,7 +293,7 @@ losses[<Λ 与坍缩预警键>]                                        # 仅日�
   bash scripts/deploy.sh --data <nuscenes> --work-dirs <work_dirs> --ops-from <旧部署目录>
   bash tools/dist_train.sh projects/EPFusion/configs/epfusion_m0_poe_4xa30-amp-accum_nus-3d.py 4 \
       --amp --sync_bn torch \
-      --cfg-options load_from=work_dirs/baseline1/epoch_19.pth model.w_teach=1.0 randomness.seed=2026
+      --cfg-options load_from=work_dirs/bevfusion_lidar-cam_official6e_4xa30_amp512_accum4_seed577127641/epoch_5.pth model.w_teach=1.0 randomness.seed=2026
   ```
 
 ## G. 诊断与验收脚本
@@ -312,7 +316,9 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
    (f) **单卡 backward 冒烟**：一次 loss 反传后，全部可训练参数 grad 非 None
        （且抽查冻结参数 grad 为 None）；
    (g) 'zero_image'/'zero_points' 强制路径冒烟（不崩溃、Λ 日志在场）；
-   (h) 打印首步 LR/momentum（核对 param_scheduler 端点与 max_epochs 同步）。
+   (h) 打印首步 LR/momentum，并断言 `T_max` 及 epoch-based `end` 不超过 `max_epochs`；
+   (i) **教师等价性断言**：显式执行教师初始化后，Λ≡1 的 PoE 输出与冻结
+       ConvFuser 输出 `torch.allclose(rtol=1e-4, atol=1e-5)`。
    报告 `sanity_lambda_logging_<日期>.txt`。
 2. **sanity_p1.py**：`--num-frames 50 --corruption downsample_blur --severities 0,0.2,0.4,0.6,0.8,1.0`。
    仅用 TRAIN 族损坏（铁律 5，**禁用 nuScenes-C 损坏**）；50 个 val 帧逐严重度强制 corrupt_cam
@@ -334,8 +340,8 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
 1. **clean 精度（相对差判据 + 绝对值锚）**：
    - 相对差：EP 最优 run 的 clean NDS ≥ **R0 − 1.0**（注意：R0 = 冻结对照组，**不是**全量复现 run；
      EP 与 R0 同口径评测——同 eval_quarter_val 或同全量 val）。
-   - **绝对值锚**：R0 与 EP 的 clean NDS 必须同时报告**相对探针 P2 复现参照值的差**；
-     若两者均低于参照 **2.0 NDS 以上** → 触发损坏配比/训练长度排查（怀疑退化演练配比过强或
+   - **绝对值锚**：R0 与 EP 的 clean NDS 必须同时报告**相对探针 P2 复现参照值 0.7060 的差**；
+     若两者均低于 0.7060 **达 2.0 NDS 以上** → 触发损坏配比/训练长度排查（怀疑退化演练配比过强或
      轮数不足），**相对差判据暂停适用**，排查收敛后重新评估。
 2. **P1 校准曲线（量化）**：Λ_C 满足 Spearman ρ ≤ −0.9 且置换检验 p < 0.05（单调下降）；
    Λ_L 满足 |ρ| < 0.5 或相对变化 < Λ_C 相对降幅的 20%（平坦）。
@@ -350,17 +356,17 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
 ## I. 风险与开放问题
 
 1. **教师/冻结主干 checkpoint【已决，开放问题闭合】**：锁定
-   **`work_dirs/baseline1/epoch_19.pth`**（20 轮 run 暴跌前最佳点，NDS 0.696 / mAP 0.665）。
+   **`work_dirs/bevfusion_lidar-cam_official6e_4xa30_amp512_accum4_seed577127641/epoch_5.pth`**
+   （官方两阶段配方：LiDAR-only 20 轮 → 融合微调 6 轮；NDS 0.7060 / mAP 0.6648）。
    理由：(a) 与 R0/R1-R3 同源初始化，锚点公平性最大化；(b) BN running stats 与本机
    SyncBN/有效 batch（4 卡×2）设置同源，教师 eval 输出分布与学生训练分布一致；
-   (c) 数据预处理完全同构。**epoch_6（失败的首次 6 轮 run）与 epoch_20（20 轮 run 暴跌点）
-   永久弃用**（暴跌为 CBGS 调度端点固有行为，见 RECON §4）。复现 Δ≈−1.8 NDS（< 官方）经
-   双 run 自洽 + SyncBN 归因判定为已知系统性差异、非 bug；因 M0 锚点是本机 R0 冻结对照
-   （H 章）而非官方分，该差异不影响相对比较，故不阻塞。
+   (c) 数据预处理完全同构。**epoch_6（NDS 0.6960 / mAP 0.6538）因 param_scheduler
+   端点与 CBGS 重采样导致的末轮回落而弃用**；这是该模式第三次独立复现。
 2. **共享投影维 D**：**256（= pts_backbone 入口，✅ P3 实测 fusion 入/出 256ch 坐实）**；
    压小 D 需 out-proj，M1 再议。
 3. **投影后是否加 norm 及位置**：默认无 norm（线性投影 + 对齐由 L_teach 驱动）；
    **BN 高危否决**（整批单模式 micro-batch 使 BN 统计随模式震荡）；GN 为备选 config 开关。
+   同一判定适用于 R0 的 `student_fuser`，其 BN 强制 eval、只用 running stats，但仿射参数保持可训练。
 4. **BEV encoder 全量 vs 部分解冻**：默认 pts_backbone+pts_neck+bbox_head 全解冻（0.1×LR）；
    若 R0 显示 clean 跌幅过大，备选只解冻 pts_neck+bbox_head——预埋 config 开关，零代码迭代。
 5. **干净副本携带机制**：候选 2（preprocessor 子类）已选（D.2 给理由）；候选 1 留档不实现。

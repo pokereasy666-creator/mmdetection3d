@@ -1,6 +1,7 @@
 # EP-Fusion M0 R0 对照 config（冻结主干 + 可训练 ConvFuser 副本 + 同退化数据流，无 Λ/无 L_teach）。
 # 公平锚点：与 R1-R3 唯一差别 = 融合机制(ConvFuser vs PoE) + 有无 L_teach；退化数据流相同。
 # student_fuser 初值由 R0WeightCopyHook 在 iter0 从冻结教师 fusion_layer 拷贝。
+# student_fuser 的 BN 由 EPFusion.train() 强制 eval，与冻结教师保持同口径（见 A3）。
 #
 # 启动：
 #   bash tools/dist_train.sh \
@@ -15,8 +16,12 @@ model = dict(
     # emit_clean=False：R0 无教师前向、不消费 clean 副本，省每步第二次 clean 图归一化（阻断2）
     data_preprocessor=dict(emit_clean=False))
 
-# before_train 时机从 fusion_layer 拷权重给 student_fuser（仅 iter0，resume 守卫见 hooks.py）
-custom_hooks = [dict(type='R0WeightCopyHook')]
+# before_train 时机从 fusion_layer 拷权重给 student_fuser（仅 iter0，resume 守卫见 hooks.py）。
+# 退火 hook 默认关闭，仅用于保持 EP/R0 两臂 hook 列表结构对称。
+custom_hooks = [
+    dict(type='R0WeightCopyHook'),
+    dict(type='WTeachAnnealHook', enable=False, w_teach_end=0.0),
+]
 
 # R0 优化器分组：student_fuser（自教师拷初值）低 LR 微调；poe_fuser 键不存在则无影响。
 optim_wrapper = dict(

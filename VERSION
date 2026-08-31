@@ -1,1 +1,1 @@
-2026-06-25 M0 block1: EPFusion pkg (PoEFuser/EPFusionDataPreprocessor/R0WeightCopyHook/EPFusion) + poe&r0 configs + sanity_lambda_logging (code-only, py_compile pass, untrained)
+2026-07-26 block1-patch2: PoE proj3x3 + teacher-init hook + student_fuser BN eval + sanity (b)1e-6/(h)assert/(i)equiv/parse_losses/proc-check + teacher ckpt -> official6e epoch_5 (NDS 0.7060)

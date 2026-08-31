@@ -2,14 +2,17 @@
 """PoEFuser —— 替换 ConvFuser 的逐格标量 Λ 精度加权 PoE 融合（M0_PLAN B.1）。
 
 设计要点（铁律 6 / I-10）：
-- proj_C/proj_L：1x1 conv 把相机/LiDAR BEV 投影到共享维 D（探针 P3 坐实 80/256→256）；
+- proj_C/proj_L：3x3 conv 把相机/LiDAR BEV 投影到共享维 D（探针 P3 坐实 80/256→256）；
 - lambda_head_C/L：2 个 3x3 conv + 1 个 1x1 conv 输出逐格 log-precision，clamp[-7,7]，
   末层零初始化 ⇒ 初始 logΛ≡0 ⇒ Λ≡1；
 - PoE 闭式融合 μ_F = (Λ_C·P_C + Λ_L·P_L) / (Λ_C + Λ_L + eps)；
 - 全程 fp32（局部关 autocast + 显式 .float()），避免 fp16 下 Λ·diff² 溢出。
 """
+import warnings
+
 import torch
 import torch.nn as nn
+from torch.nn.modules.batchnorm import _BatchNorm
 
 __all__ = ['PoEFuser']
 
@@ -21,36 +24,48 @@ class PoEFuser(nn.Module):
         in_channels_cam (int): 相机 BEV 通道（默认 80，P3 坐实）。
         in_channels_lidar (int): LiDAR BEV 通道（默认 256，P3 坐实）。
         embed_dims (int): 共享投影维 D（默认 256 = pts_backbone 入口）。
+        proj_kernel (int): 分支投影卷积核（默认 3，可设 1 做消融）。
         lambda_hidden (int): Λ 头隐层宽（默认 64）。
         gn_groups (int): GroupNorm 组数（默认 8）。
         clamp_min/clamp_max (float): log-precision clamp 区间（默认 [-7, 7]）。
         eps (float): PoE 分母数值保护（默认 1e-6）。
         lambda_input (str): 'raw'（投影前原始分支特征，默认）或 'projected'。
         norm (str): 'GN'（默认）或 'none'。
+        out_act (str): PoE 输出激活，'relu'（默认）或 'none'。
     """
 
     def __init__(self,
                  in_channels_cam=80,
                  in_channels_lidar=256,
                  embed_dims=256,
+                 proj_kernel=3,
                  lambda_hidden=64,
                  gn_groups=8,
                  clamp_min=-7.0,
                  clamp_max=7.0,
                  eps=1e-6,
                  lambda_input='raw',
-                 norm='GN'):
+                 norm='GN',
+                 out_act='relu'):
         super().__init__()
         assert lambda_input in ('raw', 'projected')
         assert norm in ('GN', 'none')
+        assert out_act in ('relu', 'none')
         self.embed_dims = embed_dims
         self.clamp_min = float(clamp_min)
         self.clamp_max = float(clamp_max)
         self.eps = float(eps)
         self.lambda_input = lambda_input
+        self.out_act = out_act
+        self._teacher_initialized = False
 
-        self.proj_C = nn.Conv2d(in_channels_cam, embed_dims, kernel_size=1)
-        self.proj_L = nn.Conv2d(in_channels_lidar, embed_dims, kernel_size=1)
+        padding = proj_kernel // 2
+        self.proj_C = nn.Conv2d(
+            in_channels_cam, embed_dims, kernel_size=proj_kernel,
+            padding=padding)
+        self.proj_L = nn.Conv2d(
+            in_channels_lidar, embed_dims, kernel_size=proj_kernel,
+            padding=padding)
 
         lam_in_C = in_channels_cam if lambda_input == 'raw' else embed_dims
         lam_in_L = in_channels_lidar if lambda_input == 'raw' else embed_dims
@@ -82,6 +97,52 @@ class PoEFuser(nn.Module):
         if last.bias is not None:
             nn.init.zeros_(last.bias)
 
+    @torch.no_grad()
+    def init_from_convfuser(self, conv_fuser) -> bool:
+        """折叠教师 ConvFuser 的 Conv+BN，初始化两个分支投影。"""
+        self._teacher_initialized = False
+        conv = None
+        bn = None
+        for module in conv_fuser.modules():
+            if conv is None and isinstance(module, nn.Conv2d):
+                conv = module
+            if bn is None and isinstance(module, _BatchNorm):
+                bn = module
+
+        issues = []
+        if conv is None:
+            issues.append('Conv2d not found')
+        if bn is None:
+            issues.append('_BatchNorm not found')
+        if conv is not None:
+            expected_in = self.proj_C.in_channels + self.proj_L.in_channels
+            if conv.weight.shape[1] != expected_in:
+                issues.append('input channels %d != %d'
+                              % (conv.weight.shape[1], expected_in))
+            if conv.weight.shape[0] != self.embed_dims:
+                issues.append('output channels %d != %d'
+                              % (conv.weight.shape[0], self.embed_dims))
+            if conv.weight.shape[2:] != self.proj_C.kernel_size:
+                issues.append('kernel %s != %s'
+                              % (tuple(conv.weight.shape[2:]),
+                                 self.proj_C.kernel_size))
+        if issues:
+            warnings.warn(
+                'PoEFuser teacher initialization skipped: %s'
+                % '; '.join(issues))
+            return False
+
+        scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+        bias = bn.bias - bn.running_mean * scale
+        split = self.proj_C.in_channels
+        scaled = 2.0 * scale.view(-1, 1, 1, 1) * conv.weight
+        self.proj_C.weight.copy_(scaled[:, :split])
+        self.proj_L.weight.copy_(scaled[:, split:])
+        self.proj_C.bias.copy_(bias)
+        self.proj_L.bias.copy_(bias)
+        self._teacher_initialized = True
+        return True
+
     def forward(self, F_C, F_L):
         """Args: F_C [B,Ccam,H,W], F_L [B,Clidar,H,W]（来自冻结分支，无梯度）。
 
@@ -102,5 +163,7 @@ class PoEFuser(nn.Module):
             lam_C = torch.exp(log_C)
             lam_L = torch.exp(log_L)
             mu = (lam_C * pc + lam_L * pl) / (lam_C + lam_L + self.eps)
+            if self.out_act == 'relu':
+                mu = torch.relu(mu)
         return dict(mu_F=mu, log_lambda_C=log_C, log_lambda_L=log_L,
                     lam_C=lam_C, lam_L=lam_L, pc=pc, pl=pl)

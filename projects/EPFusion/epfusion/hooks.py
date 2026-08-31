@@ -14,7 +14,10 @@ from mmengine.model import is_model_wrapper
 
 from mmdet3d.registry import HOOKS
 
-__all__ = ['R0WeightCopyHook', 'copy_weights']
+__all__ = [
+    'R0WeightCopyHook', 'PoETeacherInitHook', 'WTeachAnnealHook',
+    'copy_weights', 'init_poe_from_teacher',
+]
 
 
 def copy_weights(model):
@@ -34,6 +37,92 @@ def copy_weights(model):
         return False
     student.load_state_dict(teacher.state_dict())
     return True
+
+
+def init_poe_from_teacher(model):
+    """用冻结教师 ConvFuser 初始化 PoE 分支投影。"""
+    if is_model_wrapper(model):
+        model = model.module
+    poe_fuser = getattr(model, 'poe_fuser', None)
+    teacher = getattr(model, 'fusion_layer', None)
+    if poe_fuser is None or teacher is None:
+        return False
+    return poe_fuser.init_from_convfuser(teacher)
+
+
+@HOOKS.register_module()
+class PoETeacherInitHook(Hook):
+    """load_from 完成后的 before_train 时机初始化 PoE 分支投影。"""
+
+    def before_train(self, runner):
+        model = runner.model
+        if is_model_wrapper(model):
+            model = model.module
+        if getattr(model, 'poe_fuser', None) is None:
+            return
+        version = _read_version()
+        if runner.iter == 0:
+            ok = init_poe_from_teacher(model)
+            runner.logger.info(
+                '[PoETeacherInitHook] initialized poe_fuser from fusion_layer '
+                '@iter0 (ok=%s, epoch=%d, VERSION=%s)'
+                % (ok, runner.epoch, version))
+        else:
+            runner.logger.info(
+                '[PoETeacherInitHook] skip initialization '
+                '(ok=SKIP, resume, iter=%d, epoch=%d, VERSION=%s)'
+                % (runner.iter, runner.epoch, version))
+
+
+@HOOKS.register_module()
+class WTeachAnnealHook(Hook):
+    """按 epoch 线性退火 w_teach；默认关闭。"""
+
+    def __init__(self,
+                 enable=False,
+                 w_teach_end=0.0,
+                 begin_epoch=0,
+                 end_epoch=None,
+                 mode='linear'):
+        if mode != 'linear':
+            raise ValueError('WTeachAnnealHook only supports mode="linear"')
+        self.enable = bool(enable)
+        self.w_teach_end = float(w_teach_end)
+        self.begin_epoch = int(begin_epoch)
+        self.end_epoch = None if end_epoch is None else int(end_epoch)
+        self.mode = mode
+        self.w_teach_start = None
+
+    def before_train(self, runner):
+        if not self.enable:
+            runner.logger.info(
+                '[WTeachAnnealHook] annealing disabled')
+            return
+        model = runner.model
+        if is_model_wrapper(model):
+            model = model.module
+        self.w_teach_start = float(model.w_teach)
+        if self.end_epoch is None:
+            self.end_epoch = runner.max_epochs
+
+    def before_train_epoch(self, runner):
+        if not self.enable:
+            return
+        model = runner.model
+        if is_model_wrapper(model):
+            model = model.module
+        span = self.end_epoch - self.begin_epoch
+        if span <= 0:
+            progress = 1.0 if runner.epoch >= self.end_epoch else 0.0
+        else:
+            progress = ((runner.epoch - self.begin_epoch) / float(span))
+            progress = min(max(progress, 0.0), 1.0)
+        model.w_teach = (
+            self.w_teach_start
+            + progress * (self.w_teach_end - self.w_teach_start))
+        runner.logger.info(
+            '[WTeachAnnealHook] epoch=%d w_teach=%.8g'
+            % (runner.epoch, model.w_teach))
 
 
 @HOOKS.register_module()

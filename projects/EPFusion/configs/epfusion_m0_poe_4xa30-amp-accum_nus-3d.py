@@ -27,13 +27,15 @@ model = dict(
         in_channels_cam=80,     # 探针 P3 坐实
         in_channels_lidar=256,  # 探针 P3 坐实
         embed_dims=256,         # = pts_backbone 入口，免出口投影
+        proj_kernel=3,          # 与教师 ConvFuser 同核，支持折 BN 后等价初始化
         lambda_hidden=64,
         gn_groups=8,
         clamp_min=-7.0,
         clamp_max=7.0,
         eps=1e-6,
         lambda_input='raw',     # 投影前原始分支特征（开放问题 I-6 开关）
-        norm='GN'),             # BN 在模式混合 batch 上高危，否决；GN
+        norm='GN',              # BN 在模式混合 batch 上高危，否决；GN
+        out_act='relu'),        # 与教师 ConvFuser 的 post-BN ReLU 对齐
     # 离线兼容（铁律 15 / RECON 附录坑1）：load_from 提供 img_backbone 权重，
     # 置空 init_cfg 阻止 BEVFusion.init_weights() 联网下载 Swin 预训练权重。
     img_backbone=dict(init_cfg=None),
@@ -45,10 +47,23 @@ model = dict(
         seed=2026,
         emit_clean=True))               # R1-R3 需教师干净副本
 
-# 教师/冻结主干初值（M0_PLAN I.1 锁定；从全新解压目录的相对路径）
-load_from = 'work_dirs/baseline1/epoch_19.pth'
+# 教师/冻结主干初值：官方两阶段配方（LiDAR-only 20e → 融合微调 6e）的最佳点。
+# epoch_5: NDS 0.7060 / mAP 0.6648；epoch_6 因 scheduler 端点 + CBGS
+# 末轮回落至 0.6960/0.6538 而弃用；旧 baseline1/epoch_19.pth 作废。
+load_from = (
+    'work_dirs/'
+    'bevfusion_lidar-cam_official6e_4xa30_amp512_accum4_seed577127641/'
+    'epoch_5.pth')
 
-# 轮数 3（主干冻结，仅小容量 Λ 头/投影从零学 + BEV encoder/头 0.1xLR 微调）。
+# list 整体替换 _base_ 的 DisableObjectSampleHook；其 disable_after_epoch=15
+# 在 max_epochs=3 下本就不触发，并使 EP/R0 hook 结构对称。
+# 退火默认关闭；可用 --cfg-options custom_hooks.1.enable=True 开启。
+custom_hooks = [
+    dict(type='PoETeacherInitHook'),
+    dict(type='WTeachAnnealHook', enable=False, w_teach_end=0.0),
+]
+
+# 轮数 3（主干冻结，Λ 头从零学、投影由教师初始化 + BEV encoder/头 0.1xLR 微调）。
 # param_scheduler 端点须与 max_epochs=3 同步（漏改会越界，sanity 打印首步 LR/momentum 核对）。
 train_cfg = dict(max_epochs=3)
 param_scheduler = [

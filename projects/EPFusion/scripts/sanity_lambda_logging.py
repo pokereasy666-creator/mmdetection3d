@@ -5,29 +5,31 @@
 只读冒烟 + 断言，不训练、不落盘（除单文件报告）。需 GPU + nuScenes（服务器执行）。
 本脚本不经 Runner.train()，故 R0 权重相等断言前【显式调用】hooks.copy_weights(model)。
 
-断言项（a-h）：
+断言项（a-i）：
   a) 12 个 Λ 键 + loss_teach/teach_nll_raw + 4 个坍缩预警键全部在场；
-  b) 初始化下 clean 模式 mean(Λ_C)≈mean(Λ_L)≈1（poe_fuser 末层零初始化，容差 1e-3）；
+  b) 初始化下 clean 模式 mean(Λ_C)≈mean(Λ_L)≈1（poe_fuser 末层零初始化，容差 1e-6）；
   c) train pipeline cfg 无 'ObjectSample'（铁律 4）；
   d) 教师路径受控 allclose：EP 的 clean F_T vs 原 BEVFusion fusion_layer 输出
      （同 ckpt / 双 eval / fp32 / 同一固定 batch，rtol1e-4/atol1e-5）；
   e) R0：load_checkpoint 后显式 copy_weights(model)，断言 student_fuser≡fusion_layer 逐张量相等；
   f) 单卡 backward 冒烟：一次反传后可训练参数 grad 非 None、冻结参数 grad 为 None；
   g) 'zero_image'/'zero_points' 强制路径冒烟（不崩溃、Λ 键在场）；
-  h) 打印优化器 param-group LR + param_scheduler 端点（核对与 max_epochs 同步）。
+  h) 打印首步 LR/momentum，并断言 param_scheduler epoch 端点不越界；
+  i) Λ≡1 时 PoE 教师初始化输出与冻结 ConvFuser 输出 allclose。
 
 用法（服务器，复现训练结束后）：
   bash scripts/m0_probe.sh  # 确认环境（可选）
   python projects/EPFusion/scripts/sanity_lambda_logging.py \
       --config projects/EPFusion/configs/epfusion_m0_poe_4xa30-amp-accum_nus-3d.py \
       --r0-config projects/EPFusion/configs/epfusion_m0_r0_convfuser_4xa30-amp-accum_nus-3d.py \
-      --checkpoint work_dirs/baseline1/epoch_19.pth \
+      --checkpoint work_dirs/bevfusion_lidar-cam_official6e_4xa30_amp512_accum4_seed577127641/epoch_5.pth \
       --device cuda:0
 """
 import argparse
 import copy
 import datetime
 import os
+import subprocess
 import sys
 import traceback
 
@@ -62,6 +64,11 @@ def read_version():
 
 
 def apply_data_root(cfg, data_root):
+    """递归覆盖 dataloader/evaluator 中已有的 data_root 字段。
+
+    已在 config parse 时拼接好的 ann_file 字符串不会随之改变；切换非默认
+    数据根时，须同时用 --cfg-options 覆盖对应 ann_file。
+    """
     if data_root is None:
         return
     cfg.data_root = data_root
@@ -76,7 +83,8 @@ def apply_data_root(cfg, data_root):
             for child in value:
                 _patch(child)
 
-    for key in ('train_dataloader', 'val_dataloader', 'test_dataloader'):
+    for key in ('train_dataloader', 'val_dataloader', 'test_dataloader',
+                'val_evaluator', 'test_evaluator'):
         if key in cfg:
             _patch(cfg[key])
 
@@ -126,7 +134,53 @@ def build_train_batch(cfg, num=1):
     dl_cfg['num_workers'] = 2
     dl_cfg['persistent_workers'] = False
     loader = Runner.build_dataloader(dl_cfg)
-    return next(iter(loader))
+    return next(iter(loader)), len(loader)
+
+
+def detect_training_processes():
+    """检测训练/GPU compute 进程；逻辑复用 scripts/m0_probe.py:110-152。"""
+    suspects = []
+    try:
+        out = subprocess.run(
+            ['ps', '-eo', 'pid,args'], capture_output=True, text=True,
+            timeout=15).stdout
+        for line in out.splitlines():
+            low = line.lower()
+            if 'sanity_lambda_logging.py' in low:
+                continue
+            if any(k in low for k in (
+                    'tools/train.py', 'torchrun', 'torch.distributed.launch',
+                    'torch.distributed.run', 'dist_train')):
+                suspects.append('[ps] ' + line.strip()[:200])
+    except Exception as e:
+        suspects.append('[ps] 进程扫描失败（无法确认）: %r' % e)
+
+    cvd = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    if cvd is not None and cvd.strip() == '':
+        return suspects
+    try:
+        cmd = [
+            'nvidia-smi',
+            '--query-compute-apps=pid,process_name,used_memory',
+            '--format=csv,noheader',
+        ]
+        if cvd is not None and cvd.strip():
+            cmd += ['-i', cvd.strip()]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            scope = ('可见 GPU [%s]' % cvd.strip()
+                     if (cvd and cvd.strip()) else '全部 GPU')
+            for line in result.stdout.strip().splitlines():
+                if line.strip():
+                    suspects.append(
+                        '[gpu] compute 进程(%s): %s'
+                        % (scope, line.strip()))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        suspects.append('[gpu] nvidia-smi 查询失败（无法确认）: %r' % e)
+    return suspects
 
 
 LAMBDA_KEYS = ['lambda_%s_%s_%s' % (br, m, k)
@@ -137,13 +191,13 @@ WARN_KEYS = ['proj_var_C', 'proj_var_L', 'cos_pc_ft', 'cos_pl_ft']
 
 
 def run_mode(model, batch, mode):
-    """以 force_mode 跑一次 loss()，返回 losses dict（不反传）。"""
-    import torch
+    """以 force_mode 跑一次 loss()+parse_losses（不反传）。"""
     model.data_preprocessor.force_mode = mode
     try:
         data = model.data_preprocessor(copy.deepcopy(batch), True)
         losses = model.loss(data['inputs'], data['data_samples'])
-        return losses
+        loss_sum, log_vars = model.parse_losses(losses)
+        return losses, loss_sum, log_vars
     finally:
         model.data_preprocessor.force_mode = None
 
@@ -184,6 +238,13 @@ def main():
     print('生成时间 : %s' % datetime.datetime.now().isoformat())
     print('VERSION  : %s' % read_version())
     print('命令参数 : %s' % vars(args))
+    process_suspects = detect_training_processes()
+    if process_suspects:
+        print('进程自检 : WARNING，检测到训练进程或无法确认：')
+        for suspect in process_suspects:
+            print('  ' + suspect)
+    else:
+        print('进程自检 : PASS，未发现训练/GPU compute 进程')
 
     import torch
     report = []
@@ -194,10 +255,40 @@ def main():
         cfg_options=args.cfg_options,
         data_root=args.data_root)
     load_ckpt_loose(model, args.checkpoint)
+    from projects.EPFusion.epfusion.hooks import init_poe_from_teacher
+    ok_init = init_poe_from_teacher(model)
     model = model.to(args.device)
     model.train()  # 触发 override train()：冻结子模块强制 eval
 
-    batch = build_train_batch(cfg)
+    batch, epoch_length = build_train_batch(cfg)
+
+    # (i) Λ≡1 时 PoE 教师初始化与冻结 ConvFuser 输出等价
+    def _i():
+        if not ok_init:
+            return True, 'SKIP（未启用教师初始化）'
+        ep_eval = model.eval()
+        ep_pp = ep_eval.data_preprocessor
+        try:
+            with torch.no_grad():
+                ep_pp.force_mode = 'clean'
+                data = ep_pp(copy.deepcopy(batch), False)
+                ep_pp.force_mode = None
+                metas = [s.metainfo for s in data['data_samples']]
+                inp = data['inputs']
+                geo = ep_eval._img_geo(metas, inp['imgs'])
+                feats_2d = ep_eval._img_feats_2d(inp['imgs'])
+                F_C = ep_eval._img_bev(feats_2d, inp['points'], geo)
+                F_L = ep_eval._pts_bev(inp['points'])
+                mu = ep_eval.poe_fuser(F_C, F_L)['mu_F'].float()
+                ft = ep_eval.fusion_layer([F_C, F_L]).float()
+        finally:
+            ep_pp.force_mode = None
+            model.train()
+        ok = torch.allclose(mu, ft, rtol=1e-4, atol=1e-5)
+        diff = float((mu - ft).abs().max())
+        return ok, ('initialized=%s max_abs_diff=%.3e '
+                    '(rtol1e-4/atol1e-5)' % (ok_init, diff))
+    check(report, 'i_teacher_equivalence', _i)
 
     # (c) pipeline 无 ObjectSample
     def _c():
@@ -212,9 +303,14 @@ def main():
     losses_by_mode = {}
 
     def _run_all():
+        msgs = []
         for m in ('clean', 'corrupt_cam', 'corrupt_lidar'):
-            losses_by_mode[m] = run_mode(model, batch, m)
-        return True, 'modes=%s' % list(losses_by_mode.keys())
+            losses, loss_sum, log_vars = run_mode(model, batch, m)
+            losses_by_mode[m] = losses
+            msgs.append(
+                '%s loss_sum=%.6g log_vars=%d'
+                % (m, float(loss_sum.detach()), len(log_vars)))
+        return True, '; '.join(msgs)
     check(report, 'run_three_modes', _run_all)
 
     def _a():
@@ -230,14 +326,13 @@ def main():
         ls = losses_by_mode['clean']
         mc = float(ls['lambda_C_clean_sum'] / ls['lambda_C_clean_cnt'])
         ml = float(ls['lambda_L_clean_sum'] / ls['lambda_L_clean_cnt'])
-        ok = abs(mc - 1.0) < 1e-3 and abs(ml - 1.0) < 1e-3
+        ok = abs(mc - 1.0) < 1e-6 and abs(ml - 1.0) < 1e-6
         return ok, 'mean(Lam_C)=%.6f mean(Lam_L)=%.6f' % (mc, ml)
     check(report, 'b_lambda_init_one', _b)
 
     # (f) backward 冒烟
     def _f():
-        ls = run_mode(model, batch, 'clean')
-        total = sum(v for k, v in ls.items() if 'loss' in k)
+        _, total, _ = run_mode(model, batch, 'clean')
         model.zero_grad(set_to_none=True)
         total.backward()
         train_no_grad, frozen_has_grad = [], []
@@ -281,15 +376,66 @@ def main():
         return all_ok, '; '.join(msgs)
     check(report, 'g_zero_paths_smoke', _g)
 
-    # (h) 优化器 param-group LR + param_scheduler 端点
+    # (h) 首步 LR/momentum + param_scheduler epoch 端点断言
     def _h():
         from mmengine.optim import build_optim_wrapper
+        from mmengine.registry import PARAM_SCHEDULERS
         ow = build_optim_wrapper(model, copy.deepcopy(cfg.optim_wrapper))
-        lrs = sorted({g['lr'] for g in ow.optimizer.param_groups})
-        sched = [(s.get('type'), s.get('T_max', s.get('end')))
-                 for s in cfg.get('param_scheduler', [])]
+        base_lrs = sorted({g['lr'] for g in ow.optimizer.param_groups})
+        scheduler_cfgs = copy.deepcopy(cfg.get('param_scheduler', []))
         max_ep = cfg.train_cfg.get('max_epochs')
-        return True, 'lrs=%s max_epochs=%s scheduler=%s' % (lrs, max_ep, sched)
+        out_of_bounds = []
+        static = []
+        for idx, scheduler_cfg in enumerate(scheduler_cfgs):
+            scheduler_type = scheduler_cfg.get('type')
+            static.append((
+                scheduler_type, scheduler_cfg.get('T_max'),
+                scheduler_cfg.get('end'), scheduler_cfg.get('by_epoch', True)))
+            if (scheduler_cfg.get('T_max') is not None
+                    and scheduler_cfg['T_max'] > max_ep):
+                out_of_bounds.append(
+                    '#%d %s T_max=%s' %
+                    (idx, scheduler_type, scheduler_cfg['T_max']))
+            if (scheduler_cfg.get('by_epoch', True)
+                    and scheduler_cfg.get('end') is not None
+                    and scheduler_cfg['end'] > max_ep):
+                out_of_bounds.append(
+                    '#%d %s end=%s' %
+                    (idx, scheduler_type, scheduler_cfg['end']))
+
+        first_step = '无法构造，仅打印静态配置'
+        try:
+            schedulers = [
+                PARAM_SCHEDULERS.build(
+                    scheduler_cfg,
+                    default_args=dict(
+                        optimizer=ow, epoch_length=epoch_length))
+                for scheduler_cfg in scheduler_cfgs
+            ]
+            for scheduler in schedulers:
+                if not scheduler.by_epoch:
+                    scheduler.step()
+            first_lrs = [group['lr']
+                         for group in ow.optimizer.param_groups]
+            first_momenta = []
+            for group in ow.optimizer.param_groups:
+                if 'momentum' in group:
+                    first_momenta.append(group['momentum'])
+                elif 'betas' in group:
+                    first_momenta.append(group['betas'][0])
+                else:
+                    first_momenta.append(None)
+            first_step = 'lr=%s momentum=%s' % (
+                first_lrs, first_momenta)
+        except Exception as e:
+            first_step += ' (%r)' % e
+
+        ok = not out_of_bounds
+        return ok, (
+            'base_lrs=%s first_step=(%s) max_epochs=%s scheduler=%s '
+            'out_of_bounds=%s'
+            % (base_lrs, first_step, max_ep, static,
+               out_of_bounds or 'none'))
     check(report, 'h_optim_scheduler', _h)
 
     # (d) 教师路径受控 allclose（EP clean F_T vs 原 BEVFusion fusion_layer 输出）
@@ -344,6 +490,18 @@ def main():
             args.r0_config,
             cfg_options=args.cfg_options,
             data_root=args.data_root)
+        actual = (
+            r0.fusion_mode,
+            r0.w_teach,
+            r0.data_preprocessor.emit_clean)
+        config_ok = (
+            r0.fusion_mode == 'convfuser'
+            and r0.w_teach == 0.0
+            and r0.data_preprocessor.emit_clean is False)
+        if not config_ok:
+            return False, (
+                'R0 config invalid: fusion_mode=%r w_teach=%r '
+                'emit_clean=%r' % actual)
         load_ckpt_loose(r0, args.checkpoint)
         ok_copy = copy_weights(r0)  # 显式调用（脚本不经 Runner.train）
         eq = True
@@ -353,7 +511,9 @@ def main():
             if not torch.equal(sd_s[k], sd_t[k]):
                 eq = False
                 break
-        return (ok_copy and eq), 'copied=%s all_equal=%s' % (ok_copy, eq)
+        return (ok_copy and eq), (
+            'fusion_mode=%r w_teach=%r emit_clean=%r copied=%s '
+            'all_equal=%s' % (actual + (ok_copy, eq)))
     check(report, 'e_r0_weight_copy', _e)
 
     # ---- 总览 ----

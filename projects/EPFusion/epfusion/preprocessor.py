@@ -122,8 +122,11 @@ class EPFusionDataPreprocessor(Det3DDataPreprocessor):
             out = super().simple_process(data, training)
             if clean is not None:
                 # data_samples=None：仅归一化 clean 图，不重复处理 gt
+                # mmdet3d/models/data_preprocessors/data_preprocessor.py 中
+                # training 仅控制 batch_augments；传 False 避免以
+                # data_samples=None 进入该路径。
                 clean_out = super().simple_process(
-                    {'inputs': {'img': clean}, 'data_samples': None}, training)
+                    {'inputs': {'img': clean}, 'data_samples': None}, False)
                 out['inputs']['imgs_clean'] = clean_out['inputs']['imgs']
         else:  # corrupt_lidar
             points = inputs.get('points', None)

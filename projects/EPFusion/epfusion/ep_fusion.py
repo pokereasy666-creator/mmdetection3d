@@ -13,6 +13,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.modules.batchnorm import _BatchNorm
 
 from mmdet3d.registry import MODELS
 from projects.BEVFusion.bevfusion import BEVFusion, ConvFuser
@@ -65,6 +66,19 @@ class EPFusion(BEVFusion):
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad_(False)
+        self._eval_student_fuser_norm()
+
+    def _eval_student_fuser_norm(self):
+        """R0 对照对齐：student_fuser 的 BN 只使用 running stats。
+
+        仅切 eval，不冻结仿射参数；weight/bias 保持可训练。
+        """
+        student_fuser = getattr(self, 'student_fuser', None)
+        if student_fuser is None:
+            return
+        for module in student_fuser.modules():
+            if isinstance(module, _BatchNorm):
+                module.eval()
 
     def train(self, mode=True):
         """铁律 10：每次切 train 都强制冻结子模块回 eval（BN 统计不被污染）。"""
@@ -73,6 +87,7 @@ class EPFusion(BEVFusion):
             m = getattr(self, name, None)
             if m is not None:
                 m.eval()
+        self._eval_student_fuser_norm()
         return self
 
     # ---------------------------------------------------------------- 分支 helper
