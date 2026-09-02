@@ -28,10 +28,12 @@
 import argparse
 import copy
 import datetime
+import hashlib
 import os
 import subprocess
 import sys
 import traceback
+from contextlib import contextmanager
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -121,6 +123,8 @@ def load_ckpt_loose(model, path):
     res = model.load_state_dict(sd, strict=False)
     print('  loaded ckpt: missing=%d unexpected=%d'
           % (len(res.missing_keys), len(res.unexpected_keys)))
+    print('  missing_keys=%s unexpected_keys=%s'
+          % (res.missing_keys, res.unexpected_keys))
 
 
 def build_train_batch(cfg, num=1):
@@ -190,6 +194,146 @@ LAMBDA_KEYS = ['lambda_%s_%s_%s' % (br, m, k)
 WARN_KEYS = ['proj_var_C', 'proj_var_L', 'cos_pc_ft', 'cos_pl_ft']
 
 
+@contextmanager
+def strict_fp32():
+    """仅等价性检查禁用 TF32/AMP，退出（含异常）后恢复原后端设置。"""
+    import torch
+    mm, cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
+    old = (mm.allow_tf32, cudnn.allow_tf32, cudnn.benchmark,
+           cudnn.deterministic)
+    try:
+        mm.allow_tf32 = cudnn.allow_tf32 = False
+        cudnn.benchmark = False
+        cudnn.deterministic = True
+        with torch.autocast(device_type='cuda', enabled=False):
+            yield
+    finally:
+        (mm.allow_tf32, cudnn.allow_tf32, cudnn.benchmark,
+         cudnn.deterministic) = old
+
+
+def compare_tensor(name, actual, reference, exact=False):
+    """原 allclose 阈值不变；统计在 CPU 上完成，避免诊断再占 GPU。"""
+    import torch
+    a, b = actual.detach().cpu(), reference.detach().cpu()
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False, '%s shape/dtype mismatch: %s/%s vs %s/%s' % (
+            name, tuple(a.shape), a.dtype, tuple(b.shape), b.dtype)
+    finite = bool(torch.isfinite(a).all() and torch.isfinite(b).all())
+    close = (a == b) if exact else torch.isclose(a, b, rtol=1e-4, atol=1e-5)
+    ok = finite and bool(close.all())
+    diff = (a.double() - b.double()).abs()
+    max_diff = float(diff.max()) if diff.numel() else 0.0
+    bad = int((~close).sum())
+    return ok, '%s ok=%s finite=%s max_abs_diff=%.3e bad=%d/%d (%s)' % (
+        name, ok, finite, max_diff, bad, a.numel(),
+        'exact' if exact else 'rtol1e-4/atol1e-5')
+
+
+def compare_teacher_state(ep, stock):
+    """逐张量检查冻结教师参数与 buffers；不比较 EP 新增模块。"""
+    import torch
+    mismatches = []
+    for name in ep.FROZEN_MODULES:
+        left = getattr(ep, name).state_dict()
+        right = getattr(stock, name).state_dict()
+        for key in sorted(set(left) | set(right)):
+            if (key not in left or key not in right
+                    or left[key].dtype != right[key].dtype
+                    or not torch.equal(left[key].detach().cpu(),
+                                       right[key].detach().cpu())):
+                mismatches.append(name + '.' + key)
+    return not mismatches, 'teacher_state mismatches=%s' % (
+        mismatches or 'none')
+
+
+def teacher_snapshot(model, batch, ep_path=False):
+    """各自完整提取教师特征；hooks 仅记录 CPU 副本，不替换任何输入。"""
+    import torch
+    cap, handles = {}, []
+    pp = model.data_preprocessor
+    old_mode = getattr(pp, 'force_mode', None)
+
+    def save(name, tensor):
+        cap[name] = tensor.detach().cpu().clone()
+
+    def view_input(mod, inputs):
+        save('img_feats_2d', inputs[0])
+        for name, tensor in zip(
+                ('lidar2image', 'camera_intrinsics', 'camera2lidar',
+                 'img_aug_matrix', 'lidar_aug_matrix'), inputs[2:7]):
+            save('geometry.' + name, tensor)
+
+    def output_hook(name):
+        def hook(mod, inputs, output):
+            save(name, output)
+        return hook
+
+    try:
+        handles.append(model.view_transform.register_forward_pre_hook(
+            view_input))
+        for name, module in (
+                ('camera_bev', model.view_transform),
+                ('lidar_bev', model.pts_middle_encoder),
+                ('fused', model.fusion_layer)):
+            handles.append(module.register_forward_hook(output_hook(name)))
+        # DepthLSSTransform 的实际深度图输入，用于定位重复像素写入差异。
+        if hasattr(model.view_transform, 'dtransform'):
+            handles.append(
+                model.view_transform.dtransform.register_forward_pre_hook(
+                    lambda mod, inputs: save('depth', inputs[0])))
+        if ep_path:
+            pp.force_mode = 'clean'
+        with torch.no_grad():
+            data = pp(copy.deepcopy(batch), False)
+            inp = data['inputs']
+            metas = [s.metainfo for s in data['data_samples']]
+            save('inputs.imgs', inp['imgs'])
+            for idx, points in enumerate(inp['points']):
+                save('inputs.points.%d' % idx, points)
+            if ep_path:
+                geo = model._img_geo(metas, inp['imgs'])
+                f2d = model._img_feats_2d(inp['imgs'])
+                cam = model._img_bev(f2d, inp['points'], geo)
+                lidar = model._pts_bev(inp['points'])
+                model.fusion_layer([cam, lidar])
+            else:
+                model.extract_feat(inp, metas)
+    finally:
+        for handle in handles:
+            handle.remove()
+        if ep_path:
+            pp.force_mode = old_mode
+    return cap
+
+
+def compare_snapshots(name, actual, reference):
+    """中间特征只定位差异；输入精确一致及最终融合输出仍为验收条件。"""
+    msgs, failed_stages = [], []
+    all_ok = True
+    stages = ['img_feats_2d']
+    if 'depth' in actual or 'depth' in reference:
+        stages.append('depth')
+    stages += ['camera_bev', 'lidar_bev', 'fused']
+    keys = sorted((set(actual) | set(reference) | {'inputs.imgs'}) - set(stages))
+    keys += stages
+    for key in keys:
+        exact = key.startswith(('inputs.', 'geometry.'))
+        if key not in actual or key not in reference:
+            ok, detail = False, '%s missing snapshot key' % key
+            all_ok = False
+        else:
+            ok, detail = compare_tensor(key, actual[key], reference[key], exact)
+        if exact or key == 'fused':
+            all_ok = all_ok and ok
+        if not ok:
+            failed_stages.append(key)
+        msgs.append(detail)
+    msgs.append('first_difference=%s' % (
+        failed_stages[0] if failed_stages else 'none'))
+    return all_ok, name + ': ' + '; '.join(msgs)
+
+
 def run_mode(model, batch, mode):
     """以 force_mode 跑一次 loss()+parse_losses（不反传）。"""
     model.data_preprocessor.force_mode = mode
@@ -237,6 +381,9 @@ def main():
     print('EP-Fusion 块1 sanity_lambda_logging')
     print('生成时间 : %s' % datetime.datetime.now().isoformat())
     print('VERSION  : %s' % read_version())
+    print('SANITY   : block1-memory-diagnostics-20260902')
+    with open(__file__, 'rb') as source:
+        print('SCRIPT_SHA256: %s' % hashlib.sha256(source.read()).hexdigest())
     print('命令参数 : %s' % vars(args))
     process_suspects = detect_training_processes()
     if process_suspects:
@@ -247,6 +394,9 @@ def main():
         print('进程自检 : PASS，未发现训练/GPU compute 进程')
 
     import torch
+    print('torch=%s TF32 before checks: matmul=%s cudnn=%s'
+          % (torch.__version__, torch.backends.cuda.matmul.allow_tf32,
+             torch.backends.cudnn.allow_tf32))
     report = []
 
     # ---- 构建 EP（poe）模型 + 载 ckpt ----
@@ -265,11 +415,11 @@ def main():
     # (i) Λ≡1 时 PoE 教师初始化与冻结 ConvFuser 输出等价
     def _i():
         if not ok_init:
-            return True, 'SKIP（未启用教师初始化）'
+            return False, 'teacher initialization not performed'
         ep_eval = model.eval()
         ep_pp = ep_eval.data_preprocessor
         try:
-            with torch.no_grad():
+            with strict_fp32(), torch.no_grad():
                 ep_pp.force_mode = 'clean'
                 data = ep_pp(copy.deepcopy(batch), False)
                 ep_pp.force_mode = None
@@ -284,10 +434,8 @@ def main():
         finally:
             ep_pp.force_mode = None
             model.train()
-        ok = torch.allclose(mu, ft, rtol=1e-4, atol=1e-5)
-        diff = float((mu - ft).abs().max())
-        return ok, ('initialized=%s max_abs_diff=%.3e '
-                    '(rtol1e-4/atol1e-5)' % (ok_init, diff))
+        ok, detail = compare_tensor('poe_vs_teacher', mu, ft)
+        return ok, 'initialized=%s strict_fp32=True; %s' % (ok_init, detail)
     check(report, 'i_teacher_equivalence', _i)
 
     # (c) pipeline 无 ObjectSample
@@ -302,14 +450,21 @@ def main():
     # (a)+(b) 三模式 loss 键齐全 + 初始 Λ≈1
     losses_by_mode = {}
 
+    @torch.no_grad()
     def _run_all():
         msgs = []
         for m in ('clean', 'corrupt_cam', 'corrupt_lidar'):
             losses, loss_sum, log_vars = run_mode(model, batch, m)
-            losses_by_mode[m] = losses
+            # 只保留无计算图的 CPU 日志；backward 另跑独立前向。
+            losses_by_mode[m] = {
+                k: ([v.detach().cpu() for v in value]
+                    if isinstance(value, list) else value.detach().cpu())
+                for k, value in losses.items()
+            }
             msgs.append(
                 '%s loss_sum=%.6g log_vars=%d'
                 % (m, float(loss_sum.detach()), len(log_vars)))
+            del losses, loss_sum, log_vars
         return True, '; '.join(msgs)
     check(report, 'run_three_modes', _run_all)
 
@@ -329,25 +484,29 @@ def main():
         ok = abs(mc - 1.0) < 1e-6 and abs(ml - 1.0) < 1e-6
         return ok, 'mean(Lam_C)=%.6f mean(Lam_L)=%.6f' % (mc, ml)
     check(report, 'b_lambda_init_one', _b)
+    losses_by_mode.clear()
 
     # (f) backward 冒烟
     def _f():
         _, total, _ = run_mode(model, batch, 'clean')
         model.zero_grad(set_to_none=True)
-        total.backward()
         train_no_grad, frozen_has_grad = [], []
-        for n, p in model.named_parameters():
-            if p.requires_grad and p.grad is None:
-                train_no_grad.append(n)
-            if (not p.requires_grad) and (p.grad is not None):
-                frozen_has_grad.append(n)
-        model.zero_grad(set_to_none=True)
+        try:
+            total.backward()
+            for n, p in model.named_parameters():
+                if p.requires_grad and p.grad is None:
+                    train_no_grad.append(n)
+                if (not p.requires_grad) and (p.grad is not None):
+                    frozen_has_grad.append(n)
+        finally:
+            model.zero_grad(set_to_none=True)
         ok = (len(train_no_grad) == 0 and len(frozen_has_grad) == 0)
         return ok, ('train_no_grad=%s frozen_has_grad=%s'
                     % (train_no_grad[:5], frozen_has_grad[:5]))
     check(report, 'f_backward_smoke', _f)
 
     # (g) 整路置零强制路径冒烟
+    @torch.no_grad()
     def _g():
         msgs = []
         all_ok = True
@@ -370,6 +529,7 @@ def main():
                 all_ok = all_ok and not missing
                 msgs.append('%s/%s missing=%s'
                             % (fm, fc, missing or 'none'))
+                del data, ls
             finally:
                 model.data_preprocessor.force_mode = None
                 model.data_preprocessor.force_corruption = None
@@ -448,37 +608,27 @@ def main():
                 'bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py')
         _, stock = build_model_from_cfg(base_cfg_path)
         load_ckpt_loose(stock, args.checkpoint)
+        state_ok, state_msg = compare_teacher_state(model, stock)
+        print('  [d diagnostic] ' + state_msg)
         stock = stock.to(args.device).eval()
-        ep_eval = model.eval()
-        cap = {}
-
-        def hook(mod, inp, outp):
-            cap['ft'] = outp.detach().float()
-        h = stock.fusion_layer.register_forward_hook(hook)
+        was_training = model.training
+        model.eval()
         try:
-            with torch.no_grad():
-                data = stock.data_preprocessor(copy.deepcopy(batch), False)
-                metas = [s.metainfo for s in data['data_samples']]
-                stock.extract_feat(data['inputs'], metas)
-                stock_ft = cap['ft']
-                # EP clean F_T（同一 batch、clean 预处理）
-                ep_pp = ep_eval.data_preprocessor
-                ep_pp.force_mode = 'clean'
-                data2 = ep_pp(copy.deepcopy(batch), False)
-                ep_pp.force_mode = None
-                metas2 = [s.metainfo for s in data2['data_samples']]
-                inp = data2['inputs']
-                geo = ep_eval._img_geo(metas2, inp['imgs'])
-                f2d = ep_eval._img_feats_2d(inp['imgs'])
-                F_C = ep_eval._img_bev(f2d, inp['points'], geo)
-                F_L = ep_eval._pts_bev(inp['points'])
-                ep_ft = ep_eval.fusion_layer([F_C, F_L]).detach().float()
+            with strict_fp32():
+                stock_first = teacher_snapshot(stock, batch)
+                stock_repeat = teacher_snapshot(stock, batch)
+                repeat_ok, repeat_msg = compare_snapshots(
+                    'stock_self_repeat', stock_repeat, stock_first)
+                print('  [d diagnostic] ' + repeat_msg)
+                del stock_repeat
+                ep = teacher_snapshot(model, batch, ep_path=True)
+                path_ok, path_msg = compare_snapshots(
+                    'ep_vs_stock', ep, stock_first)
         finally:
-            h.remove()
-            model.train()
-        ok = torch.allclose(stock_ft, ep_ft, rtol=1e-4, atol=1e-5)
-        diff = float((stock_ft - ep_ft).abs().max())
-        return ok, 'max_abs_diff=%.3e (rtol1e-4/atol1e-5)' % diff
+            model.train(was_training)
+        return (state_ok and repeat_ok and path_ok), (
+            'strict_fp32=True; %s\n    %s\n    %s'
+            % (state_msg, repeat_msg, path_msg))
     check(report, 'd_teacher_allclose', _d)
 
     # (e) R0 权重拷贝断言
