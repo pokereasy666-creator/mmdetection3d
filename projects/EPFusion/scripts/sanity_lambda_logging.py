@@ -14,7 +14,7 @@
   e) R0：load_checkpoint 后显式 copy_weights(model)，断言 student_fuser≡fusion_layer 逐张量相等；
   f) 单卡 backward 冒烟：一次反传后可训练参数 grad 非 None、冻结参数 grad 为 None；
   g) 'zero_image'/'zero_points' 强制路径冒烟（不崩溃、Λ 键在场）；
-  h) 打印首步 LR/momentum，并断言 param_scheduler epoch 端点不越界；
+  h) 打印 scheduler 构造后的 LR/momentum，并断言 epoch 端点不越界；
   i) Λ≡1 时 PoE 教师初始化输出与冻结 ConvFuser 输出 allclose。
 
 用法（服务器，复现训练结束后）：
@@ -34,6 +34,10 @@ import subprocess
 import sys
 import traceback
 from contextlib import contextmanager
+
+# PyTorch deterministic CUDA GEMM requires this to be set before CUDA starts.
+# Respect an explicit caller choice (the other supported value is ``:16:8``).
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -195,19 +199,29 @@ WARN_KEYS = ['proj_var_C', 'proj_var_L', 'cos_pc_ft', 'cos_pl_ft']
 
 
 @contextmanager
-def strict_fp32():
-    """仅等价性检查禁用 TF32/AMP，退出（含异常）后恢复原后端设置。"""
+def strict_fp32(deterministic=False):
+    """等价性检查禁用 TF32/AMP，并可临时启用确定性算法。"""
     import torch
     mm, cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
     old = (mm.allow_tf32, cudnn.allow_tf32, cudnn.benchmark,
            cudnn.deterministic)
+    old_deterministic = torch.are_deterministic_algorithms_enabled()
+    get_warn_only = getattr(
+        torch, 'is_deterministic_algorithms_warn_only_enabled', None)
+    old_warn_only = get_warn_only() if get_warn_only is not None else False
     try:
         mm.allow_tf32 = cudnn.allow_tf32 = False
         cudnn.benchmark = False
         cudnn.deterministic = True
+        if deterministic:
+            # warn_only=False：无确定性实现时验收必须显式 ERROR，不能静默通过。
+            torch.use_deterministic_algorithms(True, warn_only=False)
         with torch.autocast(device_type='cuda', enabled=False):
             yield
     finally:
+        if deterministic:
+            torch.use_deterministic_algorithms(
+                old_deterministic, warn_only=old_warn_only)
         (mm.allow_tf32, cudnn.allow_tf32, cudnn.benchmark,
          cudnn.deterministic) = old
 
@@ -228,6 +242,114 @@ def compare_tensor(name, actual, reference, exact=False):
     return ok, '%s ok=%s finite=%s max_abs_diff=%.3e bad=%d/%d (%s)' % (
         name, ok, finite, max_diff, bad, a.numel(),
         'exact' if exact else 'rtol1e-4/atol1e-5')
+
+
+def poe_fp64_diagnostic(model, F_C, F_L, mu, teacher, limit=2048):
+    """在 FP32 超差坐标上分解折叠权重与卷积累加误差。
+
+    只读取实际特征和权重，不替换验收输出，也不改变原 allclose 闸门。
+    """
+    import torch
+
+    close = torch.isclose(mu.detach(), teacher.detach(),
+                          rtol=1e-4, atol=1e-5)
+    bad_coords = (~close).nonzero(as_tuple=False).detach().cpu()
+    total_bad = int(bad_coords.shape[0])
+    if total_bad == 0:
+        return 'fp64_diag skipped (no failing coordinates)'
+    bad_coords = bad_coords[:limit]
+
+    fusion = model.fusion_layer
+    conv, bn = fusion[0], fusion[1]
+    poe = model.poe_fuser
+    if (tuple(conv.kernel_size) != (3, 3)
+            or tuple(conv.padding) != (1, 1)
+            or tuple(conv.stride) != (1, 1)
+            or tuple(conv.dilation) != (1, 1)
+            or conv.groups != 1):
+        return 'fp64_diag unavailable: unsupported teacher convolution geometry'
+
+    # 大特征只搬 CPU fp32；每个超差位置的 3x3 patch 再转 double。
+    fc = F_C.detach().cpu()
+    fl = F_L.detach().cpu()
+    teacher_out = teacher.detach().cpu()
+    mu_out = mu.detach().cpu()
+    teacher_w = conv.weight.detach().cpu()
+    teacher_bias = (None if conv.bias is None
+                    else conv.bias.detach().cpu().double())
+    proj_c_w = poe.proj_C.weight.detach().cpu()
+    proj_l_w = poe.proj_L.weight.detach().cpu()
+    proj_c_b = poe.proj_C.bias.detach().cpu().double()
+    proj_l_b = poe.proj_L.bias.detach().cpu().double()
+    scale = (bn.weight.detach().cpu().double()
+             / torch.sqrt(bn.running_var.detach().cpu().double() + bn.eps))
+    folded_bias = (bn.bias.detach().cpu().double()
+                   - bn.running_mean.detach().cpu().double() * scale)
+    eps = float(poe.eps)
+
+    def _dot_at(feature, weight, b, out_ch, y, x):
+        height, width = feature.shape[-2:]
+        fy0, fy1 = max(0, y - 1), min(height, y + 2)
+        fx0, fx1 = max(0, x - 1), min(width, x + 2)
+        wy0, wx0 = fy0 - (y - 1), fx0 - (x - 1)
+        wy1, wx1 = wy0 + (fy1 - fy0), wx0 + (fx1 - fx0)
+        patch = feature[b, :, fy0:fy1, fx0:fx1].double()
+        kernel = weight[out_ch, :, wy0:wy1, wx0:wx1].double()
+        return (patch * kernel).sum()
+
+    errors = dict(
+        teacher_fp32_vs_ref64=[],
+        poe_fp32_vs_stored64=[],
+        stored64_vs_truefold64=[],
+        truefold64_vs_expected64=[],
+        expected64_vs_teacher64=[])
+    split = fc.shape[1]
+    for coord in bad_coords.tolist():
+        b, out_ch, y, x = coord
+        raw_c = _dot_at(fc, teacher_w[:, :split], b, out_ch, y, x)
+        raw_l = _dot_at(fl, teacher_w[:, split:], b, out_ch, y, x)
+        raw = raw_c + raw_l
+        if teacher_bias is not None:
+            raw = raw + teacher_bias[out_ch]
+        teacher64 = torch.relu(raw * scale[out_ch] + folded_bias[out_ch])
+
+        stored_c = (_dot_at(fc, proj_c_w, b, out_ch, y, x)
+                    + proj_c_b[out_ch])
+        stored_l = (_dot_at(fl, proj_l_w, b, out_ch, y, x)
+                    + proj_l_b[out_ch])
+        stored64 = torch.relu((stored_c + stored_l) / (2.0 + eps))
+
+        true_c = 2.0 * scale[out_ch] * raw_c + folded_bias[out_ch]
+        true_l = 2.0 * scale[out_ch] * raw_l + folded_bias[out_ch]
+        if teacher_bias is not None:
+            # Conv bias belongs once inside the unfused teacher convolution.
+            true_c = true_c + 2.0 * scale[out_ch] * teacher_bias[out_ch]
+        truefold64 = torch.relu((true_c + true_l) / (2.0 + eps))
+        expected64 = teacher64 * (2.0 / (2.0 + eps))
+
+        errors['teacher_fp32_vs_ref64'].append(
+            abs(float(teacher_out[b, out_ch, y, x]) - float(teacher64)))
+        errors['poe_fp32_vs_stored64'].append(
+            abs(float(mu_out[b, out_ch, y, x]) - float(stored64)))
+        errors['stored64_vs_truefold64'].append(
+            abs(float(stored64) - float(truefold64)))
+        errors['truefold64_vs_expected64'].append(
+            abs(float(truefold64) - float(expected64)))
+        errors['expected64_vs_teacher64'].append(
+            abs(float(expected64) - float(teacher64)))
+
+    maxima = {name: max(values) for name, values in errors.items()}
+    return (
+        'fp64_diag analyzed=%d/%d; '
+        'teacher_fp32_vs_ref64=%.3e; poe_fp32_vs_stored64=%.3e; '
+        'stored64_vs_truefold64=%.3e; truefold64_vs_expected64=%.3e; '
+        'expected64_vs_teacher64=%.3e'
+        % (len(bad_coords), total_bad,
+           maxima['teacher_fp32_vs_ref64'],
+           maxima['poe_fp32_vs_stored64'],
+           maxima['stored64_vs_truefold64'],
+           maxima['truefold64_vs_expected64'],
+           maxima['expected64_vs_teacher64']))
 
 
 def compare_teacher_state(ep, stock):
@@ -381,7 +503,7 @@ def main():
     print('EP-Fusion 块1 sanity_lambda_logging')
     print('生成时间 : %s' % datetime.datetime.now().isoformat())
     print('VERSION  : %s' % read_version())
-    print('SANITY   : block1-memory-diagnostics-20260902')
+    print('SANITY   : block1-deterministic-fp64-diagnostics-20260902')
     with open(__file__, 'rb') as source:
         print('SCRIPT_SHA256: %s' % hashlib.sha256(source.read()).hexdigest())
     print('命令参数 : %s' % vars(args))
@@ -435,7 +557,17 @@ def main():
             ep_pp.force_mode = None
             model.train()
         ok, detail = compare_tensor('poe_vs_teacher', mu, ft)
-        return ok, 'initialized=%s strict_fp32=True; %s' % (ok_init, detail)
+        precision_detail = 'fp64_diag skipped (FP32 gate passed)'
+        if not ok:
+            try:
+                precision_detail = poe_fp64_diagnostic(
+                    ep_eval, F_C, F_L, mu, ft)
+            except Exception as e:
+                # 高精度分解只提供诊断；原 FP32 allclose 始终是验收闸门。
+                precision_detail = 'fp64_diag unavailable: %r' % e
+        return ok, (
+            'initialized=%s strict_fp32=True; %s; %s'
+            % (ok_init, detail, precision_detail))
     check(report, 'i_teacher_equivalence', _i)
 
     # (c) pipeline 无 ObjectSample
@@ -536,7 +668,7 @@ def main():
         return all_ok, '; '.join(msgs)
     check(report, 'g_zero_paths_smoke', _g)
 
-    # (h) 首步 LR/momentum + param_scheduler epoch 端点断言
+    # (h) scheduler 初始化状态 + param_scheduler epoch 端点断言
     def _h():
         from mmengine.optim import build_optim_wrapper
         from mmengine.registry import PARAM_SCHEDULERS
@@ -563,7 +695,7 @@ def main():
                     '#%d %s end=%s' %
                     (idx, scheduler_type, scheduler_cfg['end']))
 
-        first_step = '无法构造，仅打印静态配置'
+        initialized = '无法构造，仅打印静态配置'
         try:
             schedulers = [
                 PARAM_SCHEDULERS.build(
@@ -572,29 +704,28 @@ def main():
                         optimizer=ow, epoch_length=epoch_length))
                 for scheduler_cfg in scheduler_cfgs
             ]
-            for scheduler in schedulers:
-                if not scheduler.by_epoch:
-                    scheduler.step()
-            first_lrs = [group['lr']
-                         for group in ow.optimizer.param_groups]
-            first_momenta = []
+            initial_lrs = [group['lr']
+                           for group in ow.optimizer.param_groups]
+            initial_momenta = []
             for group in ow.optimizer.param_groups:
                 if 'momentum' in group:
-                    first_momenta.append(group['momentum'])
+                    initial_momenta.append(group['momentum'])
                 elif 'betas' in group:
-                    first_momenta.append(group['betas'][0])
+                    initial_momenta.append(group['betas'][0])
                 else:
-                    first_momenta.append(None)
-            first_step = 'lr=%s momentum=%s' % (
-                first_lrs, first_momenta)
+                    initial_momenta.append(None)
+            # 构造器已经执行初始化 step；此处不得在 optimizer.step() 前再推进。
+            initialized = 'lr_unique=%s momentum_unique=%s groups=%d' % (
+                list(dict.fromkeys(initial_lrs)),
+                list(dict.fromkeys(initial_momenta)), len(initial_lrs))
         except Exception as e:
-            first_step += ' (%r)' % e
+            initialized += ' (%r)' % e
 
         ok = not out_of_bounds
         return ok, (
-            'base_lrs=%s first_step=(%s) max_epochs=%s scheduler=%s '
+            'base_lrs=%s initialized=(%s) max_epochs=%s scheduler=%s '
             'out_of_bounds=%s'
-            % (base_lrs, first_step, max_ep, static,
+            % (base_lrs, initialized, max_ep, static,
                out_of_bounds or 'none'))
     check(report, 'h_optim_scheduler', _h)
 
@@ -614,7 +745,7 @@ def main():
         was_training = model.training
         model.eval()
         try:
-            with strict_fp32():
+            with strict_fp32(deterministic=True):
                 stock_first = teacher_snapshot(stock, batch)
                 stock_repeat = teacher_snapshot(stock, batch)
                 repeat_ok, repeat_msg = compare_snapshots(
@@ -627,8 +758,10 @@ def main():
         finally:
             model.train(was_training)
         return (state_ok and repeat_ok and path_ok), (
-            'strict_fp32=True; %s\n    %s\n    %s'
-            % (state_msg, repeat_msg, path_msg))
+            'strict_fp32=True deterministic=True cublas_workspace=%s; '
+            '%s\n    %s\n    %s'
+            % (os.environ.get('CUBLAS_WORKSPACE_CONFIG'), state_msg,
+               repeat_msg, path_msg))
     check(report, 'd_teacher_allclose', _d)
 
     # (e) R0 权重拷贝断言
