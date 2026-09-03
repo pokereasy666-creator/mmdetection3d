@@ -8,6 +8,10 @@
 > 教师对照 NLL + 退化演练、PoE 融合；不做 NIG/CI/通道组 Λ/任务误差路线/nuScenes-C 正式评测/
 > 注意力融合基线/DAL）。
 
+> 2026-09-03 收尾状态：单卡受控 sanity 已 10/10；块1整体仍待按发布 SHA
+> 部署、相对 load_from 路径核验、带哈希的归档重跑及量级记录。实现审计与四卡
+> 闸门见 `BLOCK1_CLOSEOUT_AND_4GPU_20260903.md`。本注优先于下方旧的运行顺序。
+
 ---
 
 ## A. 工程结构
@@ -64,7 +68,9 @@ config 要点：
   （= pts_backbone 输入通道，免出口投影）。✅ 探针 P3 实测确认：相机 BEV 80ch、LiDAR BEV
   256ch、fusion 入/出 256ch，**80/256/256 全部坐实，无需 out-proj 兜底**。
   两个投影由冻结教师 ConvFuser 折叠 BN 后按输入通道切分并乘 2 初始化，Λ≡1 时经
-  输出 ReLU 与教师逐位等价。`proj_C + proj_L` 合计 `336×256×3×3`，与 baseline
+  输出 ReLU 在理想算术下为教师输出的 `2/(2+eps)` 倍；浮点卷积重排不保证逐位
+  相同。原始 cuDNN strict-FP32 检查仍有超差，显式 no_cudnn 同容差通过，不能
+  据此宣称生产 AMP iter-0 已等价。`proj_C + proj_L` 合计 `336×256×3×3`，与 baseline
   ConvFuser 融合卷积参数量相同；额外参数仅两个 Λ 头（约 0.17M）。
 - **lambda_head_C / lambda_head_L**（结构相同、不共享权重）：
   `Conv3×3(C_in→64) → GN(8,64) → ReLU → Conv3×3(64→64) → GN(8,64) → ReLU → Conv1×1(64→1)`，
@@ -312,14 +318,20 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
        `torch.allclose(rtol=1e-4, atol=1e-5)`；
    (e) **R0 权重拷贝断言**：学生 student_fuser 与教师 fusion_layer 权重逐张量相等——
        断言前须在 load_checkpoint 之后**显式调用 R0WeightCopyHook 的拷贝函数**
-       （本脚本不经 Runner.train()，before_train 不会自动触发）；
+       （本脚本不经 Runner.train()，before_train 不会自动触发）；并实际调用
+       `r0.train()` 检查所有学生 BN 为 eval、仿射参数仍可训练；
    (f) **单卡 backward 冒烟**：一次 loss 反传后，全部可训练参数 grad 非 None
        （且抽查冻结参数 grad 为 None）；
    (g) 'zero_image'/'zero_points' 强制路径冒烟（不崩溃、Λ 日志在场）；
    (h) 打印首步 LR/momentum，并断言 `T_max` 及 epoch-based `end` 不超过 `max_epochs`；
    (i) **教师等价性断言**：显式执行教师初始化后，Λ≡1 的 PoE 输出与冻结
        ConvFuser 输出 `torch.allclose(rtol=1e-4, atol=1e-5)`。
-   报告 `sanity_lambda_logging_<日期>.txt`。
+   默认 i 使用原后端；显式 `--equivalence-backend no_cudnn` 时仍完整保留原始
+   比较及非有限值守卫。新增 F_T abs mean/max、三模式 loss_teach、teach_nll_raw、
+   检测损失及比值，仅作数值观察、不改变公式。进程自检无法确认空闲、指定脚本
+   哈希不符或 checkpoint 不可达时中止。归档时带 `--source-sha` 和
+   `--expected-script-sha256`，运行时不调用 git。
+   报告 `sanity_lambda_logging_<日期_时分秒_微秒>.txt`，自动创建输出目录。
 2. **sanity_p1.py**：`--num-frames 50 --corruption downsample_blur --severities 0,0.2,0.4,0.6,0.8,1.0`。
    仅用 TRAIN 族损坏（铁律 5，**禁用 nuScenes-C 损坏**）；50 个 val 帧逐严重度强制 corrupt_cam
    （经 preprocessor force_*），抽 Λ_C/Λ_L 全图均值，输出均值-严重度曲线 PNG
@@ -402,5 +414,7 @@ ckpt 路径；统一参数 `--config --checkpoint --data-root --out-dir` + `--cf
    （一次 zip；服务器跑 G-1 全断言通过 → commit 记录结果）。
 2. **块 2**：sanity_p1.py / sanity_p4.py / eval_quarter_val.py
    （可与块 1 合并同一 zip；不依赖训练产物即可先行构建自检）。
-3. 运行序：R0 → R2（w_teach=1 居中先行）→ 视 R2 的 P1 曲线决定 R1/R3 顺序；
-   每 run 结束跑 eval_quarter_val + sanity_p1，结果记 EXPERIMENTS.md。
+3. 2026-09-03 更新：归档式 sanity 与部署检查通过后，先启动 EP 正式 run，合并
+   四卡验收，并设置 G1–G4 中止/复核闸门；依据实测未加权 teacher/detection loss
+   比值选择 R1/R2，当前数值未回传，暂不指定。随后进行 R0（额外记录学生 BN 状态）。
+   `sanity_p1.py` / `eval_quarter_val.py` 仍是块2规划，不能将未实现脚本写成已运行。

@@ -31,6 +31,7 @@ import argparse
 import copy
 import datetime
 import hashlib
+import math
 import os
 import subprocess
 import sys
@@ -121,8 +122,8 @@ def build_model_from_cfg(config_path, cfg_options=None, data_root=None):
 def load_ckpt_loose(model, path):
     import torch
     if not path or not os.path.isfile(path):
-        print('  [warn] ckpt 不存在，使用随机/零初始化：%s' % path)
-        return
+        raise FileNotFoundError(
+            'teacher checkpoint 不可达，禁止随机初始化验收: %s' % path)
     sd = torch.load(path, map_location='cpu')
     sd = sd.get('state_dict', sd)
     sd = {(k[7:] if k.startswith('module.') else k): v for k, v in sd.items()}
@@ -151,10 +152,12 @@ def detect_training_processes():
     """检测训练/GPU compute 进程；逻辑复用 scripts/m0_probe.py:110-152。"""
     suspects = []
     try:
-        out = subprocess.run(
+        result = subprocess.run(
             ['ps', '-eo', 'pid,args'], capture_output=True, text=True,
-            timeout=15).stdout
-        for line in out.splitlines():
+            timeout=15)
+        if result.returncode != 0:
+            suspects.append('[ps] 进程扫描失败（无法确认）')
+        for line in result.stdout.splitlines():
             low = line.lower()
             if 'sanity_lambda_logging.py' in low:
                 continue
@@ -186,8 +189,10 @@ def detect_training_processes():
                     suspects.append(
                         '[gpu] compute 进程(%s): %s'
                         % (scope, line.strip()))
+        else:
+            suspects.append('[gpu] nvidia-smi 查询失败（无法确认）')
     except FileNotFoundError:
-        pass
+        suspects.append('[gpu] nvidia-smi 不存在（无法确认）')
     except Exception as e:
         suspects.append('[gpu] nvidia-smi 查询失败（无法确认）: %r' % e)
     return suspects
@@ -528,6 +533,51 @@ def run_mode(model, batch, mode):
         model.data_preprocessor.force_mode = None
 
 
+def feature_scale(feature):
+    """只读记录当前 i 项原始后端的 F_T 量级，不改变验收容差。"""
+    absolute = feature.detach().float().cpu().abs()
+    return 'F_T_abs_mean=%.9g F_T_abs_max=%.9g' % (
+        float(absolute.mean()), float(absolute.max()))
+
+
+def mode_loss_summary(mode, log_vars, w_teach):
+    """使用 parse_losses 的标量，分别记录加权/未加权 teacher 与检测损失。"""
+    total = float(log_vars['loss'])
+    teacher = float(log_vars['loss_teach'])
+    raw = float(log_vars['teach_nll_raw'])
+    bbox_keys = [k for k in log_vars
+                 if 'loss' in k and k not in ('loss', 'loss_teach')]
+    if not bbox_keys:
+        raise ValueError('No detection loss keys in parse_losses output')
+    bbox = sum(float(log_vars[k]) for k in bbox_keys)
+    if not all(math.isfinite(v) for v in (total, teacher, raw, bbox)):
+        raise ValueError('%s non-finite loss statistics' % mode)
+    ratios = ('teacher_to_bbox=undefined raw_to_bbox=undefined' if bbox <= 0
+              else 'teacher_to_bbox=%.9g raw_to_bbox=%.9g'
+              % (teacher / bbox, raw / bbox))
+    return ('%s loss_sum=%.9g log_vars=%d w_teach=%.9g '
+            'loss_teach=%.9g teach_nll_raw=%.9g bbox_loss_sum=%.9g '
+            '%s bbox_keys=%s' % (
+                mode, total, len(log_vars), w_teach, teacher, raw, bbox,
+                ratios, bbox_keys))
+
+
+def check_r0_bn_eval(model):
+    """实际调用 train() 验证 R0 BN 状态；不执行前向、不更新 running stats。"""
+    from torch.nn.modules.batchnorm import _BatchNorm
+    model.train()
+    norms = [(name, module)
+             for name, module in model.student_fuser.named_modules()
+             if isinstance(module, _BatchNorm)]
+    training = [name for name, module in norms if module.training]
+    frozen_affine = [name for name, module in norms
+                     if not module.affine or not all(
+                         p.requires_grad for p in (module.weight, module.bias))]
+    ok = bool(norms) and not training and not frozen_affine
+    return ok, 'bn_count=%d bn_training=%s bn_frozen_affine=%s' % (
+        len(norms), training, frozen_affine)
+
+
 def check(report, name, fn):
     try:
         ok, detail = fn()
@@ -546,6 +596,12 @@ def main():
     p.add_argument('--data-root', default=None)
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--out-dir', default='.')
+    p.add_argument('--source-sha', default=None,
+                   help='Published commit SHA from the ZIP manifest '
+                        '(caller supplied; no git call)')
+    p.add_argument('--expected-script-sha256', default=None,
+                   help='Expected script SHA256 from the verified ZIP; '
+                        'mismatch aborts before GPU use')
     p.add_argument(
         '--equivalence-backend', choices=('original', 'no_cudnn'),
         default='original',
@@ -559,24 +615,42 @@ def main():
         help='Override config options, e.g. model.w_teach=0.01 '
              'randomness.seed=1')
     args = p.parse_args()
+    for name, length in (('source_sha', 40), ('expected_script_sha256', 64)):
+        value = getattr(args, name)
+        if value is not None and (len(value) != length or any(
+                c not in '0123456789abcdefABCDEF' for c in value)):
+            p.error('--%s must be %d hex characters'
+                    % (name.replace('_', '-'), length))
 
+    os.makedirs(args.out_dir, exist_ok=True)
     out = os.path.join(
         args.out_dir,
         'sanity_lambda_logging_%s.txt'
-        % datetime.datetime.now().strftime('%Y%m%d'))
+        % datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
     sys.stdout = Tee(out)
     print('EP-Fusion 块1 sanity_lambda_logging')
     print('生成时间 : %s' % datetime.datetime.now().isoformat())
     print('VERSION  : %s' % read_version())
-    print('SANITY   : block1-explicit-equivalence-backend-20260903')
+    print('SANITY   : block1-archival-evidence-20260903')
     with open(__file__, 'rb') as source:
-        print('SCRIPT_SHA256: %s' % hashlib.sha256(source.read()).hexdigest())
+        script_sha256 = hashlib.sha256(source.read()).hexdigest()
+    print('SCRIPT_SHA256: %s' % script_sha256)
+    print('SOURCE_SHA (caller supplied, verify against ZIP manifest): %s'
+          % (args.source_sha or 'unknown'))
+    if (args.expected_script_sha256 is not None
+            and script_sha256 != args.expected_script_sha256.lower()):
+        print('SCRIPT_SHA256_CHECK: FAIL (expected=%s)'
+              % args.expected_script_sha256)
+        sys.exit(2)
+    print('SCRIPT_SHA256_CHECK: %s' % (
+        'PASS' if args.expected_script_sha256 else 'NOT_REQUESTED'))
     print('命令参数 : %s' % vars(args))
     process_suspects = detect_training_processes()
     if process_suspects:
-        print('进程自检 : WARNING，检测到训练进程或无法确认：')
+        print('进程自检 : BLOCKED，检测到训练进程或无法确认；不执行 GPU 操作：')
         for suspect in process_suspects:
             print('  ' + suspect)
+        sys.exit(2)
     else:
         print('进程自检 : PASS，未发现训练/GPU compute 进程')
 
@@ -591,7 +665,11 @@ def main():
         args.config,
         cfg_options=args.cfg_options,
         data_root=args.data_root)
-    load_ckpt_loose(model, args.checkpoint)
+    checkpoint = args.checkpoint or cfg.get('load_from')
+    print('CONFIG load_from=%s custom_hooks=%s poe_cfg=%s' % (
+        cfg.get('load_from'), cfg.get('custom_hooks'), cfg.model.get('poe_cfg')))
+    print('CHECKPOINT resolved=%s' % os.path.realpath(checkpoint or ''))
+    load_ckpt_loose(model, checkpoint)
     from projects.EPFusion.epfusion.hooks import init_poe_from_teacher
     ok_init = init_poe_from_teacher(model)
     model = model.to(args.device)
@@ -622,6 +700,7 @@ def main():
                 mu = ep_eval.poe_fuser(F_C, F_L)['mu_F'].float()
                 ft, stages = teacher_fuser_forward(
                     ep_eval.fusion_layer, F_C, F_L)
+                scale_detail = feature_scale(ft)
                 # 后端诊断只复用两路 BEV，及时释放无关图像/预处理临时量。
                 del data, inp, geo, metas, feats_2d
                 original_ok, detail = compare_tensor('poe_vs_teacher', mu, ft)
@@ -662,9 +741,10 @@ def main():
         return ok, (
             'initialized=%s strict_fp32=True selected_backend=%s '
             'original_ok=%s original_finite=%s no_cudnn_ok=%s%s; '
-            '%s; %s\n    %s'
+            '%s; %s; %s\n    %s'
             % (ok_init, selected_backend, original_ok, original_finite,
-               native_ok, warning, detail, precision_detail, backend_detail))
+               native_ok, warning, scale_detail, detail, precision_detail,
+               backend_detail))
     check(report, 'i_teacher_equivalence', _i)
 
     # (c) pipeline 无 ObjectSample
@@ -690,9 +770,7 @@ def main():
                     if isinstance(value, list) else value.detach().cpu())
                 for k, value in losses.items()
             }
-            msgs.append(
-                '%s loss_sum=%.6g log_vars=%d'
-                % (m, float(loss_sum.detach()), len(log_vars)))
+            msgs.append(mode_loss_summary(m, log_vars, model.w_teach))
             del losses, loss_sum, log_vars
         return True, '; '.join(msgs)
     check(report, 'run_three_modes', _run_all)
@@ -835,7 +913,7 @@ def main():
                 REPO_ROOT, 'projects/BEVFusion/configs/'
                 'bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py')
         _, stock = build_model_from_cfg(base_cfg_path)
-        load_ckpt_loose(stock, args.checkpoint)
+        load_ckpt_loose(stock, checkpoint)
         state_ok, state_msg = compare_teacher_state(model, stock)
         print('  [d diagnostic] ' + state_msg)
         stock = stock.to(args.device).eval()
@@ -882,8 +960,9 @@ def main():
             return False, (
                 'R0 config invalid: fusion_mode=%r w_teach=%r '
                 'emit_clean=%r' % actual)
-        load_ckpt_loose(r0, args.checkpoint)
+        load_ckpt_loose(r0, checkpoint)
         ok_copy = copy_weights(r0)  # 显式调用（脚本不经 Runner.train）
+        bn_ok, bn_detail = check_r0_bn_eval(r0)
         eq = True
         sd_s = r0.student_fuser.state_dict()
         sd_t = r0.fusion_layer.state_dict()
@@ -891,9 +970,9 @@ def main():
             if not torch.equal(sd_s[k], sd_t[k]):
                 eq = False
                 break
-        return (ok_copy and eq), (
+        return (ok_copy and eq and bn_ok), (
             'fusion_mode=%r w_teach=%r emit_clean=%r copied=%s '
-            'all_equal=%s' % (actual + (ok_copy, eq)))
+            'all_equal=%s %s' % (actual + (ok_copy, eq, bn_detail)))
     check(report, 'e_r0_weight_copy', _e)
 
     # ---- 总览 ----

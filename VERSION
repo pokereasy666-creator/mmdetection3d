@@ -1,1 +1,1 @@
-2026-07-26 block1-patch2: PoE proj3x3 + teacher-init hook + student_fuser BN eval + sanity (b)1e-6/(h)assert/(i)equiv/parse_losses/proc-check + teacher ckpt -> official6e epoch_5 (NDS 0.7060)
+2026-09-03 block1-archival-evidence-v1: teacher/loss scale + R0 BN assertion + source hash guard + deployment and four-GPU handoff; GPU archival run pending
