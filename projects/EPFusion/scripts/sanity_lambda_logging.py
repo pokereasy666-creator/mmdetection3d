@@ -16,6 +16,8 @@
   g) 'zero_image'/'zero_points' 强制路径冒烟（不崩溃、Λ 键在场）；
   h) 打印 scheduler 构造后的 LR/momentum，并断言 epoch 端点不越界；
   i) Λ≡1 时 PoE 教师初始化输出与冻结 ConvFuser 输出 allclose。
+     默认使用原后端；显式 --equivalence-backend no_cudnn 仅切换 i 的融合层验收后端，
+     保留原后端比较记录，容差不变，非有限值及运行异常仍为硬失败。
 
 用法（服务器，复现训练结束后）：
   bash scripts/m0_probe.sh  # 确认环境（可选）
@@ -380,8 +382,9 @@ def poe_fp64_diagnostic(model, F_C, F_L, mu, teacher, limit=2048,
                   for name, values in errors.items()))
 
 
-def fuser_backend_diagnostic(model, F_C, F_L, mu, teacher, bad_coords):
-    """仅复算两个 fuser；后端对照不替代原始 FP32 验收结果。"""
+def fuser_backend_diagnostic(model, F_C, F_L, mu, teacher, bad_coords,
+                             diagnostic_only=True):
+    """仅复算两个 fuser，返回受控结果；是否用作闸门由显式 CLI 选项决定。"""
     import torch
 
     with strict_fp32(), torch.no_grad():
@@ -391,9 +394,14 @@ def fuser_backend_diagnostic(model, F_C, F_L, mu, teacher, bad_coords):
             native_mu = model.poe_fuser(F_C, F_L)['mu_F'].float()
             native_teacher, stages = teacher_fuser_forward(
                 model.fusion_layer, F_C, F_L)
-        msgs = ['backend_diag diagnostic_only=True cudnn_enabled=False']
+        native_finite = all(bool(torch.isfinite(t).all()) for t in (
+            native_mu, native_teacher, stages['conv'], stages['bn']))
+        native_ok, native_detail = compare_tensor(
+            'no_cudnn_poe_vs_teacher', native_mu, native_teacher)
+        msgs = [
+            'backend_check diagnostic_only=%s cudnn_enabled=False finite=%s'
+            % (diagnostic_only, native_finite), native_detail]
         for name, actual, reference in (
-                ('no_cudnn_poe_vs_teacher', native_mu, native_teacher),
                 ('teacher_no_cudnn_vs_original', native_teacher, teacher),
                 ('poe_no_cudnn_vs_original', native_mu, mu)):
             _, detail = compare_tensor(name, actual, reference)
@@ -401,7 +409,7 @@ def fuser_backend_diagnostic(model, F_C, F_L, mu, teacher, bad_coords):
         msgs.append('no_cudnn_on_original_fail_coords: ' + poe_fp64_diagnostic(
             model, F_C, F_L, native_mu, native_teacher,
             stages=stages, bad_coords=bad_coords))
-    return '\n    '.join(msgs)
+    return native_ok and native_finite, '\n    '.join(msgs)
 
 
 def compare_teacher_state(ep, stock):
@@ -539,6 +547,11 @@ def main():
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--out-dir', default='.')
     p.add_argument(
+        '--equivalence-backend', choices=('original', 'no_cudnn'),
+        default='original',
+        help='Backend for the i equivalence gate only; no_cudnn retains the '
+             'original comparison and uses the same rtol/atol.')
+    p.add_argument(
         '--cfg-options',
         nargs='+',
         action=DictAction,
@@ -555,7 +568,7 @@ def main():
     print('EP-Fusion 块1 sanity_lambda_logging')
     print('生成时间 : %s' % datetime.datetime.now().isoformat())
     print('VERSION  : %s' % read_version())
-    print('SANITY   : block1-fuser-backend-diagnostics-20260902')
+    print('SANITY   : block1-explicit-equivalence-backend-20260903')
     with open(__file__, 'rb') as source:
         print('SCRIPT_SHA256: %s' % hashlib.sha256(source.read()).hexdigest())
     print('命令参数 : %s' % vars(args))
@@ -588,6 +601,7 @@ def main():
 
     # (i) Λ≡1 时 PoE 教师初始化与冻结 ConvFuser 输出等价
     def _i():
+        selected_backend = args.equivalence_backend
         if not ok_init:
             return False, 'teacher initialization not performed'
         was_training = model.training
@@ -610,31 +624,47 @@ def main():
                     ep_eval.fusion_layer, F_C, F_L)
                 # 后端诊断只复用两路 BEV，及时释放无关图像/预处理临时量。
                 del data, inp, geo, metas, feats_2d
-                ok, detail = compare_tensor('poe_vs_teacher', mu, ft)
+                original_ok, detail = compare_tensor('poe_vs_teacher', mu, ft)
+                original_finite = all(bool(torch.isfinite(t).all()) for t in (
+                    F_C, F_L, mu, ft, stages['conv'], stages['bn']))
+                native_ok = None
                 precision_detail = 'fp64_diag skipped (FP32 gate passed)'
                 backend_detail = 'backend_diag skipped (FP32 gate passed)'
-                if not ok:
+                if not original_ok or selected_backend == 'no_cudnn':
                     bad_coords = (~torch.isclose(
                         mu, ft, rtol=1e-4, atol=1e-5)).nonzero().cpu()
-                    try:
-                        precision_detail = poe_fp64_diagnostic(
-                            ep_eval, F_C, F_L, mu, ft, stages=stages,
-                            bad_coords=bad_coords)
-                    except Exception as e:
-                        precision_detail = 'fp64_diag unavailable: %r' % e
+                    if not original_ok:
+                        try:
+                            precision_detail = poe_fp64_diagnostic(
+                                ep_eval, F_C, F_L, mu, ft, stages=stages,
+                                bad_coords=bad_coords)
+                        except Exception as e:
+                            if selected_backend == 'no_cudnn':
+                                raise
+                            precision_detail = 'fp64_diag unavailable: %r' % e
                     del stages
                     try:
-                        backend_detail = fuser_backend_diagnostic(
-                            ep_eval, F_C, F_L, mu, ft, bad_coords)
+                        native_ok, backend_detail = fuser_backend_diagnostic(
+                            ep_eval, F_C, F_L, mu, ft, bad_coords,
+                            diagnostic_only=(selected_backend == 'original'))
                     except Exception as e:
+                        if selected_backend == 'no_cudnn':
+                            raise
                         backend_detail = 'backend_diag unavailable: %r' % e
         finally:
             ep_pp.force_mode = old_mode
             model.train(was_training)
-        # 后端对照即使通过也不得覆盖原始 ok；退出码仍由原始闸门决定。
+        # 只允许显式选择受控闸门；原后端非有限值不得被受控 PASS 掩盖。
+        ok = original_finite and (
+            original_ok if selected_backend == 'original' else native_ok)
+        warning = ('; WARNING original backend tolerance check failed'
+                   if ok and not original_ok else '')
         return ok, (
-            'initialized=%s strict_fp32=True; %s; %s\n    %s'
-            % (ok_init, detail, precision_detail, backend_detail))
+            'initialized=%s strict_fp32=True selected_backend=%s '
+            'original_ok=%s original_finite=%s no_cudnn_ok=%s%s; '
+            '%s; %s\n    %s'
+            % (ok_init, selected_backend, original_ok, original_finite,
+               native_ok, warning, detail, precision_detail, backend_detail))
     check(report, 'i_teacher_equivalence', _i)
 
     # (c) pipeline 无 ObjectSample
