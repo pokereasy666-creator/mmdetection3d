@@ -244,16 +244,37 @@ def compare_tensor(name, actual, reference, exact=False):
         'exact' if exact else 'rtol1e-4/atol1e-5')
 
 
-def poe_fp64_diagnostic(model, F_C, F_L, mu, teacher, limit=2048):
+def teacher_fuser_forward(fuser, F_C, F_L):
+    """运行原 fuser；只读记录 Conv/BN 输出，BN 必须在原地 ReLU 前复制。"""
+    stages, handles = {}, []
+
+    def _capture(name):
+        def _hook(module, inputs, output):
+            stages[name] = output.detach().cpu().clone()
+        return _hook
+
+    try:
+        for name, module in (('conv', fuser[0]), ('bn', fuser[1])):
+            handles.append(module.register_forward_hook(_capture(name)))
+        output = fuser([F_C, F_L]).float()
+    finally:
+        for handle in handles:
+            handle.remove()
+    return output, stages
+
+
+def poe_fp64_diagnostic(model, F_C, F_L, mu, teacher, limit=2048,
+                       stages=None, bad_coords=None):
     """在 FP32 超差坐标上分解折叠权重与卷积累加误差。
 
     只读取实际特征和权重，不替换验收输出，也不改变原 allclose 闸门。
     """
     import torch
 
-    close = torch.isclose(mu.detach(), teacher.detach(),
-                          rtol=1e-4, atol=1e-5)
-    bad_coords = (~close).nonzero(as_tuple=False).detach().cpu()
+    if bad_coords is None:
+        close = torch.isclose(mu.detach(), teacher.detach(),
+                              rtol=1e-4, atol=1e-5)
+        bad_coords = (~close).nonzero(as_tuple=False).detach().cpu()
     total_bad = int(bad_coords.shape[0])
     if total_bad == 0:
         return 'fp64_diag skipped (no failing coordinates)'
@@ -303,6 +324,10 @@ def poe_fp64_diagnostic(model, F_C, F_L, mu, teacher, limit=2048):
         stored64_vs_truefold64=[],
         truefold64_vs_expected64=[],
         expected64_vs_teacher64=[])
+    if stages is not None:
+        errors.update(
+            conv_fp32_vs_ref64=[], conv_error_after_bn_scale=[],
+            bn_fp32_vs_same_input64=[], bn_fp32_vs_ref64=[])
     split = fc.shape[1]
     for coord in bad_coords.tolist():
         b, out_ch, y, x = coord
@@ -311,7 +336,18 @@ def poe_fp64_diagnostic(model, F_C, F_L, mu, teacher, limit=2048):
         raw = raw_c + raw_l
         if teacher_bias is not None:
             raw = raw + teacher_bias[out_ch]
-        teacher64 = torch.relu(raw * scale[out_ch] + folded_bias[out_ch])
+        bn64 = raw * scale[out_ch] + folded_bias[out_ch]
+        teacher64 = torch.relu(bn64)
+        if stages is not None:
+            conv32 = stages['conv'][b, out_ch, y, x].double()
+            bn32 = stages['bn'][b, out_ch, y, x].double()
+            bn_same_input64 = conv32 * scale[out_ch] + folded_bias[out_ch]
+            errors['conv_fp32_vs_ref64'].append(float((conv32 - raw).abs()))
+            errors['conv_error_after_bn_scale'].append(
+                float(((conv32 - raw) * scale[out_ch]).abs()))
+            errors['bn_fp32_vs_same_input64'].append(
+                float((bn32 - bn_same_input64).abs()))
+            errors['bn_fp32_vs_ref64'].append(float((bn32 - bn64).abs()))
 
         stored_c = (_dot_at(fc, proj_c_w, b, out_ch, y, x)
                     + proj_c_b[out_ch])
@@ -338,18 +374,34 @@ def poe_fp64_diagnostic(model, F_C, F_L, mu, teacher, limit=2048):
         errors['expected64_vs_teacher64'].append(
             abs(float(expected64) - float(teacher64)))
 
-    maxima = {name: max(values) for name, values in errors.items()}
-    return (
-        'fp64_diag analyzed=%d/%d; '
-        'teacher_fp32_vs_ref64=%.3e; poe_fp32_vs_stored64=%.3e; '
-        'stored64_vs_truefold64=%.3e; truefold64_vs_expected64=%.3e; '
-        'expected64_vs_teacher64=%.3e'
-        % (len(bad_coords), total_bad,
-           maxima['teacher_fp32_vs_ref64'],
-           maxima['poe_fp32_vs_stored64'],
-           maxima['stored64_vs_truefold64'],
-           maxima['truefold64_vs_expected64'],
-           maxima['expected64_vs_teacher64']))
+    return 'fp64_diag analyzed=%d/%d; %s' % (
+        len(bad_coords), total_bad,
+        '; '.join('%s=%.3e' % (name, max(values))
+                  for name, values in errors.items()))
+
+
+def fuser_backend_diagnostic(model, F_C, F_L, mu, teacher, bad_coords):
+    """仅复算两个 fuser；后端对照不替代原始 FP32 验收结果。"""
+    import torch
+
+    with strict_fp32(), torch.no_grad():
+        with torch.backends.cudnn.flags(
+                enabled=False, benchmark=False, deterministic=True,
+                allow_tf32=False):
+            native_mu = model.poe_fuser(F_C, F_L)['mu_F'].float()
+            native_teacher, stages = teacher_fuser_forward(
+                model.fusion_layer, F_C, F_L)
+        msgs = ['backend_diag diagnostic_only=True cudnn_enabled=False']
+        for name, actual, reference in (
+                ('no_cudnn_poe_vs_teacher', native_mu, native_teacher),
+                ('teacher_no_cudnn_vs_original', native_teacher, teacher),
+                ('poe_no_cudnn_vs_original', native_mu, mu)):
+            _, detail = compare_tensor(name, actual, reference)
+            msgs.append(detail)
+        msgs.append('no_cudnn_on_original_fail_coords: ' + poe_fp64_diagnostic(
+            model, F_C, F_L, native_mu, native_teacher,
+            stages=stages, bad_coords=bad_coords))
+    return '\n    '.join(msgs)
 
 
 def compare_teacher_state(ep, stock):
@@ -503,7 +555,7 @@ def main():
     print('EP-Fusion 块1 sanity_lambda_logging')
     print('生成时间 : %s' % datetime.datetime.now().isoformat())
     print('VERSION  : %s' % read_version())
-    print('SANITY   : block1-deterministic-fp64-diagnostics-20260902')
+    print('SANITY   : block1-fuser-backend-diagnostics-20260902')
     with open(__file__, 'rb') as source:
         print('SCRIPT_SHA256: %s' % hashlib.sha256(source.read()).hexdigest())
     print('命令参数 : %s' % vars(args))
@@ -538,8 +590,10 @@ def main():
     def _i():
         if not ok_init:
             return False, 'teacher initialization not performed'
+        was_training = model.training
         ep_eval = model.eval()
         ep_pp = ep_eval.data_preprocessor
+        old_mode = ep_pp.force_mode
         try:
             with strict_fp32(), torch.no_grad():
                 ep_pp.force_mode = 'clean'
@@ -552,22 +606,35 @@ def main():
                 F_C = ep_eval._img_bev(feats_2d, inp['points'], geo)
                 F_L = ep_eval._pts_bev(inp['points'])
                 mu = ep_eval.poe_fuser(F_C, F_L)['mu_F'].float()
-                ft = ep_eval.fusion_layer([F_C, F_L]).float()
+                ft, stages = teacher_fuser_forward(
+                    ep_eval.fusion_layer, F_C, F_L)
+                # 后端诊断只复用两路 BEV，及时释放无关图像/预处理临时量。
+                del data, inp, geo, metas, feats_2d
+                ok, detail = compare_tensor('poe_vs_teacher', mu, ft)
+                precision_detail = 'fp64_diag skipped (FP32 gate passed)'
+                backend_detail = 'backend_diag skipped (FP32 gate passed)'
+                if not ok:
+                    bad_coords = (~torch.isclose(
+                        mu, ft, rtol=1e-4, atol=1e-5)).nonzero().cpu()
+                    try:
+                        precision_detail = poe_fp64_diagnostic(
+                            ep_eval, F_C, F_L, mu, ft, stages=stages,
+                            bad_coords=bad_coords)
+                    except Exception as e:
+                        precision_detail = 'fp64_diag unavailable: %r' % e
+                    del stages
+                    try:
+                        backend_detail = fuser_backend_diagnostic(
+                            ep_eval, F_C, F_L, mu, ft, bad_coords)
+                    except Exception as e:
+                        backend_detail = 'backend_diag unavailable: %r' % e
         finally:
-            ep_pp.force_mode = None
-            model.train()
-        ok, detail = compare_tensor('poe_vs_teacher', mu, ft)
-        precision_detail = 'fp64_diag skipped (FP32 gate passed)'
-        if not ok:
-            try:
-                precision_detail = poe_fp64_diagnostic(
-                    ep_eval, F_C, F_L, mu, ft)
-            except Exception as e:
-                # 高精度分解只提供诊断；原 FP32 allclose 始终是验收闸门。
-                precision_detail = 'fp64_diag unavailable: %r' % e
+            ep_pp.force_mode = old_mode
+            model.train(was_training)
+        # 后端对照即使通过也不得覆盖原始 ok；退出码仍由原始闸门决定。
         return ok, (
-            'initialized=%s strict_fp32=True; %s; %s'
-            % (ok_init, detail, precision_detail))
+            'initialized=%s strict_fp32=True; %s; %s\n    %s'
+            % (ok_init, detail, precision_detail, backend_detail))
     check(report, 'i_teacher_equivalence', _i)
 
     # (c) pipeline 无 ObjectSample
