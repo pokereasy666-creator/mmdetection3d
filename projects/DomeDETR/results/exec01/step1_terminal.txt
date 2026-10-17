@@ -1,0 +1,8 @@
+[exec01_env] CONFIG=projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py
+[exec01_env] CKPT=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/epoch_5.pth
+[exec01_env] TRAIN_WORK_DIR=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run
+[exec01_env] CFG_OPTS=model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth
+[exec01_env] BASE_MAP=0.6648 BASE_NDS=0.7060
+
+[gpu-check] GPU 1 idle: no compute process, memory.used=0 MiB
+[diag] runtime: 117.1s total, 92.3s loop, 300 frames, peak mem allocated 2231.8 MiB / reserved 3276.0 MiB

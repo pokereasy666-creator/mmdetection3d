@@ -21,21 +21,50 @@
 
 **结论**：S0 通过，进入第 1 步。
 
-## 第 1 步 部署门禁与 300 帧冒烟（待回传）
+## 第 1 步 300 帧冒烟（2026-10-17 回传）：S1–S4a 全部 PASS
 
-在工作区根目录执行，先 `source tools/query_diag/exec01_env.sh`。
+- 原始输出：`results/exec01/step1_recall_quick_report.txt`、`step1_recall_quick_merged.txt`、`step1_terminal.txt`
+- GPU 1：检查时空闲（没有计算进程，`memory.used` = 0 MiB）
+- 耗时：总计 117.1 s，其中循环 92.3 s（300 帧，约 0.31 s/帧）
+- 峰值显存：allocated 2231.8 MiB，reserved 3276.0 MiB
+
+| 自检 | 值 | 判据 | 结果 |
+| --- | --- | --- | --- |
+| S1 初始化复现与 `head.query_labels` 匹配率 | 1.00000 | ≥ 0.99 | PASS |
+| S2 `bev_pos transposed` | False | == False | PASS |
+| S3a 报告中 `[WARNING]` 行数 | 0 | == 0 | PASS |
+| S3b 0–20 m 段 class-aware 初始召回率 @2 m，K=200 | 0.98781 | ≥ 0.5 | PASS |
+| S4a `center_grid` 落在 [−2, H+2] 的比例 | 0.99833 | ≥ 0.99 | PASS |
+| S4 0–20 m 段 final_agn − init_agn | +0.00037 | ≥ −0.05 | PASS |
+
+**审阅备注**：
+1. **C1 在真实模型上生效。** T4 中 final 与 init 几乎相等（全体样本均为 0.980），而参考实现在 mock 上会塌到约 0。
+2. **S4a 的 0.17% 越界在预期之内。** 120000 个中心坐标里约 200 个落在 [−2, 182] 之外，来自网格边缘附近、回归偏移较大的 query，远低于 1% 的门槛。
+3. **坐标约定正确。** 0–20 m 段 class-agnostic 初始召回率 @4 m 为 0.997，若坐标轴颠倒，这个值会远低于 0.5。
+4. **门禁输出没有回传。** v1.1 第 9 节要求提供。所有文件在同步前已经在本地通过门禁（见实施文档第 2 节），冒烟实际执行过的脚本也在服务器的 Python 3.8 上正常运行；但 `diag_oracle_query.py`、`diag_gate_s5.py`、`diag_summarize.py` 还没在服务器上跑过。要求在第 3 步之前补交服务器上的门禁输出。
+5. **冒烟数字只用于自检。** 300 帧样本太小（例如 motorcycle 只有 10 个 GT，trailer 为 0），不用于任何 R 规则，也不据此调整任何后续步骤。
+
+**结论**：第 1 步通过，进入第 2 步。全量 6019 帧的循环预计约 31 分钟，加上模型构建，共约 33 分钟。
+
+## 第 2 步 全量 D1 + D3（待回传）
+
+在工作区根目录执行。耗时较长，建议放在 `tmux` 或 `screen` 里跑，避免 SSH 断开时进程被杀。
 
 ```bash
+source tools/query_diag/exec01_env.sh
 for f in tools/query_diag/*.py; do python -c "import ast,sys; s=open(sys.argv[1],'rb').read(); assert all(b < 128 for b in s), 'non-ASCII'; ast.parse(s.decode(), feature_version=(3, 8)); print('OK', sys.argv[1])" "$f"; done
 for f in tools/query_diag/*.sh; do bash -n "$f" && echo "bash -n OK $f"; done
-CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh quick
+CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh recall
 bash tools/query_diag/run_diag.sh merge
 ```
 
-通过条件：`merge` 输出里 S1、S2、S3（a、b）、S4a、S4 全部 PASS。任一项不通过就停下回传，不调整统计口径。
+参数固定为 v1.1 第 7 节的取值，不得调整。
 
 需要回传：
-- 门禁输出
-- `work_dirs/diag/recall_quick/recall_report.txt`
-- `work_dirs/diag/recall_quick/recall_merged.txt`
-- 终端里 `[gpu-check]` 和 `[diag] runtime:` 这两行（耗时和峰值显存，用于估算全量时间）
+- 门禁输出（补交第 1 步缺的那份）
+- `work_dirs/diag/recall/recall_report.txt`
+- `work_dirs/diag/recall/recall_summary.json`
+- `work_dirs/diag/recall/recall_merged.txt`
+- 终端里的 `[gpu-check]` 行和 `[diag] runtime:` 行
+
+`merge` 会把 `recall_quick` 和 `recall` 两个目录都处理一遍。`recall_quick` 的结果与上次相同，不必再回传。
