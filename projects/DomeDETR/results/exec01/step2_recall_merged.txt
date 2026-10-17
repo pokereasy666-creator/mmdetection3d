@@ -1,0 +1,33 @@
+[merge] source=work_dirs/diag/recall frames=6019 num_gt=118538 class_range=True main_thr=2m P=200
+
+Self-checks
+  S1   init vs head.query_labels match rate                    1.00000  >= 0.99   PASS
+  S2   bev_pos transposed                                        False  == False  PASS
+  S3a  number of [WARNING] lines in recall_report.txt                0  == 0      PASS
+  S3b  class-aware init recall @2m K=200, 0-20 m               0.97621  >= 0.5    PASS
+  S4a  center_grid values within [-2, H+2] (grid units)        0.99927  >= 0.99   PASS
+  S4   0-20 m final_agn - init_agn @2m                         0.00048  >= -0.05  PASS
+  S3 overall: PASS | all self-checks PASS: True
+
+Bins @2m (class-aware "ca", class-agnostic "agn"; initial recall per K; final = after decoder)
+  bin         N_gt   ca@200   ca@300   ca@500  ca@1000  agn@200  agn@300  agn@500 agn@1000  final_ca final_agn
+  <30 m      86121   0.9732   0.9790   0.9835   0.9874   0.9844   0.9880   0.9914   0.9946    0.9735    0.9849
+  >=30 m     32417   0.9494   0.9587   0.9666   0.9727   0.9741   0.9819   0.9881   0.9929    0.9497    0.9739
+  0-20 m     52368   0.9762   0.9812   0.9852   0.9884   0.9867   0.9891   0.9919   0.9950    0.9763    0.9871
+  all       118538   0.9667   0.9734   0.9789   0.9834   0.9816   0.9864   0.9905   0.9941    0.9670    0.9819
+
+Rule inputs (exec doc v1.1 sec. 7; no R-rule verdicts here)
+  R_near(200)                                  0.97319
+  R_near(1000)                                 0.98742
+  R_far(200)                                   0.94944
+  R_far(1000)                                  0.97273
+  miss_near                                    0.02681
+  miss_far                                     0.05056
+  miss_far/miss_near                           1.88578
+  dR_far = R_far(1000)-R_far(200)              0.02329
+  agn_gap_far = agnR_far(200)-R_far(200)       0.02471
+  final_gap_far = final_ca_far-R_far(200)      0.00022
+  frac_over_200                                0.00000
+  n_gt_near                                    86121
+  n_gt_far                                     32417
+  frames                                       6019

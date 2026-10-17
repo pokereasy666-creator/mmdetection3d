@@ -1,0 +1,22 @@
+# Trimmed terminal output of step 2 (gate, GPU check, run notes, runtime).
+# The full mmengine config dump printed by the Runner is omitted.
+OK tools/query_diag/diag_common.py
+OK tools/query_diag/diag_gate_s5.py
+OK tools/query_diag/diag_merge_bins.py
+OK tools/query_diag/diag_oracle_query.py
+OK tools/query_diag/diag_query_recall.py
+OK tools/query_diag/diag_s0_check.py
+OK tools/query_diag/diag_summarize.py
+bash -n OK tools/query_diag/exec01_env.sh
+bash -n OK tools/query_diag/exec01_fetch_inputs.sh
+bash -n OK tools/query_diag/run_diag.sh
+[run_diag] NOTE: CFG_OPTS in effect: model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth (recorded in json)
+[gpu-check] GPU 1 idle: no compute process, memory.used=0 MiB
+[diag] test_cfg.fp16=False (recall loop autocast=False)
+10/17 16:24:20 - mmengine - INFO - Load checkpoint from /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/epoch_5.pth
+10/17 16:24:35 - mmengine - INFO - The length of test dataset: 6019
+[diag] num_proposals=200 nms_kernel=3 dataset=nuScenes geometry=(8.0, 0.075, 0.075, -54.0, -54.0)
+[diag] BEV map 180x180, bev_pos transposed=False
+[diag] 6000 frames, 1786.7s
+[diag] runtime: 1815.0s total, 1792.6s loop, 6019 frames, peak mem allocated 2233.8 MiB / reserved 3276.0 MiB
+[diag] saved to work_dirs/diag/recall

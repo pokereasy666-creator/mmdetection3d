@@ -46,25 +46,81 @@
 
 **结论**：第 1 步通过，进入第 2 步。全量 6019 帧的循环预计约 31 分钟，加上模型构建，共约 33 分钟。
 
-## 第 2 步 全量 D1 + D3（待回传）
+## 第 2 步 全量 D1 + D3（2026-10-17 回传）：S1–S4a 全部 PASS
 
-在工作区根目录执行。耗时较长，建议放在 `tmux` 或 `screen` 里跑，避免 SSH 断开时进程被杀。
+- 原始输出：`results/exec01/step2_recall_report.txt`、`step2_recall_summary.json`、`step2_recall_merged.txt`、`step2_terminal.txt`（门禁和运行行的节选）
+- 门禁：服务器 Python 3.8 上 7 个 .py 和 3 个 .sh 全部通过，补齐了第 1 步缺的那份
+- GPU 1：检查时空闲
+- 耗时：总计 1815 s，循环 1792.6 s（6019 帧，0.298 s/帧）
+- 峰值显存：allocated 2233.8 MiB，reserved 3276.0 MiB
+- 运行环境（runtime 字段）：torch 2.0.1+cu118、mmcv 2.1.0、mmengine 0.10.5、mmdet 3.2.0、mmdet3d 1.4.0；`config_md5` 8f49ac79…，`checkpoint_md5` c16536e3…，均与 S0 一致；fp16 两边都是 False；`CFG_OPTS` 为 Swin 路径（C3）
+
+### 自检
+
+| 自检 | 值 | 判据 | 结果 |
+| --- | --- | --- | --- |
+| S1 | 1.00000 | ≥ 0.99 | PASS |
+| S2 | False | == False | PASS |
+| S3a | 0 | == 0 | PASS |
+| S3b（0–20 m，class-aware，@2 m，K=200） | 0.97621 | ≥ 0.5 | PASS |
+| S4a | 0.99927（共 2,407,600 个值） | ≥ 0.99 | PASS |
+| S4 | +0.00048 | ≥ −0.05 | PASS |
+
+### 第 7 节规则输入量
+
+除注明外均为 class-aware、@2 m。共 118,538 个 GT：<30 m 段 86,121 个，≥30 m 段 32,417 个。
+
+| 量 | 值 | 二项标准误* |
+| --- | --- | --- |
+| R_near(200) / R_near(1000) | 0.97319 / 0.98742 | — |
+| R_far(200) / R_far(1000) | 0.94944 / 0.97273 | — |
+| miss_near / miss_far | 0.02681 / 0.05056 | 0.00055 / 0.00122 |
+| miss_far / miss_near | **1.886** | 0.060 |
+| ΔR_far | **0.0233** | 0.0008 |
+| agn_gap_far | **0.0247** | 0.0009 |
+| final_gap_far | **0.0002** | — |
+| frac_over_200 | **0.0000**（每帧最多 102 个，p99 = 76.8） | — |
+
+\* 按 GT 相互独立计算。同一帧内的 GT 相关，真实误差会更大，这里只用来看数量级。
+
+### 与阈值的相对位置（不是判读）
+
+**最终判读按第 10 节的顺序进行，第一条 R1 需要第 3 步的 ΔmAP_all，所以下表不构成任何结论，只记录 D1 / D3 的数字落在哪个区间。**
+
+| 规则 | 只依赖 D1 / D3 的部分 | 落点 |
+| --- | --- | --- |
+| R2 | miss_far / miss_near ≥ 2 | 1.886 < 2，这半条不满足。R2 要求两个条件同时成立，因此无论 ΔmAP_far 是多少，R2 都不会满足 |
+| R3 | ΔR_far 位于 ≥ 0.05 / 0.02–0.05 / ≤ 0.02 哪一段 | 0.0233，落在 0.02–0.05 的"审阅讨论"区间，比下界 0.02 高约 4 个标准误 |
+| R4 | agn_gap_far ≥ 0.05（另一个分支需要 D2） | 0.0247 < 0.05，这个分支不触发；ΔmAP_all_cls − ΔmAP_all 那个分支待第 3 步 |
+| R5 | final_gap_far ≥ 0.05 | 0.0002，不满足：解码器没有补回初始化漏掉的目标 |
+| R6 | frac_over_200 < 0.5% | 0，满足 |
+
+### 审阅备注（事实层面）
+
+1. **初始化召回整体已经很高。** K=200、2 m 内有同类 query 的 GT 占 96.7%（不区分类别时为 98.2%）；≥30 m 段为 94.9%（不区分类别 97.4%）。
+2. **漏检里有近一半是类别锁定造成的。** 全体漏检 3.33% 中约 45%、远距离漏检 5.06% 中约 49% 属于"附近有 query，但初始化时类别判错"（class-agnostic 和 class-aware 之差）。agn_gap_far 本身（0.0247）仍低于 R4 的 0.05。
+3. **加预算能找回一部分。** K 从 200 增加到 1000，远距离 class-aware 召回 +2.3 pp，class-agnostic +1.9 pp（0.974 → 0.993）。
+4. **漏检集中在少数类别，且与距离关系不一。** class-aware @2 m 全距离：construction_vehicle 0.716、trailer 0.857、bicycle 0.909、truck 0.935、bus 0.943、barrier 0.943。barrier 在 0–20 m 段也只有 0.942，说明不全是距离问题。
+5. **解码器只做局部细化，不改变召回。** T4 中 final 与 init 在各段之间的差都在 0.002 以内（R5 的落点也是这个意思）。
+6. **D3**：每帧有效 GT 最多 102 个，没有任何一帧超过 200 个。
+
+**结论**：第 2 步通过，可以进入第 3 步。按预登记的流程，D1 的数字不改变第 3 步的执行方式。
+
+## 第 3 步 D2 oracle 五组（待回传）
+
+在 `tmux` 里执行。先跑 base，S5 通过后会自动接着跑另外 4 组；每组约 40 分钟（推理约 30 分钟 + nuScenes 评测约 9 分钟），共约 3.3–3.5 小时。
 
 ```bash
 source tools/query_diag/exec01_env.sh
-for f in tools/query_diag/*.py; do python -c "import ast,sys; s=open(sys.argv[1],'rb').read(); assert all(b < 128 for b in s), 'non-ASCII'; ast.parse(s.decode(), feature_version=(3, 8)); print('OK', sys.argv[1])" "$f"; done
-for f in tools/query_diag/*.sh; do bash -n "$f" && echo "bash -n OK $f"; done
-CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh recall
-bash tools/query_diag/run_diag.sh merge
+GPUS=1 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh oracle
+bash tools/query_diag/run_diag.sh summary
 ```
 
-参数固定为 v1.1 第 7 节的取值，不得调整。
+- 退出码 4 且提示 `S5 FAILED`：后四组不会运行。按预登记流程执行 `CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh s5-adjudicate`，回传结果后**停下等确认**。
+- 中途若因 GPU 被占用（退出码 3）而停止：已完成的组的 json 会保留，但重新执行 `oracle` 会从 base 开始重跑。
 
 需要回传：
-- 门禁输出（补交第 1 步缺的那份）
-- `work_dirs/diag/recall/recall_report.txt`
-- `work_dirs/diag/recall/recall_summary.json`
-- `work_dirs/diag/recall/recall_merged.txt`
-- 终端里的 `[gpu-check]` 行和 `[diag] runtime:` 行
-
-`merge` 会把 `recall_quick` 和 `recall` 两个目录都处理一遍。`recall_quick` 的结果与上次相同，不必再回传。
+- `work_dirs/diag/oracle_{base,all,far,near,all_cls}/oracle_*.json`（5 个）
+- `work_dirs/diag/oracle_base/s5_gate.json`
+- `summary` 的完整输出
+- 终端里的 `[gpu-check]`、`[S5]`、`[oracle]` 开头的行
