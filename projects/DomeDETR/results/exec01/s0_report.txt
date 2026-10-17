@@ -1,0 +1,60 @@
+[s0] repo=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag config=projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py ckpt=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/epoch_5.pth
+[s0] config md5=8f49ac799dc93ccd3e8c7a8dc736a2dc ckpt md5=c16536e34cff05f51b6145dec2893f7d
+S0a  md5 vs manifest of 82c2b4e: 33/33 tracked files OK, 0 extra files, extended set 9/9 OK
+     core OK       projects/BEVFusion/bevfusion/bevfusion.py
+     core OK       projects/BEVFusion/bevfusion/sparse_encoder.py
+     core OK       projects/BEVFusion/bevfusion/transfusion_head.py
+     core OK       projects/BEVFusion/bevfusion/utils.py
+     core OK       projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py
+     core OK       projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py
+     core OK       projects/BEVFusion/configs/bevfusion_lidar_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py
+     import mmdet3d -> /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/mmdet3d/__init__.py
+     import projects.BEVFusion.bevfusion -> /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/projects/BEVFusion/bevfusion/__init__.py
+S0a  PASS
+S0b  overrides of bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py relative to bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py: 14
+     model.img_backbone.init_cfg.checkpoint: 'https://github.com/SwinTransformer/storage/releases/download/v1.0.... -> '/212022085500129/mmdetection3d-claude-jolly-wozniak-c4YMQ/checkpoi...
+     optim_wrapper.accumulative_counts: '<absent>' -> 4
+     optim_wrapper.clip_grad.max_norm: 35 -> 10
+     optim_wrapper.loss_scale: '<absent>' -> 512.0
+     optim_wrapper.type: 'OptimWrapper' -> 'AmpOptimWrapper'
+     param_scheduler[1].T_max: 6 -> 20
+     param_scheduler[1].end: 6 -> 20
+     param_scheduler[2].end: 2.4 -> 8
+     param_scheduler[3].begin: 2.4 -> 8
+     param_scheduler[3].end: 6 -> 20
+     train_cfg.max_epochs: 6 -> 20
+     train_dataloader.batch_size: 4 -> 2
+     train_dataloader.dataset.dataset.pipeline[10].max_epoch: 6 -> 20
+     train_pipeline[10].max_epoch: 6 -> 20
+     model types: official 28, current 28, new none
+S0b  PASS
+[s0] NOTE: cfg_options applied for S0c/S0d: {'model.img_backbone.init_cfg.checkpoint': '/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth'}
+S0c  load /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/epoch_5.pth (CPU, mmengine load_checkpoint, strict=False)
+     ckpt tensors by module: {'img_backbone': 187, 'img_neck': 24, 'view_transform': 59, 'pts_middle_encoder': 126, 'fusion_layer': 6, 'pts_backbone': 72, 'pts_neck': 12, 'bbox_head': 96}
+     camera branch: ckpt=True, CONFIG model=True
+     log hits: {'missing keys': False, 'unexpected keys': False, 'size mismatch': False}
+     raw key/shape diff before load hooks (info): {'missing': 0, 'unexpected': 0, 'shape': 0}
+     tensors: model 582, ckpt 582; ckpt meta: {'epoch': 5, 'iter': 77240, 'mmengine_version': '0.10.5', 'time': '20260719_005050', 'experiment_name': 'bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d_20260718_020825', 'seed': 577127641}
+     load log:
+       Loads checkpoint by local backend from path: /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/epoch_5.pth
+S0c  PASS
+S0d  evaluation setup
+     ann_file val=nuscenes_infos_val.pkl test=nuscenes_infos_val.pkl
+     fp16: {'val_cfg': False, 'test_cfg': False}
+     training run (ckpt meta): sync_bn=torch optim_wrapper=AmpOptimWrapper (train-only; SyncBN in eval mode equals BN)
+     training run (ckpt meta) work_dir: /212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ/work_dirs/bevfusion_lidar-cam_official6e_4xa30_amp512_accum4_seed577127641
+     training run (ckpt meta) load_from: /212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ/work_dirs/bevfusion_lidar_voxel0075_4xa30_accum2_seed577127641/epoch_20.pth
+     training run (ckpt meta) input_modality: {'use_camera': True, 'use_lidar': True}
+     training run (ckpt meta) max_epochs: 6
+     training run (ckpt meta) ckpt_epoch: 5
+     training configs compared: 2 (ckpt meta cfg, train dump /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py)
+     val step 1   mAP=0.638675 NDS=0.688499  (/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run/20260718_020825/vis_data/scalars.json)
+     val step 2   mAP=0.648277 NDS=0.695788  (/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run/20260718_020825/vis_data/scalars.json)
+     val step 3   mAP=0.657597 NDS=0.701419  (/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run/20260718_020825/vis_data/scalars.json)
+     val step 4   mAP=0.659332 NDS=0.701668  (/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run/20260718_020825/vis_data/scalars.json)
+     val step 5   mAP=0.664817 NDS=0.706014  (/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run/20260718_020825/vis_data/scalars.json)  <- CKPT epoch
+     val step 6   mAP=0.653790 NDS=0.695992  (/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/train_run/20260718_020825/vis_data/scalars.json)
+     BASE check (epoch 5): given mAP/NDS ('0.6648', '0.7060'), log ('0.6648', '0.7060')
+S0d  PASS
+
+[s0] results: {'S0a': 'PASS', 'S0b': 'PASS', 'S0c': 'PASS', 'S0d': 'PASS'} -> ALL PASS
