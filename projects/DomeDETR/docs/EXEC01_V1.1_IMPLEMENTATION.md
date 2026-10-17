@@ -53,7 +53,7 @@ non-ASCII lines: 0 in every file under tools/query_diag/
 
 ## 3. 本地 CPU 验证（mock）
 
-`projects/DomeDETR/tests/test_query_diag_cpu.py`，16 项全部通过（包括 D-3 配置规则、S0d 的 BASE 核对和 `exec01_env.sh`）。
+`projects/DomeDETR/tests/test_query_diag_cpu.py`，18 项全部通过（包括 D-3 配置规则、S0d 的 BASE 核对、A-1 的隔离检查：fetch 前后源目录逐文件不变、各脚本在受保护目录内拒绝运行、`build-ops` 只做 `build_ext --inplace`）。
 
 - mock head 的以下部分**逐行复制**自本仓库，包括原地改写 `center` 的那几行：
   - query 初始化（`transfusion_head.py:227-262`）
@@ -112,39 +112,47 @@ train_pipeline[10].max_epoch: 6 -> 20
 
 `model` 下唯一的覆盖项是 Swin 初始化路径。这个路径在加载完整权重后会被覆盖，不影响推理。test / val 相关的项没有任何覆盖。
 
-## 5. 服务器运行手册
+## 5. 服务器运行手册（A-1：独立工作区）
 
-在服务器仓库根目录、训练用的同一个 conda 环境中执行。分支 zip 先解压到**仓库外**，例如 `~/qd_zip`。
+**不在 EP-Fusion 仓库 `/212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ` 中做任何操作。** 诊断在本分支的独立检出（`$WS`）中进行。EP-Fusion 仓库只被 `exec01_fetch_inputs.sh` 只读一次。所有脚本发现工作目录或输出目录在 EP-Fusion 仓库内，都会拒绝运行。
 
-> 2026-10-17 更新：服务器仓库根目录实际是 `/212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ`。CKPT、BASE、`CFG_OPTS` 的具体取值，以及待你决定的事项，见 `EXEC01_INPUTS_FROM_LOG.md`。下面的命令只示意执行顺序。
+使用与训练相同的 conda 环境，但**只读**：不 `pip install`，不 `setup.py develop` / `install`。
 
 ```bash
-cd /212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ
-# 已确认的输入（D-1、D-2 和 CFG_OPTS），见 EXEC01_DECISIONS.md
-source ~/qd_zip/tools/query_diag/exec01_env.sh
+# 0) 独立工作区：把分支 zip 解压到 EP-Fusion 仓库之外（位置自定，示例如下）
+mkdir -p /212022085500129/dome-detr && cd /212022085500129/dome-detr
+unzip mmdetection3d-claude-dome-detr-query-diag.zip
+cd mmdetection3d-claude-dome-detr-query-diag          # = $WS，以下都在这里执行
 
-# S0：只用 CPU，直接从 zip 目录运行，此时仓库里还没有 tools/query_diag/
-#     S0d 会同时核对 BASE_MAP / BASE_NDS 与 epoch 5 的 val 日志
-bash ~/qd_zip/tools/query_diag/run_diag.sh s0
+# 1) 一次性准备
+bash tools/query_diag/exec01_fetch_inputs.sh   # 只读拷贝 epoch_5、Swin、训练目录的配置/日志/scalars.json，校验 md5；链接 data/nuscenes
+bash tools/query_diag/run_diag.sh build-ops    # FORCE_CUDA=1 build_ext --inplace，只写 $WS，不动 conda 环境
+source tools/query_diag/exec01_env.sh          # D-1、D-2 和 CFG_OPTS
+
+# 2) 同步门禁（服务器 Python 3.8）
+for f in tools/query_diag/*.py; do python -c "import ast,sys; s=open(sys.argv[1],'rb').read(); assert all(b < 128 for b in s), 'non-ASCII'; ast.parse(s.decode(), feature_version=(3, 8)); print('OK', sys.argv[1])" "$f"; done
+for f in tools/query_diag/*.sh; do bash -n "$f" && echo "bash -n OK $f"; done
+
+# 3) S0（只用 CPU）：在 $WS 上做 S0a；S0d 同时核对 BASE 值与 epoch 5 的 val 日志
+bash tools/query_diag/run_diag.sh s0
 #   -> work_dirs/diag/s0/s0_report.txt。S0a–S0d 全部 PASS 才继续；否则停下回传。
 
-# 第 1 步：部署、门禁、冒烟
-cp -r ~/qd_zip/tools/query_diag tools/
-for f in tools/query_diag/*.py; do python -c "import ast,sys; s=open(sys.argv[1],'rb').read(); assert all(b < 128 for b in s), 'non-ASCII'; ast.parse(s.decode(), feature_version=(3, 8)); print('OK', sys.argv[1])" "$f"; done
-bash -n tools/query_diag/run_diag.sh && echo 'bash -n OK'
+# 4) 第 1 步：冒烟
 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh quick
 bash tools/query_diag/run_diag.sh merge        # S1–S4a 全部 PASS 才继续
 
-# 第 2 步：全量 D1 + D3
+# 5) 第 2 步：全量 D1 + D3
 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh recall
 bash tools/query_diag/run_diag.sh merge
 
-# 第 3 步：D2（R1 阈值已登记为 1.0 pp，见 D-4）
+# 6) 第 3 步：D2（R1 已登记为 1.0 pp，见 D-4）
 GPUS=1 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh oracle
 bash tools/query_diag/run_diag.sh summary
 # 只有 S5 不通过时才执行：
 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh s5-adjudicate
 ```
+
+所有输出都在 `$WS/work_dirs/diag/` 下。EP-Fusion 仓库只会被读到以下内容：`fetch` 时的 3 类输入文件；以及当 nuScenes 实际存放在该仓库内时，推理过程中对数据集的只读访问（`fetch` 会提示是否属于这种情况）。
 
 退出码：0 = 正常；2 = 参数或环境不满足；3 = GPU 被占用；4 = S5 不通过，或 S5 裁决已结束（需要人工确认）。
 

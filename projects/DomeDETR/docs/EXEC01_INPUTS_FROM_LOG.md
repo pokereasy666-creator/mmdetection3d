@@ -50,8 +50,10 @@ v1.1 把 CKPT 预设为 `baseline1/epoch_19.pth`。这是我在第 0 步报告�
 
 RECON §1 和 M0_PLAN I.1 把 `work_dirs/baseline1/epoch_19.pth` 记作 **lidar-cam** 复现（NDS 0.696 / mAP 0.665），并把它**锁定为 EP-Fusion 的教师和冻结主干权重**。如果它实际是 LiDAR-only，EP-Fusion 冻结的相机分支就没有经过训练，那条线的实验需要复核。这和本诊断无关，但问题严重，需要单独确认。下面这条命令只用 CPU，几秒就能判定：
 
+在诊断工作区（或任何 EP-Fusion 仓库之外的目录）执行，只读加载，不进入 EP-Fusion 仓库：
+
 ```bash
-cd $REPO && python -c "
+python -c "
 import re, sys, torch
 ck = torch.load(sys.argv[1], map_location='cpu')
 sd = ck.get('state_dict', ck); meta = ck.get('meta', {}); cfg = meta.get('cfg', '')
@@ -59,7 +61,7 @@ print('modules :', sorted({k.split('.')[0] for k in sd}))
 print('epoch   :', meta.get('epoch'))
 print('modality:', re.findall(r'input_modality = .*', cfg)[:1])
 print('work_dir:', re.findall(r'work_dir = .*', cfg)[:1])
-" work_dirs/baseline1/epoch_19.pth
+" /212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ/work_dirs/baseline1/epoch_19.pth
 ```
 
 `modules` 里有 `img_backbone`、`view_transform`、`fusion_layer` 就是融合模型，没有就是 LiDAR-only。
@@ -91,6 +93,8 @@ R1 是第 3 步 oracle 实验的"总上限"门槛，用来回答一个问题：*
 4. `baseline1` 的核查结果（第 3 节）。不影响本诊断，但请尽快确认。
 
 ## 6. 若选 A，具体运行参数
+
+> **已被 A-1 取代（2026-10-17）**：诊断不在 EP-Fusion 仓库中进行。下面的路径只用于说明当时的分析；实际参数见 `tools/query_diag/exec01_env.sh`（使用工作区内的拷贝），执行步骤见 `EXEC01_V1.1_IMPLEMENTATION.md` 第 5 节。
 
 ```bash
 cd /212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ

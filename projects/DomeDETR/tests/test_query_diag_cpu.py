@@ -257,7 +257,12 @@ if [ "$q" = apps ]; then printf '%s' "${!v:-}"; else echo "${!m:-3}"; fi
 '''
 
 PYSTUB = r'''#!/usr/bin/env bash
-echo "python $*" >> "$STUB_LOG"
+echo "FORCE_CUDA=${FORCE_CUDA:-} python $*" >> "$STUB_LOG"
+if [[ "$*" == *setup.py*build_ext*--inplace* ]]; then
+  touch projects/BEVFusion/bevfusion/ops/bev_pool/bev_pool_ext.cpython-38-x86_64-linux-gnu.so
+  touch projects/BEVFusion/bevfusion/ops/voxel/voxel_layer.cpython-38-x86_64-linux-gnu.so
+  exit 0
+fi
 case "$*" in
   *diag_gate_s5.py*|*diag_merge_bins.py*) exec "$REAL_PY" "$@" ;;
 esac
@@ -313,7 +318,8 @@ def test_run_diag(tmp, cfg, ckpt):
         if os.path.exists(log):
             os.remove(log)
         rc, txt = sh(['bash', rdsh, step], env=e)
-        calls = open(log).read().splitlines() if osp.exists(log) else []
+        calls = [c.split(' ', 1)[1] for c in open(log).read().splitlines()] \
+            if osp.exists(log) else []
         return rc, txt, calls
 
     clean = {'CUDA_VISIBLE_DEVICES': ''}
@@ -402,24 +408,133 @@ def stub_project_modules(root):
         sys.modules['projects.BEVFusion.bevfusion']
 
 
-@case('exec01_env.sh: exports confirmed inputs; refuses outside repo root')
-def test_env(tmp):
-    root = osp.join(tmp, 'env_repo')
-    run = osp.join(root, 'work_dirs', 'bevfusion_lidar-cam_official6e_4xa30_'
-                   'amp512_accum4_seed577127641')
-    os.makedirs(run)
-    os.makedirs(osp.join(root, 'projects', 'BEVFusion'))
-    env = osp.join(QD, 'exec01_env.sh')
-    rc, out = sh(['bash', '-c', 'source "%s" && echo "CKPT=$CKPT" && echo '
-                  '"OPTS=$CFG_OPTS" && echo "B=$BASE_MAP/$BASE_NDS"' % env],
-                 cwd=root)
+RUN_NAME = 'bevfusion_lidar-cam_official6e_4xa30_amp512_accum4_seed577127641'
+
+
+def snapshot(root):
+    out = {}
+    for dp, dn, fn in os.walk(root):
+        for n in dn + fn:
+            p = osp.join(dp, n)
+            st = os.lstat(p)
+            out[osp.relpath(p, root)] = (st.st_mtime_ns, st.st_size)
+    return out
+
+
+def make_fake_ep(tmp):
+    """Fake EP-Fusion repo + a nuScenes dir outside it."""
+    ep = osp.join(tmp, 'ep_repo')
+    run = osp.join(ep, 'work_dirs', RUN_NAME)
+    os.makedirs(osp.join(run, '20260718_020825', 'vis_data'))
+    os.makedirs(osp.join(ep, 'checkpoints'))
+    os.makedirs(osp.join(ep, 'data'))
+    open(osp.join(run, 'epoch_5.pth'), 'wb').write(os.urandom(4096))
+    open(osp.join(run, 'epoch_6.pth'), 'wb').write(os.urandom(64))
+    open(osp.join(run, 'bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_'
+                  'nus-3d.py'), 'w').write('x = 1\n')
+    open(osp.join(run, '20260718_020825', '20260718_020825.log'),
+         'w').write('log\n')
+    open(osp.join(run, '20260718_020825', 'vis_data', 'scalars.json'),
+         'w').write('{"x/mAP": 0.6648, "x/NDS": 0.706, "step": 5}\n')
+    open(osp.join(ep, 'checkpoints', 'swint-nuimages-pretrained.pth'),
+         'wb').write(os.urandom(512))
+    nus = osp.join(tmp, 'datasets', 'nuscenes')
+    os.makedirs(nus)
+    open(osp.join(nus, 'nuscenes_infos_val.pkl'), 'wb').write(b'pkl')
+    os.symlink(nus, osp.join(ep, 'data', 'nuscenes'))
+    return ep, nus
+
+
+def make_workspace(tmp, name):
+    ws = osp.join(tmp, name)
+    for d in ('projects/BEVFusion/bevfusion/ops/bev_pool',
+              'projects/BEVFusion/bevfusion/ops/voxel', 'tools/query_diag'):
+        os.makedirs(osp.join(ws, d))
+    open(osp.join(ws, 'tools', 'test.py'), 'w').write('')
+    return ws
+
+
+@case('A-1 fetch: read-only copy, md5 manifest, nuScenes link, guards')
+def test_fetch(tmp):
+    ep, nus = make_fake_ep(tmp)
+    ws = make_workspace(tmp, 'ws_fetch')
+    fetch = osp.join(QD, 'exec01_fetch_inputs.sh')
+    before = snapshot(ep)
+    rc, out = sh(['bash', fetch], env={'EP_REPO': ep}, cwd=ws)
     assert rc == 0, out
-    assert 'CKPT=%s/epoch_5.pth' % run in out, out
-    assert 'OPTS=model.img_backbone.init_cfg.checkpoint=%s/checkpoints/' \
-        'swint-nuimages-pretrained.pth' % root in out, out
-    assert 'B=0.6648/0.7060' in out and 'WARNING: missing file' in out, out
-    rc, out = sh(['bash', '-c', 'source "%s"; echo "rc=$?"' % env], cwd=tmp)
-    assert 'rc=1' in out and 'server repo root' in out, out
+    assert snapshot(ep) == before, 'EP repo was modified'
+    inp = osp.join(ws, 'work_dirs', 'exec01_inputs')
+    for rel in ('epoch_5.pth', 'swint-nuimages-pretrained.pth',
+                'train_run/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_'
+                'nus-3d.py',
+                'train_run/20260718_020825/vis_data/scalars.json',
+                'train_run/20260718_020825/20260718_020825.log'):
+        assert osp.isfile(osp.join(inp, rel)), rel
+    assert not osp.exists(osp.join(inp, 'epoch_6.pth'))
+    man = open(osp.join(inp, 'FETCH_MANIFEST.txt')).read()
+    assert man.count(' -> ') == 5, man
+    assert os.readlink(osp.join(ws, 'data', 'nuscenes')) == nus
+    rc, out = sh(['bash', fetch], env={'EP_REPO': ep}, cwd=ep)
+    assert rc == 2 and not osp.exists(osp.join(ep, 'work_dirs',
+                                               'exec01_inputs')), out
+    rc, out = sh(['bash', fetch], env={'EP_REPO': ep,
+                                       'INPUTS': osp.join(ep, 'x')}, cwd=ws)
+    assert rc == 2 and 'inside the EP-Fusion repo' in out, out
+    assert snapshot(ep) == before
+
+
+@case('exec01_env.sh: workspace-local inputs; refuses in EP repo / elsewhere')
+def test_env(tmp):
+    ep = osp.join(tmp, 'ep_repo')                 # made by test_fetch
+    ws = osp.join(tmp, 'ws_fetch')
+    env = osp.join(QD, 'exec01_env.sh')
+    show = ('source "%s" && echo "CKPT=$CKPT" && echo "TW=$TRAIN_WORK_DIR" '
+            '&& echo "OPTS=$CFG_OPTS" && echo "B=$BASE_MAP/$BASE_NDS"' % env)
+    rc, out = sh(['bash', '-c', show], env={'EP_REPO': ep}, cwd=ws)
+    inp = osp.join(ws, 'work_dirs', 'exec01_inputs')
+    assert rc == 0, out
+    assert 'CKPT=%s/epoch_5.pth' % inp in out, out
+    assert 'TW=%s/train_run' % inp in out, out
+    assert 'OPTS=model.img_backbone.init_cfg.checkpoint=%s/swint-nuimages-' \
+        'pretrained.pth' % inp in out, out
+    assert 'B=0.6648/0.7060' in out, out
+    assert 'WARNING: missing %s' % 'projects/BEVFusion/configs' in out, out
+    rc, out = sh(['bash', '-c', 'source "%s"; echo "rc=$?"' % env],
+                 env={'EP_REPO': ep}, cwd=osp.join(ep, 'work_dirs'))
+    assert 'rc=1' in out and 'inside the EP-Fusion repo' in out, out
+    rc, out = sh(['bash', '-c', 'source "%s"; echo "rc=$?"' % env],
+                 env={'EP_REPO': ep}, cwd=tmp)
+    assert 'rc=1' in out and 'workspace root' in out, out
+
+
+@case('run_diag.sh A-1 guards; build-ops is in-place with FORCE_CUDA=1')
+def test_guards(tmp):
+    b = stub_env(tmp)
+    ep = osp.join(tmp, 'ep_repo')
+    ws = make_workspace(tmp, 'ws_build')
+    log = osp.join(tmp, 'guard.log')
+    rdsh = osp.join(QD, 'run_diag.sh')
+    env = {'PATH': b + os.pathsep + os.environ['PATH'], 'STUB_LOG': log,
+           'REAL_PY': PY, 'PROTECTED_DIRS': ep}
+    before = snapshot(ep)
+    rc, out = sh(['bash', rdsh, 'merge'], env=env, cwd=osp.join(ep, 'data'))
+    assert rc == 2 and 'protected' in out, out
+    e = dict(env, OUT=osp.join(ep, 'work_dirs', 'diag'))
+    rc, out = sh(['bash', rdsh, 'summary'], env=e, cwd=ws)
+    assert rc == 2 and 'OUT=' in out, out
+    e = dict(env, OUT=osp.join(ws, 'work_dirs', 'diag'))
+    rc, out = sh(['bash', rdsh, 'build-ops'], env=e, cwd=ws)
+    assert rc == 0, out
+    calls = open(log).read().splitlines()
+    assert calls == ['FORCE_CUDA=1 python projects/BEVFusion/setup.py '
+                     'build_ext --inplace'], calls
+    assert 'develop' not in open(rdsh).read().split('build-ops)')[1] \
+        .split(';;')[0].replace("'setup.py develop'", '')
+    e = dict(env, OUT=osp.join(ws, 'work_dirs', 'diag'), CONFIG=__file__,
+             CKPT=osp.join(ep, 'work_dirs', RUN_NAME, 'epoch_5.pth'))
+    rc, out = sh(['bash', rdsh, 'merge'], env=e, cwd=ws)
+    assert 'NOTE: CKPT is read (read-only) from a protected' in out, out
+    assert snapshot(ep) == before
 
 
 @case('S0a: this repo matches the 82c2b4e manifest')
@@ -645,7 +760,9 @@ def main():
     test_gate(tmp)
     test_adjudicate(tmp)
     test_run_diag(tmp, cfg, ckpt)
+    test_fetch(tmp)
     test_env(tmp)
+    test_guards(tmp)
     test_s0a_repo()
     test_s0a_tamper(tmp)
     test_s0a_rule_d3(tmp)

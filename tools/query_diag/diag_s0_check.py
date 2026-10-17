@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """S0a-S0d: server consistency checks before step 1 (exec doc v1.1 sec. 5).
 
-Run from the SERVER repo root, CPU only, before tools/query_diag/ is copied
-into that repo (the script can run from an unpacked branch zip):
+Run from the root of the Dome-DETR diagnosis workspace (a separate checkout
+of this branch, never the EP-Fusion repo; decision A-1), CPU only, normally
+via 'run_diag.sh s0' after 'source tools/query_diag/exec01_env.sh':
 
-  cd <server repo root>
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD python <zip>/tools/query_diag/\
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD python tools/query_diag/\
 diag_s0_check.py --config <CONFIG> --ckpt <CKPT> \
-      [--train-work-dir work_dirs/baseline1] [--cfg-options ...]
+      [--train-work-dir <dir>] [--base-map M --base-nds N] [--cfg-options ...]
 
 S0a  md5 of the audited files against the manifest of commit 82c2b4e,
      no extra source files under projects/BEVFusion, and mmdet3d /

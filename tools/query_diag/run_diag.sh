@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Query-initialization diagnostics for BEVFusion (exec doc #1 v1.1).
-# Run from the mmdetection3d repo root. The script itself may live outside
-# the repo (e.g. in an unpacked branch zip): that is how S0 is run before
-# tools/query_diag/ is copied into the server repo.
+# Run from the root of the Dome-DETR diagnosis workspace: a separate
+# checkout of branch claude/dome-detr-query-diag. The EP-Fusion repo is
+# protected (decision A-1): every step refuses to run if the working
+# directory or OUT lies inside a directory listed in PROTECTED_DIRS.
+#
+# One-time setup in the workspace (see EXEC01_DECISIONS.md, A-1):
+#   bash tools/query_diag/exec01_fetch_inputs.sh   read-only copy of inputs
+#   bash tools/query_diag/run_diag.sh build-ops    CUDA ops, in-place only
 #
 # Confirmed inputs of exec doc #1: source exec01_env.sh from the repo root
 # first (sets CONFIG, CKPT, TRAIN_WORK_DIR, CFG_OPTS, BASE_MAP, BASE_NDS).
@@ -29,6 +34,8 @@
 #                      (dumped config + val logs) for S0d; with BASE_MAP /
 #                      BASE_NDS set, S0d also checks them against that log
 #      PORT, OUT       defaults 29531, work_dirs/diag
+#      PROTECTED_DIRS  space-separated dirs never to work in (default: the
+#                      EP-Fusion repo); an empty value keeps the default
 #
 # Every GPU step first checks each GPU in CUDA_VISIBLE_DEVICES (C5,
 # mandatory, no override): it refuses to start if any compute process is
@@ -46,8 +53,33 @@ export PYTHONPATH=$PWD:$DIAG:${PYTHONPATH:-}
 # nvidia-smi enumerates GPUs in PCI bus order; make CUDA use the same order
 # so that the ids checked below are the ids the job actually runs on.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
+PROTECTED_DIRS=${PROTECTED_DIRS:-/212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ}
 
 die() { echo "[run_diag] $*" >&2; exit 2; }
+
+# A-1: never work inside the EP-Fusion repo (cwd and every output path).
+inside_protected() {
+  local p d
+  p=$(readlink -m -- "$1")
+  for d in $PROTECTED_DIRS; do
+    d=$(readlink -m -- "$d")
+    case "$p/" in "$d"/*) return 0 ;; esac
+  done
+  return 1
+}
+if inside_protected "$PWD"; then
+  die "cwd $PWD is inside a protected directory ($PROTECTED_DIRS); run from" \
+    "the separate Dome-DETR workspace"
+fi
+if inside_protected "$OUT"; then
+  die "OUT=$OUT resolves inside a protected directory ($PROTECTED_DIRS)"
+fi
+for _v in CKPT TRAIN_WORK_DIR; do
+  if [ -n "${!_v:-}" ] && inside_protected "${!_v}"; then
+    echo "[run_diag] NOTE: $_v is read (read-only) from a protected" \
+      "directory; exec01_fetch_inputs.sh makes a local copy instead" >&2
+  fi
+done
 
 CFG_ARGS=()
 if [ -n "${CFG_OPTS:-}" ]; then
@@ -124,6 +156,18 @@ run_oracle() {
 }
 
 case "$STEP" in
+  build-ops)
+    need_repo_root
+    # Compile bev_pool_ext / voxel_layer INTO THIS WORKSPACE ONLY. Never use
+    # 'setup.py develop' or 'pip install' here: they write egg-links into
+    # the shared conda env that EP-Fusion uses. FORCE_CUDA=1 so the build
+    # does not depend on GPU visibility (no GPU is used).
+    FORCE_CUDA=1 python projects/BEVFusion/setup.py build_ext --inplace
+    for m in projects/BEVFusion/bevfusion/ops/bev_pool/bev_pool_ext \
+             projects/BEVFusion/bevfusion/ops/voxel/voxel_layer; do
+      ls "$m".*.so >/dev/null 2>&1 || die "build-ops: no $m.*.so produced"
+      echo "[run_diag] built $(ls "$m".*.so)"
+    done ;;
   s0)
     need_repo_root; need_config; need_ckpt
     S0_ARGS=(--config "$CONFIG" --ckpt "$CKPT" --out-dir "$OUT/s0")
@@ -192,6 +236,7 @@ case "$STEP" in
   summary)
     python "$DIAG/diag_summarize.py" "$OUT" ;;
   *)
-    echo "unknown step: '$STEP' (s0|quick|recall|merge|oracle|s5-adjudicate|summary)"
+    echo "unknown step: '$STEP'" \
+      "(build-ops|s0|quick|recall|merge|oracle|s5-adjudicate|summary)"
     exit 1 ;;
 esac
