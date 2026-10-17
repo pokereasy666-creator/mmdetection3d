@@ -31,6 +31,7 @@ Exit code 0 only if S0a-S0d are all PASS.
 """
 import argparse
 import copy
+import difflib
 import glob
 import hashlib
 import json
@@ -51,6 +52,9 @@ IGNORE_DIRS = ('__pycache__', 'build', '.eggs')
 IGNORE_EXT = ('.pyc', '.pyo', '.so', '.o')
 ALLOWED_MODULE_PREFIX = ('projects.BEVFusion.', 'mmdet3d.', 'mmdet.',
                          'mmcv.', 'mmengine.', 'torch.')
+CAMERA_MODULES = ('img_backbone', 'img_neck', 'view_transform',
+                  'fusion_layer')
+DIFF_LINES_SHOWN = 80
 
 LINES = []
 
@@ -145,7 +149,7 @@ def s0a(repo):
         man = json.load(f)
     core = set(man['core'])
     res = {'commit': man['commit'], 'files': [], 'extra': [],
-           'extended': [], 'imports': {}}
+           'extended': [], 'imports': {}, 'core_diffs': {}}
     fail, warn = [], []
     for p, ref in sorted(man['tree'].items()):
         fp = osp.join(repo, p)
@@ -153,6 +157,13 @@ def s0a(repo):
             st = 'MISSING'
         else:
             st = 'OK' if file_md5(fp) == ref else 'DIFF'
+        if st == 'DIFF' and p in man.get('core_text', {}):
+            with open(fp, errors='replace') as f:
+                server = f.read()
+            res['core_diffs'][p] = ''.join(difflib.unified_diff(
+                man['core_text'][p].splitlines(True),
+                server.splitlines(True), fromfile='82c2b4e:' + p,
+                tofile='server:' + p, n=1))
         is_source = p.endswith(SOURCE_EXT) or p in core
         level = 'core' if p in core else ('source' if is_source else 'doc')
         res['files'].append({'path': p, 'status': st, 'level': level})
@@ -213,6 +224,13 @@ def s0a(repo):
         emit('     FAIL ' + m)
     for m in warn:
         emit('     WARN ' + m)
+    for p, d in res['core_diffs'].items():
+        lines = d.splitlines()
+        emit('     diff of %s (%d lines%s):'
+             % (p, len(lines), ', first %d shown, full text in json'
+                % DIFF_LINES_SHOWN if len(lines) > DIFF_LINES_SHOWN else ''))
+        for ln in lines[:DIFF_LINES_SHOWN]:
+            emit('       ' + ln)
     emit('S0a  %s' % res['result'])
     return res
 
@@ -299,6 +317,14 @@ def s0b(repo, config):
 # S0c
 # ---------------------------------------------------------------------------
 
+def module_counts(keys):
+    out = {}
+    for k in keys:
+        top = k.split('.', 1)[0]
+        out[top] = out.get(top, 0) + 1
+    return out
+
+
 class _ListHandler(logging.Handler):
 
     def __init__(self):
@@ -345,7 +371,15 @@ def s0c(cfg, ckpt):
                       for k in msd if k in sd and hasattr(sd[k], 'shape')
                       and tuple(sd[k].shape) != tuple(msd[k].shape)]}
         meta = ck.get('meta', {}) if isinstance(ck, dict) else {}
+        ck_mod, md_mod = module_counts(sd), module_counts(msd)
+        cam_ck = [m for m in CAMERA_MODULES if ck_mod.get(m)]
+        cam_md = [m for m in CAMERA_MODULES if md_mod.get(m)]
+        modality_fail = bool(cam_md) and not cam_ck
         res.update({
+            'ckpt_modules': ck_mod, 'model_modules': md_mod,
+            'ckpt_has_camera_branch': bool(cam_ck),
+            'model_has_camera_branch': bool(cam_md),
+            'modality_mismatch': modality_fail,
             'load_log': text, 'log_hits': hits,
             'raw_diff_counts': {k: len(v) for k, v in raw.items()},
             'raw_diff_examples': {k: v[:10] for k, v in raw.items()},
@@ -353,7 +387,8 @@ def s0c(cfg, ckpt):
             'meta': {k: meta.get(k) for k in ('epoch', 'iter',
                                               'mmengine_version', 'time',
                                               'experiment_name', 'seed')},
-            'result': 'FAIL' if any(hits.values()) else 'PASS'})
+            'result': 'FAIL' if any(hits.values()) or modality_fail
+            else 'PASS'})
     except Exception:  # noqa: B902
         res.update({'error': traceback.format_exc(), 'result': 'FAIL'})
     emit('S0c  load %s (CPU, mmengine load_checkpoint, strict=False)' % ckpt)
@@ -365,6 +400,13 @@ def s0c(cfg, ckpt):
              'here, pass CFG_OPTS="model.img_backbone.init_cfg.checkpoint='
              '<local swin ckpt>"')
     else:
+        emit('     ckpt tensors by module: %s' % res['ckpt_modules'])
+        emit('     camera branch: ckpt=%s, CONFIG model=%s'
+             % (res['ckpt_has_camera_branch'],
+                res['model_has_camera_branch']))
+        if res['modality_mismatch']:
+            emit('     FAIL CONFIG is lidar-cam but CKPT has no camera branch '
+                 '(LiDAR-only checkpoint?)')
         emit('     log hits: %s' % res['log_hits'])
         emit('     raw key/shape diff before load hooks (info): %s'
              % res['raw_diff_counts'])
@@ -462,6 +504,12 @@ def s0d(cfg, config, ck, train_work_dir):
             res['ckpt_meta_sync_bn'] = tcfg.get('sync_bn')
             res['ckpt_meta_optim_wrapper_type'] = \
                 (tcfg.get('optim_wrapper') or {}).get('type')
+            res['ckpt_meta_run'] = {
+                'work_dir': tcfg.get('work_dir'),
+                'load_from': tcfg.get('load_from'),
+                'input_modality': tcfg.get('input_modality'),
+                'max_epochs': (tcfg.get('train_cfg') or {}).get('max_epochs'),
+                'ckpt_epoch': meta.get('epoch')}
             sources += 1
         except Exception:  # noqa: B902
             fail.append('cannot parse ckpt meta cfg:\n' +
@@ -504,6 +552,9 @@ def s0d(cfg, config, ck, train_work_dir):
              '(train-only; SyncBN in eval mode equals BN)'
              % (res['ckpt_meta_sync_bn'],
                 res['ckpt_meta_optim_wrapper_type']))
+    if 'ckpt_meta_run' in res:
+        for k, v in res['ckpt_meta_run'].items():
+            emit('     training run (ckpt meta) %s: %s' % (k, v))
     emit('     training configs compared: %d (ckpt meta cfg%s)'
          % (sources, ', train dump %s' % res['train_dump']
             if 'train_dump' in res else ''))

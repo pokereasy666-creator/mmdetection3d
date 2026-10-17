@@ -438,6 +438,8 @@ def test_s0a_tamper(tmp):
     assert r['result'] == 'FAIL'
     joined = '\n'.join(r['fail'])
     assert 'DIFF projects/BEVFusion/bevfusion/utils.py (core)' in joined
+    d = r['core_diffs']['projects/BEVFusion/bevfusion/utils.py']
+    assert '+# local edit' in d and d.startswith('--- 82c2b4e:'), d[:300]
     assert 'EXTRA projects/BEVFusion/bevfusion/ep_module.py' in joined
     assert '.so' not in joined
     shutil.copy(osp.join(REPO, 'projects/BEVFusion/bevfusion/utils.py'),
@@ -451,6 +453,18 @@ def test_s0a_tamper(tmp):
 def load_cfg(path):
     from mmengine.config import Config
     return Config.fromfile(osp.join(REPO, path), import_custom_modules=False)
+
+
+@case('S0c helper: checkpoint composition by top-level module')
+def test_s0c_modules():
+    s0 = load_s0()
+    keys = ['img_backbone.a', 'img_backbone.b', 'pts_backbone.c',
+            'bbox_head.heatmap_head.0.conv.weight', 'fusion_layer.0.weight']
+    c = s0.module_counts(keys)
+    assert c == {'img_backbone': 2, 'pts_backbone': 1, 'bbox_head': 1,
+                 'fusion_layer': 1}, c
+    lidar_only = s0.module_counts(['pts_backbone.c', 'bbox_head.x'])
+    assert not [m for m in s0.CAMERA_MODULES if lidar_only.get(m)]
 
 
 @case('S0b: override list of 4xa30 vs official; no new model types')
@@ -538,6 +552,7 @@ def main():
     test_run_diag(tmp, cfg, ckpt)
     test_s0a_repo()
     test_s0a_tamper(tmp)
+    test_s0c_modules()
     test_s0b_diff()
     test_s0d(tmp)
     n_fail = sum(1 for r in RESULTS if r[1] != 'PASS')

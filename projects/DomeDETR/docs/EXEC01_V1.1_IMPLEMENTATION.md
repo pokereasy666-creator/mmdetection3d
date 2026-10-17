@@ -53,7 +53,7 @@ non-ASCII lines: 0 in every file under tools/query_diag/
 
 ## 3. 本地 CPU 验证（mock）
 
-`projects/DomeDETR/tests/test_query_diag_cpu.py`，13 项全部通过。
+`projects/DomeDETR/tests/test_query_diag_cpu.py`，14 项全部通过。
 
 - mock head 的以下部分**逐行复制**自本仓库，包括原地改写 `center` 的那几行：
   - query 初始化（`transfusion_head.py:227-262`）
@@ -72,7 +72,8 @@ non-ASCII lines: 0 in every file under tools/query_diag/
 | S5 gate | 0.6660 对 0.6650 判 PASS（浮点余量起作用），差 0.0011 判 FAIL |
 | S5 裁决 | SOURCE 和 HOOK 两种判定、json 来源和文本日志回退都覆盖到 |
 | run_diag.sh（替换了 `nvidia-smi` 和 `python`） | 没设 CONFIG 时拒绝；没设 `CUDA_VISIBLE_DEVICES` 时拒绝；有进程时退出码 3；显存 2048 MiB 时退出码 3，1024 MiB 时放行；卡数不对时拒绝；S5 不通过时只跑了 base，退出码 4；S5 通过时按 base → all → far → near → all_cls 顺序全部执行；`GPUS=3` 被拒绝；`CFG_OPTS` 透传到参数末尾 |
-| S0a | 本仓库对照清单全部 OK；改动核心文件判 FAIL；未跟踪的 .py 判 FAIL；.so 被忽略；改动 .md 只判 WARN；import 解析到仓库外判 FAIL |
+| S0a | 本仓库对照清单全部 OK；改动核心文件判 FAIL，并打印与审计版本的逐行 diff；未跟踪的 .py 判 FAIL；.so 被忽略；改动 .md 只判 WARN；import 解析到仓库外判 FAIL |
+| S0c 辅助 | 按顶层模块统计权重张量数；能识别 LiDAR-only 权重（没有相机分支） |
 | S0b | 两份真实配置的覆盖项共 14 条（见第 4 节），`model` 类型集合相同 |
 | S0d | 评测设置比较正确；`pretty_text` 来回转换后无差异；只改训练项时不报差异；改测试项时报 3 处差异 |
 
@@ -85,10 +86,10 @@ non-ASCII lines: 0 in every file under tools/query_diag/
 
 | 自检 | 实现 | 与 v1.1 文字的差别 |
 | --- | --- | --- |
-| S0a | 用 `82c2b4e` 生成的 md5 清单（`s0_manifest_82c2b4e.json`）覆盖 `projects/BEVFusion` 下全部 33 个已跟踪文件。源码和配置有差异 → FAIL；`.md` 有差异 → **WARN**；该目录下多出未跟踪的源码文件 → FAIL；编译产物（.so、build、egg-info、`__pycache__`）忽略。另外核对 `mmdet3d` 和 `projects.BEVFusion` 实际是从本仓库 import 的，否则 FAIL。审计引用过的 mmdet3d 文件、`tools/test.py`、`default_runtime.py` 作为扩展集，只给 WARN。 | 不调用 git：CLAUDE.md 铁律 16 规定服务器代码来自 zip。md5 清单覆盖整个目录，比 v1.1 列出的 7 个文件更严。**`.md` 只判 WARN，请确认是否接受。** |
+| S0a | 用 `82c2b4e` 生成的 md5 清单（`s0_manifest_82c2b4e.json`）覆盖 `projects/BEVFusion` 下全部 33 个已跟踪文件。清单里还内嵌了 7 个核心文件的审计原文，任一核心文件 DIFF 时直接打印逐行 diff（终端显示前 80 行，全文写入 json）。源码和配置有差异 → FAIL；`.md` 有差异 → **WARN**；该目录下多出未跟踪的源码文件 → FAIL；编译产物（.so、build、egg-info、`__pycache__`）忽略。另外核对 `mmdet3d` 和 `projects.BEVFusion` 实际是从本仓库 import 的，否则 FAIL。审计引用过的 mmdet3d 文件、`tools/test.py`、`default_runtime.py` 作为扩展集，只给 WARN。 | 不调用 git：CLAUDE.md 铁律 16 规定服务器代码来自 zip。md5 清单覆盖整个目录，比 v1.1 列出的 7 个文件更严。**`.md` 只判 WARN，请确认是否接受。** |
 | S0b | 用 mmengine 加载两份配置后递归 diff，逐条列出覆盖项。`model` 中出现官方配置没有的 `type` 时 FAIL；`custom_imports` 不同时 FAIL；在注册表里查每个 model type 实际来自哪个模块，模块不在官方前缀内或文件在仓库外时 FAIL。 | — |
-| S0c | 在 CPU 上构建模型，用 mmengine 的 `load_checkpoint(strict=False)` 加载权重（与 `Runner.load_checkpoint` 同一调用链），并挂一个 logger 收集它的输出，在其中查找 `missing keys`、`unexpected key`、`size mismatch`。另外直接比对 key 和形状，只作参考。 | 需要专门收集日志的原因：`Runner.load_checkpoint` 调用 `print_log(logger=None)`，不匹配信息只打到 stdout，**不会进日志文件**。 |
-| S0d | 检查 val 与 test 的 dataloader.dataset 和 evaluator 是否完全相同，记录并比较 fp16。用权重里 mmengine 保存的训练配置（`meta['cfg']`）比较三处：val 数据集 / evaluator / `val_cfg.fp16`，以及去掉 `init_cfg`、`train_cfg` 后的 `model`。给了 `TRAIN_WORK_DIR` 时，再比较当时转存的配置，并从 `vis_data/scalars.json` 列出每个 epoch 的 val mAP/NDS（6 位小数），标出与权重 `meta.epoch` 对应的那一行。 | BASE_MAP / BASE_NDS 仍由你填写，脚本只把日志里的值列出来。 |
+| S0c | 在 CPU 上构建模型，用 mmengine 的 `load_checkpoint(strict=False)` 加载权重（与 `Runner.load_checkpoint` 同一调用链），并挂一个 logger 收集它的输出，在其中查找 `missing keys`、`unexpected key`、`size mismatch`。另外直接比对 key 和形状，只作参考。按顶层模块统计权重组成：CONFIG 含相机分支而权重没有时，直接判 FAIL（LiDAR-only 权重）。 | 需要专门收集日志的原因：`Runner.load_checkpoint` 调用 `print_log(logger=None)`，不匹配信息只打到 stdout，**不会进日志文件**。 |
+| S0d | 检查 val 与 test 的 dataloader.dataset 和 evaluator 是否完全相同，记录并比较 fp16。用权重里 mmengine 保存的训练配置（`meta['cfg']`）比较三处：val 数据集 / evaluator / `val_cfg.fp16`，以及去掉 `init_cfg`、`train_cfg` 后的 `model`。给了 `TRAIN_WORK_DIR` 时，再比较当时转存的配置，并从 `vis_data/scalars.json` 列出每个 epoch 的 val mAP/NDS（6 位小数），标出与权重 `meta.epoch` 对应的那一行。同时打印权重训练配置里的 `work_dir`、`load_from`、`input_modality`、`max_epochs`，用来确认这个目录到底是哪次训练。 | BASE_MAP / BASE_NDS 仍由你填写，脚本只把日志里的值列出来。 |
 
 S0b 在 `82c2b4e` 上的预期输出共 14 条，服务器结果应与此完全一致：
 
@@ -115,8 +116,10 @@ train_pipeline[10].max_epoch: 6 -> 20
 
 在服务器仓库根目录、训练用的同一个 conda 环境中执行。分支 zip 先解压到**仓库外**，例如 `~/qd_zip`。
 
+> 2026-10-17 更新：服务器仓库根目录实际是 `/212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ`。CKPT、BASE、`CFG_OPTS` 的具体取值，以及待你决定的事项，见 `EXEC01_INPUTS_FROM_LOG.md`。下面的命令只示意执行顺序。
+
 ```bash
-cd /212022085500129/mmdetection3d-claude-jolly-wozniak-c4YMQ
+cd /212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ
 export CONFIG=projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py
 export CKPT=<epoch_19.pth 的绝对路径>
 
