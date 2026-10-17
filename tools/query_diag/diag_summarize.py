@@ -48,6 +48,36 @@ def main():
               % (tag, a['oracle'], '%g-%g' % tuple(a['range']), a['score'],
                  m, m - bm, n, n - bn, int(r['stats']['injected_cells'])))
 
+    # Self-checks S5-S7 (exec doc v1.1 sec. 8). R-rule verdicts are left
+    # to the review on purpose.
+    print('\nSelf-checks')
+    gates = glob.glob(osp.join(args.root, '**', 's5_gate.json'),
+                      recursive=True)
+    if gates:
+        with open(max(gates, key=osp.getmtime)) as fh:
+            g = json.load(fh)
+        print('  S5  base vs known: dmAP=%+.4f dNDS=%+.4f (tol %.4f)  %s'
+              % (g['diff']['mAP'], g['diff']['NDS'], g['tol'], g['result']))
+    else:
+        print('  S5  no s5_gate.json found  MISSING')
+    for tag, r in runs.items():
+        if r['args']['oracle'] == 'none':
+            continue
+        st = r['stats']
+        s6 = st['init_mismatch_rate'] <= 0.01 and st['capped_cells'] == 0
+        s7 = st['restored_queries'] >= 0.99 * st['injected_cells']
+        print('  S6  %-8s init_mismatch_rate=%.5f (<= 0.01) capped_cells=%d '
+              '(== 0)  %s' % (tag, st['init_mismatch_rate'],
+                              int(st['capped_cells']),
+                              'PASS' if s6 else 'FAIL'))
+        print('  S7  %-8s restored_queries=%d >= 0.99 x injected_cells=%d  '
+              '%s' % (tag, int(st['restored_queries']),
+                      int(st['injected_cells']), 'PASS' if s7 else 'FAIL'))
+    for tag, r in runs.items():
+        opts = r.get('runtime', {}).get('cfg_options') or {}
+        if opts:
+            print('  NOTE %-8s ran with cfg_options=%s' % (tag, opts))
+
     rec = glob.glob(osp.join(args.root, '**', 'recall_summary.json'),
                     recursive=True)
     for f in rec:

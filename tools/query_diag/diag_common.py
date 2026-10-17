@@ -10,6 +10,11 @@ head.query_labels after every forward pass.
 
 This file is ASCII-only on purpose (pre-sync gate).
 """
+import hashlib
+import os
+import sys
+import time
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -202,7 +207,12 @@ def install_capture(model):
 
     After model.test_step(data) the following are in STATE:
       samples, logits [B,C,H,W], head_out (raw head output),
-      query_labels [B,P]
+      query_labels [B,P], center_grid [B,2,P]
+
+    center_grid is a copy of the last decoder layer's 'center' taken
+    BEFORE predict_by_feat runs: TransFusionBBoxCoder.decode rewrites
+    head_out['center'] in place into metric coordinates, so head_out must
+    not be used to read decoder centers after test_step returns.
     """
     m = unwrap(model)
     head = get_head(m)
@@ -231,6 +241,9 @@ def install_capture(model):
     def forward(*args, **kwargs):
         out = orig_forward(*args, **kwargs)
         STATE['query_labels'] = head.query_labels.detach().clone()
+        P = int(head.num_proposals)
+        STATE['center_grid'] = \
+            first_dict(out)['center'][..., -P:].detach().clone()
         post = HOOKS.get('head_out_modifier', None)
         if post is not None:
             post(out)
@@ -339,3 +352,81 @@ def restore_oracle_scores(qhs, cls, idx, oracle_mask, sig_raw):
     new = torch.where(is_or, orig, cur)
     qhs.scatter_(1, cls[:, None, :], new[:, None, :])
     return int(is_or.sum().item())
+
+
+# ---------------------------------------------------------------------------
+# Runtime / provenance info written into every output json (C6)
+# ---------------------------------------------------------------------------
+
+def file_md5(path, chunk=1 << 22):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def read_version_line(path='VERSION'):
+    """First line of the repo VERSION file (git is not used at runtime)."""
+    try:
+        with open(path) as f:
+            line = f.readline().strip()
+        return line or 'unknown'
+    except (OSError, UnicodeDecodeError):
+        return 'unknown'
+
+
+def lib_versions():
+    out = {'python': sys.version.split()[0]}
+    for name in ('torch', 'mmcv', 'mmengine', 'mmdet', 'mmdet3d', 'numpy'):
+        try:
+            mod = __import__(name)
+            out[name] = str(getattr(mod, '__version__', 'unknown'))
+        except Exception as e:  # noqa: B902
+            out[name] = 'unavailable (%s)' % type(e).__name__
+    out['torch_cuda'] = str(torch.version.cuda)
+    return out
+
+
+def loop_fp16(cfg, key):
+    """fp16 flag of the loop config cfg[key] ('val_cfg' / 'test_cfg')."""
+    loop = cfg.get(key, None) or {}
+    return bool(loop.get('fp16', False)) if hasattr(loop, 'get') else False
+
+
+def runtime_info(cfg, config_path, ckpt_path, t_start, cfg_options=None,
+                 extra=None):
+    """Elapsed time, peak GPU memory, versions, md5s and fp16 settings."""
+    rt = {'elapsed_s': round(time.time() - t_start, 1)}
+    if torch.cuda.is_available():
+        dev = torch.cuda.current_device()
+        rt['gpu_name'] = torch.cuda.get_device_name(dev)
+        rt['peak_mem_allocated_mib'] = round(
+            torch.cuda.max_memory_allocated(dev) / 2.0**20, 1)
+        rt['peak_mem_reserved_mib'] = round(
+            torch.cuda.max_memory_reserved(dev) / 2.0**20, 1)
+    rt['cuda_visible_devices'] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+    rt['world_size'] = int(os.environ.get('WORLD_SIZE', '1'))
+    rt['versions'] = lib_versions()
+    rt['repo_version'] = read_version_line()
+    rt['config'] = config_path
+    rt['config_md5'] = file_md5(config_path)
+    rt['checkpoint'] = ckpt_path
+    rt['checkpoint_md5'] = file_md5(ckpt_path)
+    rt['fp16'] = {'val_cfg': loop_fp16(cfg, 'val_cfg'),
+                  'test_cfg': loop_fp16(cfg, 'test_cfg')}
+    rt['cfg_options'] = dict(cfg_options or {})
+    rt['cfg_opts_env'] = os.environ.get('CFG_OPTS', '')
+    # The server copy of tools/query_diag/ is deployed by hand: record which
+    # diag code actually ran (the repo VERSION file predates it).
+    here = os.path.dirname(os.path.abspath(__file__))
+    rt['diag_files_md5'] = {
+        fn: file_md5(os.path.join(here, fn))
+        for fn in sorted(os.listdir(here))
+        if fn.endswith(('.py', '.sh', '.json'))}
+    if extra:
+        rt.update(extra)
+    return rt

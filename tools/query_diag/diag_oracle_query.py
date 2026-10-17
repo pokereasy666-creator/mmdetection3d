@@ -31,6 +31,7 @@ import json
 import os
 import os.path as osp
 import sys
+import time
 
 import torch
 
@@ -70,6 +71,7 @@ def parse_args():
 
 
 def main():
+    t_start = time.time()
     args = parse_args()
     from mmengine.config import Config
     from mmengine.dist import all_reduce, get_rank
@@ -78,6 +80,8 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
+        print('[oracle] NOTE: --cfg-options in effect (recorded in json):',
+              args.cfg_options)
     cfg.launcher = args.launcher
     cfg.work_dir = args.work_dir
     cfg.load_from = args.checkpoint
@@ -154,14 +158,23 @@ def main():
         res = {'args': vars(args), 'num_proposals': P, 'stats': stats,
                'metrics': {k: (float(v) if isinstance(v, (int, float))
                                else str(v)) for k, v in metrics.items()}}
+        res['runtime'] = dc.runtime_info(cfg, args.config, args.checkpoint,
+                                         t_start,
+                                         cfg_options=args.cfg_options)
         os.makedirs(args.work_dir, exist_ok=True)
         path = osp.join(args.work_dir, 'oracle_%s.json' % args.tag)
         with open(path, 'w') as f:
-            json.dump(res, f, indent=2)
+            json.dump(res, f, indent=2, default=str)
         print('[oracle] tag=%s mode=%s range=[%g,%g) score=%s jitter=%d'
               % (args.tag, args.oracle, rmin, rmax, args.score,
                  args.jitter_cells))
         print('[oracle] stats:', json.dumps(stats))
+        rt = res['runtime']
+        print('[oracle] runtime: %.1fs, peak mem allocated %s MiB / '
+              'reserved %s MiB, test_cfg.fp16=%s'
+              % (rt['elapsed_s'], rt.get('peak_mem_allocated_mib', 'n/a'),
+                 rt.get('peak_mem_reserved_mib', 'n/a'),
+                 rt['fp16']['test_cfg']))
         if args.oracle != 'none' and stats['init_mismatch_rate'] > 0.01:
             print('[WARNING] replicated init differs from head.query_labels '
                   '(rate %.4f); score restoration may be wrong.'

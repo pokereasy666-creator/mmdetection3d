@@ -5,6 +5,7 @@
 - 核对对象：本仓库 `projects/BEVFusion`（mmdet3d `1.4.0`，`mmdet3d/version.py`）与 `query_diag.tar.gz` 参考实现
 - 执行方式：只读核对。没有部署，没有运行。本会话是云端容器（无 GPU、无 torch、无 nuScenes、无权重），第 1–3 步需要在 4×A30 服务器上执行。
 - 原执行文档：`projects/DomeDETR/docs/exec_doc_01_query_init_diagnosis.md`
+- 后续状态（2026-10-17）：本报告已通过审阅，C1–C6 获批，执行文档更新为 v1.1（`exec_doc_01_query_init_diagnosis_v1.1.md`）。实施记录见 `EXEC01_V1.1_IMPLEMENTATION.md`。
 
 ## 0. 结论
 

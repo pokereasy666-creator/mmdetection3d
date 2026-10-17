@@ -163,9 +163,11 @@ def summarize(R, frame_counts, class_names, ks, thr, edges, P, main_thr):
 # ---------------------------------------------------------------------------
 
 def main():
+    t_start = time.time()
     args = parse_args()
     from mmengine.config import Config
     from mmengine.runner import Runner
+    from mmengine.runner.amp import autocast
 
     thr = [float(x) for x in args.thr.split(',')]
     edges = [float(x) for x in args.bins.split(',')]
@@ -174,6 +176,11 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
+        print('[diag] NOTE: --cfg-options in effect (recorded in json):',
+              args.cfg_options)
+    # Follow the official TestLoop: autocast only if test_cfg.fp16 is set.
+    fp16 = dc.loop_fp16(cfg, 'test_cfg')
+    print('[diag] test_cfg.fp16=%s (recall loop autocast=%s)' % (fp16, fp16))
     cfg.work_dir = args.out_dir
     cfg.launcher = 'none'
     cfg.load_from = None
@@ -197,6 +204,7 @@ def main():
                          'fin_agn', 'fin_ca', 'frame')}
     frame_counts = []
     match_hit = match_tot = 0
+    cg_in = cg_tot = 0          # S4a: center_grid values in grid units
     transposed = None
     n_frames = 0
     last_print = 0
@@ -205,7 +213,8 @@ def main():
         for data in dl:
             if 0 < args.max_samples <= n_frames:
                 break
-            model.test_step(data)
+            with autocast(enabled=fp16):
+                model.test_step(data)
             S = dc.STATE
             logits = S['logits']
             B, C, H, W = logits.shape
@@ -218,8 +227,13 @@ def main():
             match_hit += int((cls[:, :P] == ql).sum().item())
             match_tot += int(ql.numel())
             q_xy = dc.cells_to_xy(head, idx).cpu()          # [B, kmax, 2]
-            out = dc.first_dict(S['head_out'])
-            fin_xy = dc.grid_to_xy(head, out['center'][..., -P:]).cpu()
+            # Decoder centers from the pre-decode snapshot (grid units);
+            # head_out['center'] is metric by now (decode works in place).
+            cg = S['center_grid'].float()                   # [B, 2, P]
+            hi = cg.new_tensor([H + 2.0, W + 2.0]).view(1, 2, 1)
+            cg_in += int(((cg >= -2.0) & (cg <= hi)).sum().item())
+            cg_tot += int(cg.numel())
+            fin_xy = dc.grid_to_xy(head, cg).cpu()
             for b, sample in enumerate(S['samples']):
                 fid = n_frames
                 n_frames += 1
@@ -249,13 +263,20 @@ def main():
     R = {k: np.concatenate(v) if len(v) else np.zeros(0)
          for k, v in R.items()}
     match = match_hit / max(match_tot, 1)
+    cg_frac = cg_in / max(cg_tot, 1)
     summ, lines = summarize(R, frame_counts, class_names, ks, thr, edges,
                             P, args.main_thr)
     summ['init_label_match_rate'] = match
     summ['frames'] = n_frames
+    summ['bev_pos_transposed'] = transposed
+    summ['class_range'] = not args.no_class_range
+    summ['center_grid_in_range_frac'] = cg_frac
+    summ['center_grid_values'] = cg_tot
 
     head_lines = ['[sanity] replicated init vs head.query_labels match rate: '
-                  '%.5f' % match]
+                  '%.5f' % match,
+                  '[sanity] center_grid values within [-2, H+2] grid units: '
+                  '%.5f (of %d)' % (cg_frac, cg_tot)]
     if match < 0.99:
         head_lines.append('[WARNING] match < 0.99: your transfusion_head.py '
                           'query init differs from the replicated rule; the '
@@ -267,14 +288,26 @@ def main():
                           % (thr[-1], near['recall'][-1]))
     text = '\n'.join(head_lines + [''] + lines)
     print(text)
+    summ['runtime'] = dc.runtime_info(
+        cfg, args.config, args.checkpoint, t_start,
+        cfg_options=args.cfg_options,
+        extra={'recall_loop_fp16': fp16, 'frames': n_frames,
+               'loop_s': round(time.time() - t0, 1)})
+    rt = summ['runtime']
+    print('[diag] runtime: %.1fs total, %.1fs loop, %d frames, peak mem '
+          'allocated %s MiB / reserved %s MiB'
+          % (rt['elapsed_s'], rt['loop_s'], n_frames,
+             rt.get('peak_mem_allocated_mib', 'n/a'),
+             rt.get('peak_mem_reserved_mib', 'n/a')))
     with open(osp.join(args.out_dir, 'recall_report.txt'), 'w') as f:
         f.write(text + '\n')
     with open(osp.join(args.out_dir, 'recall_summary.json'), 'w') as f:
-        json.dump(summ, f, indent=2)
+        json.dump(summ, f, indent=2, default=str)
     np.savez_compressed(osp.join(args.out_dir, 'recall_per_gt.npz'),
                         frame_counts=np.asarray(frame_counts),
                         thr=np.asarray(thr), ks=np.asarray(ks), P=P,
-                        class_names=np.asarray(class_names), **R)
+                        class_names=np.asarray(class_names),
+                        class_range=not args.no_class_range, **R)
     print('[diag] saved to', args.out_dir)
 
 
