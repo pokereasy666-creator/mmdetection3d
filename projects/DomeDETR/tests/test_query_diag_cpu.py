@@ -369,9 +369,11 @@ def test_run_diag(tmp, cfg, ckpt):
     rc, txt, calls = run('merge')
     assert rc == 2 and 'no recall_per_gt.npz' in txt, txt
     rc, txt, calls = run('s0', CONFIG=cfg, CKPT=ckpt,
-                         TRAIN_WORK_DIR='work_dirs/baseline1')
+                         TRAIN_WORK_DIR='work_dirs/baseline1',
+                         BASE_MAP='0.6648', BASE_NDS='0.7060')
     assert rc == 0 and 'diag_s0_check.py' in calls[0] and \
-        '--train-work-dir work_dirs/baseline1' in calls[0], calls
+        '--train-work-dir work_dirs/baseline1' in calls[0] and \
+        '--base-map 0.6648 --base-nds 0.7060' in calls[0], calls
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +400,26 @@ def stub_project_modules(root):
     sys.modules['projects'].BEVFusion = sys.modules['projects.BEVFusion']
     sys.modules['projects.BEVFusion'].bevfusion = \
         sys.modules['projects.BEVFusion.bevfusion']
+
+
+@case('exec01_env.sh: exports confirmed inputs; refuses outside repo root')
+def test_env(tmp):
+    root = osp.join(tmp, 'env_repo')
+    run = osp.join(root, 'work_dirs', 'bevfusion_lidar-cam_official6e_4xa30_'
+                   'amp512_accum4_seed577127641')
+    os.makedirs(run)
+    os.makedirs(osp.join(root, 'projects', 'BEVFusion'))
+    env = osp.join(QD, 'exec01_env.sh')
+    rc, out = sh(['bash', '-c', 'source "%s" && echo "CKPT=$CKPT" && echo '
+                  '"OPTS=$CFG_OPTS" && echo "B=$BASE_MAP/$BASE_NDS"' % env],
+                 cwd=root)
+    assert rc == 0, out
+    assert 'CKPT=%s/epoch_5.pth' % run in out, out
+    assert 'OPTS=model.img_backbone.init_cfg.checkpoint=%s/checkpoints/' \
+        'swint-nuimages-pretrained.pth' % root in out, out
+    assert 'B=0.6648/0.7060' in out and 'WARNING: missing file' in out, out
+    rc, out = sh(['bash', '-c', 'source "%s"; echo "rc=$?"' % env], cwd=tmp)
+    assert 'rc=1' in out and 'server repo root' in out, out
 
 
 @case('S0a: this repo matches the 82c2b4e manifest')
@@ -453,6 +475,68 @@ def test_s0a_tamper(tmp):
 def load_cfg(path):
     from mmengine.config import Config
     return Config.fromfile(osp.join(REPO, path), import_custom_modules=False)
+
+
+def make_fake_repo(tmp, name):
+    s0 = load_s0()
+    fake = osp.join(tmp, name)
+    man = json.load(open(s0.MANIFEST))
+    for p in list(man['tree']) + list(man['extended']):
+        os.makedirs(osp.dirname(osp.join(fake, p)), exist_ok=True)
+        shutil.copy(osp.join(REPO, p), osp.join(fake, p))
+    stub_project_modules(fake)
+    return s0, fake
+
+
+@case('S0a rule D-3: July-run style config edit accepted; eval edits fail')
+def test_s0a_rule_d3(tmp):
+    s0, fake = make_fake_repo(tmp, 'fake_repo_d3')
+    cfg4 = osp.join(fake, 'projects/BEVFusion/configs/'
+                    'bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py')
+    lidar = osp.join(fake, 'projects/BEVFusion/configs/'
+                     'bevfusion_lidar_voxel0075_second_secfpn_8xb4-cyclic-'
+                     '20e_nus-3d.py')
+    orig4, orig_l = open(cfg4).read(), open(lidar).read()
+    july = (orig4.replace('max_epochs=20', 'max_epochs=6')
+            .replace('max_epoch=20', 'max_epoch=6')
+            .replace('T_max=20', 'T_max=6')
+            .replace('/212022085500129/mmdetection3d-claude-jolly',
+                     '/212022085500129/bevfusion-concat/mmdetection3d-'
+                     'claude-jolly'))
+    assert july != orig4
+    open(cfg4, 'w').write(july)
+    r = s0.s0a(fake)
+    assert r['result'] == 'PASS', r['fail']
+    assert r['config_diff_accepted'] == [osp.relpath(cfg4, fake)]
+    fd = r['config_field_diffs'][osp.relpath(cfg4, fake)]
+    paths = sorted(d['path'] for d in fd)
+    assert 'model.img_backbone.init_cfg.checkpoint' in paths, paths
+    assert 'train_cfg.max_epochs' in paths and all(d['allowed'] for d in fd)
+    assert r['core_diffs'], 'unified diff expected for a changed config'
+    for extra, bad in (("\ntest_cfg = dict(fp16=True)\n", 'test_cfg.fp16'),
+                       ("\nmodel = dict(bbox_head=dict(test_cfg=dict("
+                        "nms_type='circle')))\n",
+                        'model.bbox_head.test_cfg.nms_type'),
+                       ("\ndefault_hooks = dict(checkpoint=dict("
+                        "max_keep_ckpts=-1))\n",
+                        'default_hooks.checkpoint.max_keep_ckpts')):
+        open(cfg4, 'w').write(july + extra)
+        r = s0.s0a(fake)
+        assert r['result'] == 'FAIL', (bad, r)
+        fd = r['config_field_diffs'][osp.relpath(cfg4, fake)]
+        assert [d['path'] for d in fd if not d['allowed']] == [bad], fd
+    open(cfg4, 'w').write(orig4 + '\n# comment only\n')
+    r = s0.s0a(fake)
+    assert r['result'] == 'PASS' and r['config_diff_accepted'], r['fail']
+    assert r['config_field_diffs'][osp.relpath(cfg4, fake)] == []
+    open(cfg4, 'w').write(orig4)
+    open(lidar, 'w').write(orig_l.replace('num_proposals=200',
+                                          'num_proposals=300'))
+    r = s0.s0a(fake)
+    assert r['result'] == 'FAIL'
+    assert any('bevfusion_lidar_voxel0075' in m for m in r['fail']), r['fail']
+    open(lidar, 'w').write(orig_l)
+    assert s0.s0a(fake)['result'] == 'PASS'
 
 
 @case('S0c helper: checkpoint composition by top-level module')
@@ -528,6 +612,17 @@ def test_s0d(tmp):
     rows = s0.read_val_metrics(osp.join(tmp, 'baseline1'))
     assert len(rows) == 1 and rows[0]['step'] == 19 and \
         abs(rows[0]['mAP'] - 0.66512) < 1e-12, rows
+    ck = {'meta': {'epoch': 19, 'cfg': cfg.pretty_text}}
+    twd = osp.join(tmp, 'baseline1')
+    r = s0.s0d(cfg, path, ck, twd, 0.6651, 0.6960)
+    assert r['result'] == 'PASS', r['fail']
+    assert r['base_check']['log'] == ('0.6651', '0.6960')
+    assert r['ckpt_meta_run']['ckpt_epoch'] == 19
+    r = s0.s0d(cfg, path, ck, twd, 0.6650, 0.6960)
+    assert r['result'] == 'FAIL' and 'do not match' in r['fail'][0], r
+    r = s0.s0d(cfg, path, {'meta': {'epoch': 5, 'cfg': cfg.pretty_text}},
+               twd, 0.6651, 0.6960)
+    assert r['result'] == 'FAIL' and 'no val metrics' in r['fail'][0], r
 
 
 def main():
@@ -550,8 +645,10 @@ def main():
     test_gate(tmp)
     test_adjudicate(tmp)
     test_run_diag(tmp, cfg, ckpt)
+    test_env(tmp)
     test_s0a_repo()
     test_s0a_tamper(tmp)
+    test_s0a_rule_d3(tmp)
     test_s0c_modules()
     test_s0b_diff()
     test_s0d(tmp)

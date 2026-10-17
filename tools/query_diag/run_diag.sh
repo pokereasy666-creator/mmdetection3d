@@ -4,8 +4,11 @@
 # the repo (e.g. in an unpacked branch zip): that is how S0 is run before
 # tools/query_diag/ is copied into the server repo.
 #
-#   CONFIG=.. CKPT=.. [TRAIN_WORK_DIR=work_dirs/baseline1] run_diag.sh s0
-#                                          S0a-S0d consistency checks, CPU only
+# Confirmed inputs of exec doc #1: source exec01_env.sh from the repo root
+# first (sets CONFIG, CKPT, TRAIN_WORK_DIR, CFG_OPTS, BASE_MAP, BASE_NDS).
+#
+#   CONFIG=.. CKPT=.. [TRAIN_WORK_DIR=..] [BASE_MAP=.. BASE_NDS=..] \
+#     run_diag.sh s0                       S0a-S0d consistency checks, CPU only
 #   CONFIG=.. CKPT=.. CUDA_VISIBLE_DEVICES=<id> run_diag.sh quick
 #                                          300 frames (step 1 smoke test)
 #   CONFIG=.. CKPT=.. CUDA_VISIBLE_DEVICES=<id> run_diag.sh recall
@@ -23,7 +26,8 @@
 #      BASE_MAP/BASE_NDS  required by 'oracle' (4 decimals, same eval setup)
 #      GPUS            oracle only, 1 (recommended) or 2
 #      TRAIN_WORK_DIR  s0 only, optional: training work dir of the checkpoint
-#                      (dumped config + val logs) for S0d
+#                      (dumped config + val logs) for S0d; with BASE_MAP /
+#                      BASE_NDS set, S0d also checks them against that log
 #      PORT, OUT       defaults 29531, work_dirs/diag
 #
 # Every GPU step first checks each GPU in CUDA_VISIBLE_DEVICES (C5,
@@ -125,6 +129,9 @@ case "$STEP" in
     S0_ARGS=(--config "$CONFIG" --ckpt "$CKPT" --out-dir "$OUT/s0")
     if [ -n "${TRAIN_WORK_DIR:-}" ]; then
       S0_ARGS+=(--train-work-dir "$TRAIN_WORK_DIR")
+    fi
+    if [ -n "${BASE_MAP:-}" ] && [ -n "${BASE_NDS:-}" ]; then
+      S0_ARGS+=(--base-map "$BASE_MAP" --base-nds "$BASE_NDS")
     fi
     # CPU only: the consistency checker never touches a GPU.
     CUDA_VISIBLE_DEVICES="" python "$DIAG/diag_s0_check.py" "${S0_ARGS[@]}" \

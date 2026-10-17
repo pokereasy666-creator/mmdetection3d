@@ -3,6 +3,7 @@
 - 日期：2026-10-17
 - 依据：用户上传的 `20260718_020825.log`，以及用户说明的三个服务器目录
 - 服务器仓库根目录：`/212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ`（下文简称 `$REPO`）
+- **状态（2026-10-17）**：第 5 节第 1–3 项已确认：权重用 A（`epoch_5`），R1 定 1.0 pp，配置差异按建议规则处理。正式登记见 `EXEC01_DECISIONS.md`；第 6 节的参数已写入 `tools/query_diag/exec01_env.sh`。
 
 ## 1. 这份日志是哪次训练
 

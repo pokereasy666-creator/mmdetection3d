@@ -39,7 +39,9 @@ import logging
 import os
 import os.path as osp
 import re
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 
@@ -55,6 +57,18 @@ ALLOWED_MODULE_PREFIX = ('projects.BEVFusion.', 'mmdet3d.', 'mmdet.',
 CAMERA_MODULES = ('img_backbone', 'img_neck', 'view_transform',
                   'fusion_layer')
 DIFF_LINES_SHOWN = 80
+# Pre-registered rule D-3 (projects/DomeDETR/docs/EXEC01_DECISIONS.md,
+# 2026-10-17): a core config file whose md5 differs is accepted only if
+# every field-level difference of its resolved config lies under one of
+# these paths, AND S0d passes. The four core .py files stay strict.
+CONFIG_DIFF_ALLOWED = (
+    'param_scheduler', 'train_cfg',              # schedule
+    'optim_wrapper', 'auto_scale_lr',            # optimizer
+    'train_dataloader',                          # batch (+ its dataset)
+    'train_pipeline',                            # training pipeline
+    'model.img_backbone.init_cfg.checkpoint',    # Swin init path
+)
+RUNTIME_BASE = 'configs/_base_/default_runtime.py'
 
 LINES = []
 
@@ -144,13 +158,53 @@ def inside(path, root):
 # S0a
 # ---------------------------------------------------------------------------
 
+def diff_allowed(path):
+    return any(path == a or path.startswith((a + '.', a + '['))
+               for a in CONFIG_DIFF_ALLOWED)
+
+
+def config_field_diffs(repo, man):
+    """Field-level diffs of every core config, audited vs server.
+
+    The audited texts are written into a temp tree mirroring the repo
+    layout, with the SERVER's default_runtime.py as the common base on both
+    sides, so only changes inside the three config files show up. No
+    project code is imported (import_custom_modules=False).
+    """
+    from mmengine.config import Config
+    cfgs = sorted(p for p in man['core'] if '/configs/' in p)
+    tmp = tempfile.mkdtemp(prefix='s0a_cfg_')
+    out = {}
+    try:
+        for p in cfgs:
+            dst = osp.join(tmp, p)
+            os.makedirs(osp.dirname(dst), exist_ok=True)
+            with open(dst, 'w') as f:
+                f.write(man['core_text'][p])
+        dst = osp.join(tmp, RUNTIME_BASE)
+        os.makedirs(osp.dirname(dst), exist_ok=True)
+        shutil.copy(osp.join(repo, RUNTIME_BASE), dst)
+        for p in cfgs:
+            a = plain(Config.fromfile(osp.join(tmp, p),
+                                      import_custom_modules=False).to_dict())
+            b = plain(Config.fromfile(osp.join(repo, p),
+                                      import_custom_modules=False).to_dict())
+            out[p] = [{'path': q, 'audited': x, 'server': y,
+                       'allowed': diff_allowed(q)}
+                      for q, x, y in tree_diff(a, b)]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
 def s0a(repo):
     with open(MANIFEST) as f:
         man = json.load(f)
     core = set(man['core'])
     res = {'commit': man['commit'], 'files': [], 'extra': [],
-           'extended': [], 'imports': {}, 'core_diffs': {}}
-    fail, warn = [], []
+           'extended': [], 'imports': {}, 'core_diffs': {},
+           'config_diff_accepted': []}
+    fail, warn, cfg_diff = [], [], []
     for p, ref in sorted(man['tree'].items()):
         fp = osp.join(repo, p)
         if not osp.isfile(fp):
@@ -167,7 +221,9 @@ def s0a(repo):
         is_source = p.endswith(SOURCE_EXT) or p in core
         level = 'core' if p in core else ('source' if is_source else 'doc')
         res['files'].append({'path': p, 'status': st, 'level': level})
-        if st != 'OK':
+        if st == 'DIFF' and p in core and '/configs/' in p:
+            cfg_diff.append(p)          # decided by rule D-3 below
+        elif st != 'OK':
             (fail if is_source else warn).append('%s %s (%s)' % (st, p,
                                                                  level))
     known = set(man['tree'])
@@ -183,6 +239,27 @@ def s0a(repo):
             res['extra'].append({'path': rel, 'source': src})
             if src:
                 fail.append('EXTRA %s (untracked source file)' % rel)
+    if cfg_diff:
+        try:
+            fd = config_field_diffs(repo, man)
+        except Exception:  # noqa: B902
+            fd = None
+            fail += ['DIFF %s (core config)' % p for p in cfg_diff]
+            fail.append('field-level config comparison failed:\n' +
+                        traceback.format_exc())
+        if fd is not None:
+            res['config_field_diffs'] = fd
+            bad = sorted(p for p, v in fd.items()
+                         if any(not d['allowed'] for d in v))
+            for p in bad:
+                fail.append('config %s has field changes outside rule D-3'
+                            % p)
+            if not bad:
+                res['config_diff_accepted'] = list(cfg_diff)
+                for p in cfg_diff:
+                    warn.append('DIFF %s accepted under rule D-3 (%d field '
+                                'changes, all allowed); valid only if S0d '
+                                'PASS' % (p, len(fd.get(p, []))))
     for p, ref in sorted(man['extended'].items()):
         fp = osp.join(repo, p)
         if not osp.isfile(fp):
@@ -224,6 +301,13 @@ def s0a(repo):
         emit('     FAIL ' + m)
     for m in warn:
         emit('     WARN ' + m)
+    for p, v in sorted(res.get('config_field_diffs', {}).items()):
+        if v:
+            emit('     field changes of %s (resolved config):' % p)
+        for d in v:
+            emit('       %-11s %s: %s -> %s'
+                 % ('allowed' if d['allowed'] else 'NOT ALLOWED', d['path'],
+                    short(d['audited'], 60), short(d['server'], 60)))
     for p, d in res['core_diffs'].items():
         lines = d.splitlines()
         emit('     diff of %s (%d lines%s):'
@@ -471,7 +555,7 @@ def read_val_metrics(work_dir):
     return rows
 
 
-def s0d(cfg, config, ck, train_work_dir):
+def s0d(cfg, config, ck, train_work_dir, base_map=None, base_nds=None):
     from mmengine.config import Config
     cur = plain(cfg.to_dict())
     fail, info = [], []
@@ -534,6 +618,26 @@ def s0d(cfg, config, ck, train_work_dir):
             info.append('no unique dumped config in %s (found %s)'
                         % (train_work_dir, dumps))
         res['val_metrics'] = read_val_metrics(train_work_dir)
+        # BASE values must equal the CKPT epoch's val metrics as mmengine
+        # prints them ('%.4f'), i.e. come from this very evaluation.
+        ep = meta.get('epoch')
+        rows = [r for r in res['val_metrics'] if r['step'] == ep]
+        if base_map is not None and base_nds is not None:
+            if not rows:
+                fail.append('no val metrics for CKPT epoch %s under %s; '
+                            'cannot verify BASE_MAP / BASE_NDS'
+                            % (ep, train_work_dir))
+            else:
+                r = rows[-1]
+                got = ('%.4f' % r['mAP'], '%.4f' % r['NDS'])
+                want = ('%.4f' % base_map, '%.4f' % base_nds)
+                res['base_check'] = {'log': got, 'given': want,
+                                     'epoch': ep, 'source': r['log']}
+                if got != want:
+                    fail.append('BASE_MAP/BASE_NDS %s do not match the '
+                                'epoch-%s val log %s' % (want, ep, got))
+    elif base_map is not None:
+        info.append('BASE values not cross-checked (no --train-work-dir)')
     res['training_config_sources_compared'] = sources
     res['fail'], res['info'] = fail, info
     if fail:
@@ -563,6 +667,10 @@ def s0d(cfg, config, ck, train_work_dir):
         mark = '  <- CKPT epoch' if ep is not None and r['step'] == ep else ''
         emit('     val step %-3s mAP=%.6f NDS=%.6f  (%s)%s'
              % (r['step'], r['mAP'], r['NDS'], r['log'], mark))
+    if 'base_check' in res:
+        emit('     BASE check (epoch %s): given mAP/NDS %s, log %s'
+             % (res['base_check']['epoch'], res['base_check']['given'],
+                res['base_check']['log']))
     for m in info:
         emit('     INFO ' + m)
     for m in fail:
@@ -582,6 +690,10 @@ def main():
     p.add_argument('--train-work-dir', default=None,
                    help='training work dir of CKPT (dumped config + logs)')
     p.add_argument('--repo', default='.', help='repo root (default: cwd)')
+    p.add_argument('--base-map', type=float, default=None,
+                   help='BASE_MAP to verify against the training val log')
+    p.add_argument('--base-nds', type=float, default=None,
+                   help='BASE_NDS to verify against the training val log')
     p.add_argument('--cfg-options', nargs='+', action=DictAction,
                    help='same CFG_OPTS as the later runs (key=value ...)')
     args = p.parse_args()
@@ -609,10 +721,17 @@ def main():
             emit('[s0] NOTE: cfg_options applied for S0c/S0d: %s'
                  % args.cfg_options)
         out['S0c'], ck = s0c(cfg, args.ckpt)
-        out['S0d'] = s0d(cfg, args.config, ck, args.train_work_dir)
+        out['S0d'] = s0d(cfg, args.config, ck, args.train_work_dir,
+                         args.base_map, args.base_nds)
         del ck
     results = {k: out[k]['result'] for k in ('S0a', 'S0b', 'S0c', 'S0d')
                if k in out}
+    if out['S0a'].get('config_diff_accepted'):
+        emit('[s0] S0a accepted config diffs under rule D-3 (%s); this holds '
+             'only together with S0d PASS (S0d=%s).'
+             % (', '.join(osp.basename(p) for p in
+                          out['S0a']['config_diff_accepted']),
+                results.get('S0d', 'not run')))
     ok = len(results) == 4 and all(v == 'PASS' for v in results.values())
     out['results'] = results
     out['all_pass'] = ok

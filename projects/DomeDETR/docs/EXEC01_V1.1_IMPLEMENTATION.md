@@ -53,7 +53,7 @@ non-ASCII lines: 0 in every file under tools/query_diag/
 
 ## 3. 本地 CPU 验证（mock）
 
-`projects/DomeDETR/tests/test_query_diag_cpu.py`，14 项全部通过。
+`projects/DomeDETR/tests/test_query_diag_cpu.py`，16 项全部通过（包括 D-3 配置规则、S0d 的 BASE 核对和 `exec01_env.sh`）。
 
 - mock head 的以下部分**逐行复制**自本仓库，包括原地改写 `center` 的那几行：
   - query 初始化（`transfusion_head.py:227-262`）
@@ -86,7 +86,7 @@ non-ASCII lines: 0 in every file under tools/query_diag/
 
 | 自检 | 实现 | 与 v1.1 文字的差别 |
 | --- | --- | --- |
-| S0a | 用 `82c2b4e` 生成的 md5 清单（`s0_manifest_82c2b4e.json`）覆盖 `projects/BEVFusion` 下全部 33 个已跟踪文件。清单里还内嵌了 7 个核心文件的审计原文，任一核心文件 DIFF 时直接打印逐行 diff（终端显示前 80 行，全文写入 json）。源码和配置有差异 → FAIL；`.md` 有差异 → **WARN**；该目录下多出未跟踪的源码文件 → FAIL；编译产物（.so、build、egg-info、`__pycache__`）忽略。另外核对 `mmdet3d` 和 `projects.BEVFusion` 实际是从本仓库 import 的，否则 FAIL。审计引用过的 mmdet3d 文件、`tools/test.py`、`default_runtime.py` 作为扩展集，只给 WARN。 | 不调用 git：CLAUDE.md 铁律 16 规定服务器代码来自 zip。md5 清单覆盖整个目录，比 v1.1 列出的 7 个文件更严。**`.md` 只判 WARN，请确认是否接受。** |
+| S0a | 用 `82c2b4e` 生成的 md5 清单（`s0_manifest_82c2b4e.json`）覆盖 `projects/BEVFusion` 下全部 33 个已跟踪文件。清单里还内嵌了 7 个核心文件的审计原文，任一核心文件 DIFF 时直接打印逐行 diff（终端显示前 80 行，全文写入 json）。三份配置文件的差异按 D-3（`EXEC01_DECISIONS.md`）做字段级判定：差异全部落在允许的路径内，且 S0d 通过，才算可接受。源码和配置有差异 → FAIL；`.md` 有差异 → **WARN**；该目录下多出未跟踪的源码文件 → FAIL；编译产物（.so、build、egg-info、`__pycache__`）忽略。另外核对 `mmdet3d` 和 `projects.BEVFusion` 实际是从本仓库 import 的，否则 FAIL。审计引用过的 mmdet3d 文件、`tools/test.py`、`default_runtime.py` 作为扩展集，只给 WARN。 | 不调用 git：CLAUDE.md 铁律 16 规定服务器代码来自 zip。md5 清单覆盖整个目录，比 v1.1 列出的 7 个文件更严。**`.md` 只判 WARN，请确认是否接受。** |
 | S0b | 用 mmengine 加载两份配置后递归 diff，逐条列出覆盖项。`model` 中出现官方配置没有的 `type` 时 FAIL；`custom_imports` 不同时 FAIL；在注册表里查每个 model type 实际来自哪个模块，模块不在官方前缀内或文件在仓库外时 FAIL。 | — |
 | S0c | 在 CPU 上构建模型，用 mmengine 的 `load_checkpoint(strict=False)` 加载权重（与 `Runner.load_checkpoint` 同一调用链），并挂一个 logger 收集它的输出，在其中查找 `missing keys`、`unexpected key`、`size mismatch`。另外直接比对 key 和形状，只作参考。按顶层模块统计权重组成：CONFIG 含相机分支而权重没有时，直接判 FAIL（LiDAR-only 权重）。 | 需要专门收集日志的原因：`Runner.load_checkpoint` 调用 `print_log(logger=None)`，不匹配信息只打到 stdout，**不会进日志文件**。 |
 | S0d | 检查 val 与 test 的 dataloader.dataset 和 evaluator 是否完全相同，记录并比较 fp16。用权重里 mmengine 保存的训练配置（`meta['cfg']`）比较三处：val 数据集 / evaluator / `val_cfg.fp16`，以及去掉 `init_cfg`、`train_cfg` 后的 `model`。给了 `TRAIN_WORK_DIR` 时，再比较当时转存的配置，并从 `vis_data/scalars.json` 列出每个 epoch 的 val mAP/NDS（6 位小数），标出与权重 `meta.epoch` 对应的那一行。同时打印权重训练配置里的 `work_dir`、`load_from`、`input_modality`、`max_epochs`，用来确认这个目录到底是哪次训练。 | BASE_MAP / BASE_NDS 仍由你填写，脚本只把日志里的值列出来。 |
@@ -120,11 +120,12 @@ train_pipeline[10].max_epoch: 6 -> 20
 
 ```bash
 cd /212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ
-export CONFIG=projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py
-export CKPT=<epoch_19.pth 的绝对路径>
+# 已确认的输入（D-1、D-2 和 CFG_OPTS），见 EXEC01_DECISIONS.md
+source ~/qd_zip/tools/query_diag/exec01_env.sh
 
 # S0：只用 CPU，直接从 zip 目录运行，此时仓库里还没有 tools/query_diag/
-TRAIN_WORK_DIR=work_dirs/baseline1 bash ~/qd_zip/tools/query_diag/run_diag.sh s0
+#     S0d 会同时核对 BASE_MAP / BASE_NDS 与 epoch 5 的 val 日志
+bash ~/qd_zip/tools/query_diag/run_diag.sh s0
 #   -> work_dirs/diag/s0/s0_report.txt。S0a–S0d 全部 PASS 才继续；否则停下回传。
 
 # 第 1 步：部署、门禁、冒烟
@@ -138,9 +139,8 @@ bash tools/query_diag/run_diag.sh merge        # S1–S4a 全部 PASS 才继续
 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh recall
 bash tools/query_diag/run_diag.sh merge
 
-# 第 3 步：D2（R1 阈值需在此前确定）
-BASE_MAP=<4位> BASE_NDS=<4位> GPUS=1 CUDA_VISIBLE_DEVICES=<空闲卡> \
-  bash tools/query_diag/run_diag.sh oracle
+# 第 3 步：D2（R1 阈值已登记为 1.0 pp，见 D-4）
+GPUS=1 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh oracle
 bash tools/query_diag/run_diag.sh summary
 # 只有 S5 不通过时才执行：
 CUDA_VISIBLE_DEVICES=<空闲卡> bash tools/query_diag/run_diag.sh s5-adjudicate
