@@ -8,6 +8,7 @@ Run from the repo root:
            reproduce finding F1 side by side; skipped if not given.
 """
 import argparse
+import glob
 import json
 import os
 import os.path as osp
@@ -187,6 +188,9 @@ def test_summary(tmp):
     assert 'S5  base vs known' in log and log.count('  S6  ') == 3 and \
         log.count('  S7  ') == 3, log
     assert 'FAIL' not in log, log
+    saved = open(osp.join(root, 'summary.txt')).read()
+    assert saved.splitlines()[0].startswith('tag') and 'S7  far' in saved
+    assert '[summary] saved' not in saved
 
 
 def write_base(path, m, n):
@@ -333,6 +337,8 @@ def test_run_diag(tmp, cfg, ckpt):
     assert '--max-samples 300' in calls[0] and \
         calls[0].endswith('--cfg-options a.b=1 c=x'), calls
     assert 'GPU 2 idle' in txt, txt
+    logs = sorted(glob.glob(osp.join(out, 'logs', 'quick_*.log')))
+    assert logs and 'GPU 2 idle' in open(logs[-1]).read(), logs
     rc, txt, calls = run('recall', CONFIG=cfg, CKPT=ckpt,
                          CUDA_VISIBLE_DEVICES='2',
                          STUB_APPS_2='4242, python, 9000 MiB')

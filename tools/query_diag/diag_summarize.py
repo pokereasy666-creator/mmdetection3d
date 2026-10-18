@@ -3,8 +3,10 @@
 """Collect oracle_*.json files and print mAP / NDS deltas vs. the baseline.
 
 Usage: python diag_summarize.py work_dirs/diag [--base base]
+Also writes <root>/summary.txt with the same text.
 """
 import argparse
+import builtins
 import glob
 import json
 import os.path as osp
@@ -25,7 +27,23 @@ def main():
     p.add_argument('root')
     p.add_argument('--base', default='base')
     args = p.parse_args()
+    lines = []
 
+    def print(*a):  # noqa: A001  echo to the terminal and keep for the file
+        s = ' '.join(str(x) for x in a)
+        lines.append(s)
+        builtins.print(s)
+
+    try:
+        _main(args, print)
+    finally:
+        path = osp.join(args.root, 'summary.txt')
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        builtins.print('[summary] saved', path)
+
+
+def _main(args, print):
     runs = {}
     for f in sorted(glob.glob(osp.join(args.root, '**', 'oracle_*.json'),
                               recursive=True)):

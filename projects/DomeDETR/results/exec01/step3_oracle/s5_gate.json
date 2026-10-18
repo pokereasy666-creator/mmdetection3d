@@ -1,0 +1,26 @@
+{
+  "check": "S5",
+  "result": "PASS",
+  "tol": 0.001,
+  "base_json": "work_dirs/diag/oracle_base/oracle_base.json",
+  "base": {
+    "mAP": 0.6654625831924301,
+    "NDS": 0.7061536003546148
+  },
+  "known": {
+    "mAP": 0.6648,
+    "NDS": 0.706
+  },
+  "diff": {
+    "mAP": 0.0006625831924301773,
+    "NDS": 0.00015360035461486898
+  },
+  "runtime": {
+    "time": "2026-10-18 06:45:37",
+    "repo_version": "2026-10-17 dome-detr exec01 A-1: isolated workspace, read-only fetch from EP-Fusion repo, in-place ops build",
+    "config": "projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py",
+    "config_md5": "8f49ac799dc93ccd3e8c7a8dc736a2dc",
+    "ckpt": "/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/epoch_5.pth",
+    "ckpt_md5": "c16536e34cff05f51b6145dec2893f7d"
+  }
+}

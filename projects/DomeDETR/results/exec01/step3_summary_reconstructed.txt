@@ -1,0 +1,29 @@
+tag        oracle   range        score       mAP     dmAP      NDS     dNDS   injected
+all        loc      0-1000       orig     0.6842  +0.0187   0.7176  +0.0114     117976
+all_cls    loc_cls  0-1000       orig     0.6853  +0.0199   0.7165  +0.0103     118103
+base       none     0-1000       orig     0.6655  +0.0000   0.7062  +0.0000          0
+far        loc      30-1000      orig     0.6706  +0.0051   0.7092  +0.0031      32394
+near       loc      0-30         orig     0.6769  +0.0115   0.7131  +0.0069      85582
+
+Self-checks
+  S5  base vs known: dmAP=+0.0007 dNDS=+0.0002 (tol 0.0010)  PASS
+  S6  all      init_mismatch_rate=0.00000 (<= 0.01) capped_cells=0 (== 0)  PASS
+  S7  all      restored_queries=117976 >= 0.99 x injected_cells=117976  PASS
+  S6  all_cls  init_mismatch_rate=0.00000 (<= 0.01) capped_cells=0 (== 0)  PASS
+  S7  all_cls  restored_queries=118103 >= 0.99 x injected_cells=118103  PASS
+  S6  far      init_mismatch_rate=0.00000 (<= 0.01) capped_cells=0 (== 0)  PASS
+  S7  far      restored_queries=32394 >= 0.99 x injected_cells=32394  PASS
+  S6  near     init_mismatch_rate=0.00000 (<= 0.01) capped_cells=0 (== 0)  PASS
+  S7  near     restored_queries=85582 >= 0.99 x injected_cells=85582  PASS
+  NOTE all      ran with cfg_options={'model.img_backbone.init_cfg.checkpoint': '/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth'}
+  NOTE all_cls  ran with cfg_options={'model.img_backbone.init_cfg.checkpoint': '/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth'}
+  NOTE base     ran with cfg_options={'model.img_backbone.init_cfg.checkpoint': '/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth'}
+  NOTE far      ran with cfg_options={'model.img_backbone.init_cfg.checkpoint': '/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth'}
+  NOTE near     ran with cfg_options={'model.img_backbone.init_cfg.checkpoint': '/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth'}
+
+[recall] work_dirs/diag/recall/recall_summary.json  frames=6019  init-label match=1.00000
+  0-20     N= 52368  @0.5m 0.904  @1m 0.959  @2m 0.976  @4m 0.983
+  20-30    N= 33753  @0.5m 0.821  @1m 0.933  @2m 0.969  @4m 0.979
+  30-40    N= 21619  @0.5m 0.771  @1m 0.916  @2m 0.960  @4m 0.977
+  40-50    N= 10798  @0.5m 0.598  @1m 0.831  @2m 0.929  @4m 0.964
+  all      N=118538  @0.5m 0.828  @1m 0.932  @2m 0.967  @4m 0.979

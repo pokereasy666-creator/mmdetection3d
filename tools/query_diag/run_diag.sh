@@ -34,6 +34,8 @@
 #                      (dumped config + val logs) for S0d; with BASE_MAP /
 #                      BASE_NDS set, S0d also checks them against that log
 #      PORT, OUT       defaults 29531, work_dirs/diag
+#                      (every step also writes OUT/logs/<step>_<time>.log;
+#                      'summary' writes OUT/summary.txt)
 #      PROTECTED_DIRS  space-separated dirs never to work in (default: the
 #                      EP-Fusion repo); an empty value keeps the default
 #
@@ -74,6 +76,15 @@ fi
 if inside_protected "$OUT"; then
   die "OUT=$OUT resolves inside a protected directory ($PROTECTED_DIRS)"
 fi
+# Persist the whole terminal output of every step (incl. [gpu-check], [S5],
+# [oracle] lines) to $OUT/logs/<step>_<time>.log, after the OUT guard.
+case "$STEP" in
+  build-ops|s0|quick|recall|merge|oracle|s5-adjudicate|summary)
+    mkdir -p "$OUT/logs"
+    RUN_LOG="$OUT/logs/${STEP}_$(date +%Y%m%d_%H%M%S).log"
+    exec > >(tee -a "$RUN_LOG") 2>&1
+    echo "[run_diag] step=$STEP log=$RUN_LOG" ;;
+esac
 for _v in CKPT TRAIN_WORK_DIR; do
   if [ -n "${!_v:-}" ] && inside_protected "${!_v}"; then
     echo "[run_diag] NOTE: $_v is read (read-only) from a protected" \
