@@ -333,8 +333,16 @@ def patch_mmengine(loader, runner_test=None):
     Runner.from_cfg = classmethod(lambda cls, cfg: FakeRunner(cfg))
 
 
+def mock_loader(frames, seed):
+    """QD_MOCK_FRAMES / QD_MOCK_SEED override the defaults, so that a
+    recall run and an oracle run can see exactly the same frames."""
+    import os
+    return make_loader(int(os.environ.get('QD_MOCK_FRAMES', frames)), 2,
+                       seed=int(os.environ.get('QD_MOCK_SEED', seed)))
+
+
 def child_recall(impl_dir, out_dir, cfg, ckpt):
-    loader = make_loader(24, 2, seed=0)
+    loader = mock_loader(24, 0)
     patch_mmengine(loader)
     sys.path.insert(0, impl_dir)
     mod = load_module('diag_query_recall',
@@ -344,7 +352,7 @@ def child_recall(impl_dir, out_dir, cfg, ckpt):
 
 
 def child_oracle(impl_dir, work_dir, cfg, ckpt, tag, extra):
-    loader = make_loader(12, 2, seed=1)
+    loader = mock_loader(12, 1)
     checks = {'frames': 0, 'restored_ok': 0, 'restored_bad': 0,
               'injected_selected': 0}
 

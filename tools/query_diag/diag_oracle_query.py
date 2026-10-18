@@ -18,6 +18,12 @@ Variants (see run_diag.sh):
   --oracle loc     --range 30 1000   location oracle, far GT only
   --oracle loc     --range 0 30      location oracle, near GT only
   --oracle loc_cls --range 0 1000    location + class oracle
+Exec doc #2 adds:
+  --subset missed [--miss-thr 2.0]   inject only GT that have no same-class
+                                     initial query within miss-thr meters
+                                     on the UNMODIFIED heatmap (K =
+                                     num_proposals; same functions as D1)
+  --score boost / --jitter-cells J   (already supported)
 
 The mAP/NDS gain of a variant over 'none' is the ceiling for ANY method
 that only changes query allocation / initialization (Dome-DETR PAQI, ALIGN,
@@ -56,6 +62,11 @@ def parse_args():
     p.add_argument('--score', choices=['orig', 'boost'], default='orig',
                    help='orig: restore original heatmap score of injected '
                         'queries (no confidence leak); boost: keep ~1.0')
+    p.add_argument('--subset', choices=['all', 'missed'], default='all',
+                   help='all: every GT in range; missed: only GT without a '
+                        'same-class initial query within --miss-thr m')
+    p.add_argument('--miss-thr', type=float, default=2.0,
+                   help='center distance (m) defining a missed GT')
     p.add_argument('--jitter-cells', type=int, default=0,
                    help='random +-J cell offset on injected positions')
     p.add_argument('--seed', type=int, default=0)
@@ -93,8 +104,10 @@ def main():
     rmin, rmax = args.range
     gen = torch.Generator().manual_seed(args.seed + get_rank())
 
-    # counters: frames, injected cells, capped, restored, init-mismatch, P*B
-    cnt = torch.zeros(6, dtype=torch.float64)
+    # counters: 0 frames, 1 injected cells, 2 capped, 3 restored,
+    # 4 init-mismatch, 5 P*B, 6 selected_injected, 7 gt_in_range,
+    # 8 missed_gt
+    cnt = torch.zeros(9, dtype=torch.float64)
     cache = {}
 
     def logits_modifier(logits):
@@ -107,12 +120,27 @@ def main():
         out = logits.clone()
         mask = torch.zeros(B, C * H * W, dtype=torch.bool,
                            device=logits.device)
+        # Initial queries of the UNMODIFIED heatmap (as in D1), used to
+        # define missed GT: no same-class query within miss-thr meters.
+        idx0, cls0, _ = dc.replicate_init(head, logits, P)
+        q_xy0 = dc.cells_to_xy(head, idx0).cpu()
+        cls0 = cls0.cpu()
         for b, sample in enumerate(S['samples']):
             xy, lab, dist = dc.gt_from_sample(sample, class_names,
                                               not args.no_class_range)
             keep = (dist >= rmin) & (dist < rmax)
+            xy, lab = xy[keep], lab[keep]
+            missed = torch.zeros(len(lab), dtype=torch.bool)
+            if len(lab):
+                _, rank_ca = dc.per_gt_hits(xy, lab, q_xy0[b], cls0[b],
+                                            [args.miss_thr])
+                missed = rank_ca[:, 0] >= P
+            cnt[7] += len(lab)
+            cnt[8] += int(missed.sum())
+            if args.subset == 'missed':
+                xy, lab = xy[missed], lab[missed]
             ch, r, c, n_cap = dc.oracle_cells(
-                head, logits[b], xy[keep], lab[keep], H, W,
+                head, logits[b], xy, lab, H, W,
                 cache['transposed'], args.oracle, P,
                 jitter=args.jitter_cells, gen=gen)
             cnt[0] += 1
@@ -137,8 +165,11 @@ def main():
         ql = head.query_labels
         cnt[4] += float((cls != ql).sum().item())
         cnt[5] += float(ql.numel())
+        B, C, H, W = logits.shape
+        # selected initial queries whose (class, cell) is an injected one
+        sel = S['oracle_mask'].gather(1, cls * (H * W) + idx)
+        cnt[6] += float(sel.sum().item())
         if args.score == 'orig':
-            B, C, H, W = logits.shape
             sig_raw = S['logits_raw'].float().sigmoid().view(B, C, -1)
             cnt[3] += dc.restore_oracle_scores(
                 d['query_heatmap_score'], cls, idx, S['oracle_mask'], sig_raw)
@@ -153,7 +184,9 @@ def main():
     t = t.cpu().tolist()
     stats = {'frames': t[0], 'injected_cells': t[1], 'capped_cells': t[2],
              'restored_queries': t[3],
-             'init_mismatch_rate': t[4] / max(t[5], 1.0)}
+             'init_mismatch_rate': t[4] / max(t[5], 1.0),
+             'selected_injected': t[6], 'gt_in_range': t[7],
+             'missed_gt': t[8]}
     if get_rank() == 0:
         res = {'args': vars(args), 'num_proposals': P, 'stats': stats,
                'metrics': {k: (float(v) if isinstance(v, (int, float))
@@ -165,9 +198,10 @@ def main():
         path = osp.join(args.work_dir, 'oracle_%s.json' % args.tag)
         with open(path, 'w') as f:
             json.dump(res, f, indent=2, default=str)
-        print('[oracle] tag=%s mode=%s range=[%g,%g) score=%s jitter=%d'
-              % (args.tag, args.oracle, rmin, rmax, args.score,
-                 args.jitter_cells))
+        print('[oracle] tag=%s mode=%s subset=%s miss_thr=%g range=[%g,%g) '
+              'score=%s jitter=%d seed=%d'
+              % (args.tag, args.oracle, args.subset, args.miss_thr, rmin,
+                 rmax, args.score, args.jitter_cells, args.seed))
         print('[oracle] stats:', json.dumps(stats))
         rt = res['runtime']
         print('[oracle] runtime: %.1fs, peak mem allocated %s MiB / '
@@ -179,6 +213,10 @@ def main():
             print('[WARNING] replicated init differs from head.query_labels '
                   '(rate %.4f); score restoration may be wrong.'
                   % stats['init_mismatch_rate'])
+        if stats['frames'] and stats['selected_injected'] < \
+                0.99 * stats['injected_cells']:
+            print('[WARNING] selected_injected < 0.99 x injected_cells; some '
+                  'injected cells did not become initial queries.')
         if stats['frames'] and stats['restored_queries'] < \
                 0.99 * stats['injected_cells'] and args.score == 'orig':
             print('[WARNING] fewer restored queries than injected cells; '

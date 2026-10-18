@@ -1,1 +1,1 @@
-2026-10-18 dome-detr exec01: step 3 oracle S5-S7 PASS; R1 met, stops at R3 discussion; run logs + summary.txt persisted
+2026-10-18 dome-detr exec02: M1-M5 implemented (--subset missed, B0, run_diag b0/exec2); CPU tests 8+18 PASS; awaiting server step 1 (b0)

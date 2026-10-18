@@ -25,6 +25,13 @@
 #                                          only after an S5 FAIL (sec. 8)
 #   run_diag.sh summary
 #
+# Exec doc #2 (coverage vs localization; source exec02_env.sh first):
+#   run_diag.sh b0                         step 1, no GPU: S0' then B0 / S9
+#   CUDA_VISIBLE_DEVICES=<id> run_diag.sh exec2
+#                                          E0 -> S5' gate -> E1, E2, E3 ->
+#                                          summary (single GPU)
+#   run_diag.sh exec2-summary              re-run the exec doc #2 summary
+#
 # Env: CONFIG, CKPT    required (no defaults)
 #      CFG_OPTS        optional, passed to --cfg-options; recorded in every
 #                      output json (report it whenever it is non-empty)
@@ -79,7 +86,7 @@ fi
 # Persist the whole terminal output of every step (incl. [gpu-check], [S5],
 # [oracle] lines) to $OUT/logs/<step>_<time>.log, after the OUT guard.
 case "$STEP" in
-  build-ops|s0|quick|recall|merge|oracle|s5-adjudicate|summary)
+  build-ops|s0|quick|recall|merge|oracle|s5-adjudicate|summary|b0|exec2|exec2-summary)
     mkdir -p "$OUT/logs"
     RUN_LOG="$OUT/logs/${STEP}_$(date +%Y%m%d_%H%M%S).log"
     exec > >(tee -a "$RUN_LOG") 2>&1
@@ -153,15 +160,16 @@ check_gpus() {
 
 run_oracle() {
   local tag=$1; shift
+  local root=${ORACLE_ROOT:-$OUT}
   check_gpus "$GPUS"
   if [ "$GPUS" -gt 1 ]; then
     torchrun --nproc_per_node="$GPUS" --master_port="$PORT" \
       "$DIAG/diag_oracle_query.py" "$CONFIG" "$CKPT" --launcher pytorch \
-      --work-dir "$OUT/oracle_$tag" --tag "$tag" "$@" \
+      --work-dir "$root/oracle_$tag" --tag "$tag" "$@" \
       ${CFG_ARGS[@]+"${CFG_ARGS[@]}"}
   else
     python "$DIAG/diag_oracle_query.py" "$CONFIG" "$CKPT" \
-      --work-dir "$OUT/oracle_$tag" --tag "$tag" "$@" \
+      --work-dir "$root/oracle_$tag" --tag "$tag" "$@" \
       ${CFG_ARGS[@]+"${CFG_ARGS[@]}"}
   fi
 }
@@ -246,8 +254,57 @@ case "$STEP" in
     exit 4 ;;
   summary)
     python "$DIAG/diag_summarize.py" "$OUT" ;;
+  b0)
+    # Exec doc #2 step 1 (no GPU): S0' consistency with exec doc #1, then B0.
+    need_repo_root; need_config; need_ckpt
+    [ -f "$OUT/oracle_base/oracle_base.json" ] || \
+      die "exec doc #1 result $OUT/oracle_base/oracle_base.json not found"
+    [ -f "$OUT/recall/recall_per_gt.npz" ] || \
+      die "exec doc #1 D1 data $OUT/recall/recall_per_gt.npz not found"
+    if ! python "$DIAG/diag_exec2_check.py" s0p --config "$CONFIG" \
+        --ckpt "$CKPT" --ref-json "$OUT/oracle_base/oracle_base.json" \
+        --out-dir "$OUT/exec2"; then
+      echo "[run_diag] S0' FAILED: B0 was not run. Stop and report." >&2
+      exit 4
+    fi
+    if ! python "$DIAG/diag_b0_decoder.py" \
+        --npz "$OUT/recall/recall_per_gt.npz" --out-dir "$OUT/exec2"; then
+      echo "[run_diag] S9 FAILED. Stop and report." >&2
+      exit 4
+    fi ;;
+  exec2)
+    need_repo_root; need_config; need_ckpt; need_base
+    # Exec doc #2 sec. 1 / S5': the reference is the exec doc #1 step 3 base.
+    awk -v a="$BASE_MAP" -v b="$BASE_NDS" \
+      'BEGIN { exit !(a + 0 == 0.665463 && b + 0 == 0.706154) }' || \
+      die "exec2 needs BASE_MAP=0.665463 BASE_NDS=0.706154 (exec doc #2" \
+        "references); got $BASE_MAP / $BASE_NDS." \
+        "Use: source tools/query_diag/exec02_env.sh"
+    python "$DIAG/diag_exec2_check.py" step1-ok --root "$OUT/exec2" || \
+      die "step 1 (S0' and S9) has not passed; run 'b0' first"
+    GPUS=1                       # exec doc #2: a single GPU only
+    ORACLE_ROOT="$OUT/exec2"
+    run_oracle e0_base --oracle none
+    if ! python "$DIAG/diag_gate_s5.py" gate \
+        --base-json "$OUT/exec2/oracle_e0_base/oracle_e0_base.json" \
+        --map "$BASE_MAP" --nds "$BASE_NDS" --config "$CONFIG" \
+        --ckpt "$CKPT" --out "$OUT/exec2/oracle_e0_base/s5p_gate.json"; then
+      echo "[run_diag] S5' FAILED: E1-E3 were NOT run. Stop and report" \
+        "(exec doc #2 has no adjudication step; ignore any" \
+        "s5-adjudicate hint above)." >&2
+      exit 4
+    fi
+    run_oracle e1_missed_orig  --oracle loc --subset missed --range 0 1000 \
+      --score orig
+    run_oracle e2_missed_boost --oracle loc --subset missed --range 0 1000 \
+      --score boost
+    run_oracle e3_jitter       --oracle loc --subset all --range 0 1000 \
+      --score orig --jitter-cells 1 --seed 0
+    python "$DIAG/diag_exec2_check.py" summary --root "$OUT/exec2" ;;
+  exec2-summary)
+    python "$DIAG/diag_exec2_check.py" summary --root "$OUT/exec2" ;;
   *)
-    echo "unknown step: '$STEP'" \
-      "(build-ops|s0|quick|recall|merge|oracle|s5-adjudicate|summary)"
+    echo "unknown step: '$STEP' (build-ops|s0|quick|recall|merge|oracle|" \
+      "s5-adjudicate|summary|b0|exec2|exec2-summary)"
     exit 1 ;;
 esac
