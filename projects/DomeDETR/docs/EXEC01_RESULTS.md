@@ -110,7 +110,7 @@
 
 - 原始数据：`results/exec01/step3_oracle/`（5 个 `oracle_*.json` + `s5_gate.json`）
 - `summary` 输出：`results/exec01/step3_summary_reconstructed.txt`
-- 分解分析：`results/exec01/step3_oracle_breakdown.txt`（由 `projects/DomeDETR/tools/oracle_breakdown.py` 生成）
+- 分解分析：`results/exec01/step3_oracle_breakdown.txt`（由 `oracle_breakdown.py` 生成，现位于 `tools/query_diag/`）
 
 **回传缺失项与处理**：
 - **`summary` 的输出原本只打印在终端，不写文件**，这是工具的缺陷。这里用同一个 `diag_summarize.py` 在回传的 json 上重新生成了一份。它只读 json，所以与服务器上的输出一致；唯一缺的是 300 帧冒烟的 `[recall]` 段，因为那份 json 没有回传。
