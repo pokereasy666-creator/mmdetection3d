@@ -1,1 +1,1 @@
-2026-10-19 dome-detr exec02: step 1 S0' PASS, S9 PASS, N_missed_D1=3948; step 2 (E0-E3) pending
+2026-10-19 dome-detr exec02: step 2 done, S5'-S8 PASS; coverage_orig +0.300 pp, coverage_boost +0.615 pp, E3 -11.93 pp (validity issue: local-max NMS displacement); E3' requested

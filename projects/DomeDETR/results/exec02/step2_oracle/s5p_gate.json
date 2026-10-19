@@ -1,0 +1,26 @@
+{
+  "check": "S5",
+  "result": "PASS",
+  "tol": 0.001,
+  "base_json": "work_dirs/diag/exec2/oracle_e0_base/oracle_e0_base.json",
+  "base": {
+    "mAP": 0.6661803276266157,
+    "NDS": 0.7063239523716291
+  },
+  "known": {
+    "mAP": 0.665463,
+    "NDS": 0.706154
+  },
+  "diff": {
+    "mAP": 0.0007173276266156936,
+    "NDS": 0.00016995237162920063
+  },
+  "runtime": {
+    "time": "2026-10-19 09:31:29",
+    "repo_version": "2026-10-19 dome-detr exec02: M1-M5 + decisions E2-1..E2-3 (log changes output-equivalent on #1 data; K from head.num_proposals); CPU tests 11+18 PASS; awaiting server step 1 (b0)",
+    "config": "projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_4xa30-amp-accum_nus-3d.py",
+    "config_md5": "8f49ac799dc93ccd3e8c7a8dc736a2dc",
+    "ckpt": "/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/epoch_5.pth",
+    "ckpt_md5": "c16536e34cff05f51b6145dec2893f7d"
+  }
+}

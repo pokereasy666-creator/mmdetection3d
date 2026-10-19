@@ -1,0 +1,60 @@
+Exec doc #2 summary (dmAP / dNDS in pp vs E0; no Q verdicts)
+tag              oracle  subset  score  jit      mAP     dmAP      NDS     dNDS  injected  selected  restored    missed
+e0_base          none    all     orig     0   0.6662   +0.000   0.7063   +0.000         0         0         0         0
+e1_missed_orig   loc     missed  orig     0   0.6692   +0.300   0.7071   +0.081      3789      3789      3789      3926
+e2_missed_boost  loc     missed  boost    0   0.6723   +0.615   0.7092   +0.289      3813      3813         0      3951
+e3_jitter        loc     all     orig     1   0.5469  -11.926   0.6309   -7.546    117776    117776    117776      3907
+
+coverage_orig  = dmAP(E1) = +0.300 pp
+coverage_boost = dmAP(E2) = +0.615 pp
+jitter retention = dmAP(E3) / 1.875 = -6.361
+
+Self-checks
+  S0'  consistency with exec doc #1             PASS     "PASS"
+  S9   R_near/R_far(200) @2m == #1 step 2       PASS     "PASS"
+  S5'  E0 vs reference base (tol 0.001)         PASS     {"mAP": 0.0007173276266156936, "NDS": 0.00016995237162920063}
+  S6   e1_missed_orig                           PASS     {"init_mismatch_rate": 0.0, "capped_cells": 0.0}
+  S7'  e1_missed_orig                           PASS     {"selected_injected": 3789.0, "injected_cells": 3789.0, "restored_queries": 3789.0}
+  S6   e2_missed_boost                          PASS     {"init_mismatch_rate": 0.0, "capped_cells": 0.0}
+  S7'  e2_missed_boost                          PASS     {"selected_injected": 3813.0, "injected_cells": 3813.0, "restored_queries": 0.0}
+  S6   e3_jitter                                PASS     {"init_mismatch_rate": 0.0, "capped_cells": 0.0}
+  S7'  e3_jitter                                PASS     {"selected_injected": 117776.0, "injected_cells": 117776.0, "restored_queries": 117776.0}
+  S8   e1_missed_orig missed_gt vs N_missed_D1  PASS     {"missed_gt": 3926.0, "N_missed_D1": 3948, "rel_diff": 0.005572441742654508}
+  S8   e2_missed_boost missed_gt vs N_missed_D1 PASS     {"missed_gt": 3951.0, "N_missed_D1": 3948, "rel_diff": 0.0007598784194528875}
+  S8   E1 vs E2 missed_gt                       PASS     {"e1": 3926.0, "e2": 3951.0, "rel_diff": 0.006367804381049415}
+  all self-checks PASS: True
+
+Breakdown relative to E0 (oracle_breakdown.py --base e0_base)
+Class-mean AP per match threshold, pp (delta vs base)
+run                     AP@0.5m         AP@1.0m         AP@2.0m         AP@4.0m      mAP
+e0_base           53.40 (+0.00)   65.15 (+0.00)   72.22 (+0.00)   75.70 (+0.00)   66.618
+e1_missed_orig    53.60 (+0.20)   65.48 (+0.33)   72.68 (+0.46)   75.92 (+0.22)   66.918
+e2_missed_boost   53.64 (+0.24)   65.98 (+0.82)   73.17 (+0.95)   76.15 (+0.45)   67.233
+e3_jitter        40.30 (-13.09)  53.48 (-11.67)  60.21 (-12.01)  64.77 (-10.93)   54.692
+
+Share of dmAP by threshold (dmAP = mean over thresholds), pp
+e1_missed_orig  @0.5m +0.050  @1.0m +0.082  @2.0m +0.114  @4.0m +0.054  | dmAP +0.300
+e2_missed_boost @0.5m +0.060  @1.0m +0.206  @2.0m +0.237  @4.0m +0.113  | dmAP +0.615
+e3_jitter       @0.5m -3.273  @1.0m -2.918  @2.0m -3.003  @4.0m -2.732  | dmAP -11.926
+
+Per-class AP (mean over thresholds), pp: base | delta per run
+class                     base |  e1_missed_orig e2_missed_boost       e3_jitter
+car                      88.95 |           +0.24           +0.40          -17.86
+truck                    61.56 |           +0.16           -0.09          -13.54
+construction_vehicle     25.89 |           +0.41           +2.40           -5.72
+bus                      74.52 |           +0.30           -0.63           -9.41
+trailer                  44.59 |           +0.67           +1.75           -6.70
+barrier                  69.72 |           +0.65           +0.76          -19.82
+motorcycle               75.51 |           -0.15           -0.23          -18.50
+bicycle                  59.52 |           +0.37           +0.88          -27.69
+pedestrian               87.71 |           +0.10           +0.37           +0.05
+traffic_cone             78.22 |           +0.24           +0.55           -0.09
+
+TP errors and NDS
+               e0_base  e1_missed_orig e2_missed_boost       e3_jitter
+mATE            0.2893          0.2914          0.2886          0.3666
+mASE            0.2551          0.2560          0.2560          0.2661
+mAOE            0.2798          0.2847          0.2827          0.3468
+mAVE            0.2615          0.2607          0.2602          0.2799
+mAAE            0.1819          0.1819          0.1820          0.1665
+NDS             0.7063          0.7071          0.7092          0.6309

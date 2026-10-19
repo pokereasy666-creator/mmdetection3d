@@ -1,0 +1,240 @@
+{
+  "rows": {
+    "e0_base": {
+      "mAP": 0.6661803276266157,
+      "NDS": 0.7063239523716291,
+      "dmAP_pp": 0.0,
+      "dNDS_pp": 0.0,
+      "stats": {
+        "frames": 0.0,
+        "injected_cells": 0.0,
+        "capped_cells": 0.0,
+        "restored_queries": 0.0,
+        "init_mismatch_rate": 0.0,
+        "selected_injected": 0.0,
+        "gt_in_range": 0.0,
+        "missed_gt": 0.0
+      },
+      "args": {
+        "oracle": "none",
+        "subset": "all",
+        "miss_thr": 2.0,
+        "range": [
+          0.0,
+          1000.0
+        ],
+        "score": "orig",
+        "jitter_cells": 0,
+        "seed": 0
+      },
+      "runtime_elapsed_s": 2289.2
+    },
+    "e1_missed_orig": {
+      "mAP": 0.6691831805308511,
+      "NDS": 0.7071291624136304,
+      "dmAP_pp": 0.3002852904235409,
+      "dNDS_pp": 0.0805210042001292,
+      "stats": {
+        "frames": 6019.0,
+        "injected_cells": 3789.0,
+        "capped_cells": 0.0,
+        "restored_queries": 3789.0,
+        "init_mismatch_rate": 0.0,
+        "selected_injected": 3789.0,
+        "gt_in_range": 118538.0,
+        "missed_gt": 3926.0
+      },
+      "args": {
+        "oracle": "loc",
+        "subset": "missed",
+        "miss_thr": 2.0,
+        "range": [
+          0.0,
+          1000.0
+        ],
+        "score": "orig",
+        "jitter_cells": 0,
+        "seed": 0
+      },
+      "runtime_elapsed_s": 2302.8
+    },
+    "e2_missed_boost": {
+      "mAP": 0.6723326175811037,
+      "NDS": 0.7092138484419319,
+      "dmAP_pp": 0.6152289954488022,
+      "dNDS_pp": 0.28898960703027665,
+      "stats": {
+        "frames": 6019.0,
+        "injected_cells": 3813.0,
+        "capped_cells": 0.0,
+        "restored_queries": 0.0,
+        "init_mismatch_rate": 0.0,
+        "selected_injected": 3813.0,
+        "gt_in_range": 118538.0,
+        "missed_gt": 3951.0
+      },
+      "args": {
+        "oracle": "loc",
+        "subset": "missed",
+        "miss_thr": 2.0,
+        "range": [
+          0.0,
+          1000.0
+        ],
+        "score": "boost",
+        "jitter_cells": 0,
+        "seed": 0
+      },
+      "runtime_elapsed_s": 2323.4
+    },
+    "e3_jitter": {
+      "mAP": 0.5469183230290169,
+      "NDS": 0.6308662190377126,
+      "dmAP_pp": -11.926200459759883,
+      "dNDS_pp": -7.545773333391659,
+      "stats": {
+        "frames": 6019.0,
+        "injected_cells": 117776.0,
+        "capped_cells": 0.0,
+        "restored_queries": 117776.0,
+        "init_mismatch_rate": 0.0,
+        "selected_injected": 117776.0,
+        "gt_in_range": 118538.0,
+        "missed_gt": 3907.0
+      },
+      "args": {
+        "oracle": "loc",
+        "subset": "all",
+        "miss_thr": 2.0,
+        "range": [
+          0.0,
+          1000.0
+        ],
+        "score": "orig",
+        "jitter_cells": 1,
+        "seed": 0
+      },
+      "runtime_elapsed_s": 2315.2
+    }
+  },
+  "coverage_orig_pp": 0.3002852904235409,
+  "coverage_boost_pp": 0.6152289954488022,
+  "jitter_retention": -6.360640245205271,
+  "ref_dmap_all_pp": 1.875,
+  "self_checks": [
+    {
+      "id": "S0'",
+      "desc": "consistency with exec doc #1",
+      "value": "PASS",
+      "result": "PASS"
+    },
+    {
+      "id": "S9",
+      "desc": "R_near/R_far(200) @2m == #1 step 2",
+      "value": "PASS",
+      "result": "PASS"
+    },
+    {
+      "id": "S5'",
+      "desc": "E0 vs reference base (tol 0.001)",
+      "value": {
+        "mAP": 0.0007173276266156936,
+        "NDS": 0.00016995237162920063
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S6",
+      "desc": "e1_missed_orig",
+      "value": {
+        "init_mismatch_rate": 0.0,
+        "capped_cells": 0.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S7'",
+      "desc": "e1_missed_orig",
+      "value": {
+        "selected_injected": 3789.0,
+        "injected_cells": 3789.0,
+        "restored_queries": 3789.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S6",
+      "desc": "e2_missed_boost",
+      "value": {
+        "init_mismatch_rate": 0.0,
+        "capped_cells": 0.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S7'",
+      "desc": "e2_missed_boost",
+      "value": {
+        "selected_injected": 3813.0,
+        "injected_cells": 3813.0,
+        "restored_queries": 0.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S6",
+      "desc": "e3_jitter",
+      "value": {
+        "init_mismatch_rate": 0.0,
+        "capped_cells": 0.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S7'",
+      "desc": "e3_jitter",
+      "value": {
+        "selected_injected": 117776.0,
+        "injected_cells": 117776.0,
+        "restored_queries": 117776.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S8",
+      "desc": "e1_missed_orig missed_gt vs N_missed_D1",
+      "value": {
+        "missed_gt": 3926.0,
+        "N_missed_D1": 3948,
+        "rel_diff": 0.005572441742654508
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S8",
+      "desc": "e2_missed_boost missed_gt vs N_missed_D1",
+      "value": {
+        "missed_gt": 3951.0,
+        "N_missed_D1": 3948,
+        "rel_diff": 0.0007598784194528875
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S8",
+      "desc": "E1 vs E2 missed_gt",
+      "value": {
+        "e1": 3926.0,
+        "e2": 3951.0,
+        "rel_diff": 0.006367804381049415
+      },
+      "result": "PASS"
+    }
+  ],
+  "self_checks_all_pass": true,
+  "note": "Q-rule verdicts are intentionally not computed.",
+  "runtime": {
+    "time": "2026-10-19 11:27:47",
+    "repo_version": "2026-10-19 dome-detr exec02: M1-M5 + decisions E2-1..E2-3 (log changes output-equivalent on #1 data; K from head.num_proposals); CPU tests 11+18 PASS; awaiting server step 1 (b0)"
+  }
+}

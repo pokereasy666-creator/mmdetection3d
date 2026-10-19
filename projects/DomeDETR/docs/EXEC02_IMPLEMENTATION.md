@@ -2,7 +2,7 @@
 
 - 执行文档：`exec_doc_02_coverage_vs_localization.md`（本目录）
 - 分支：`claude/dome-detr-query-diag`
-- 状态：代码与开发侧测试完成；决策 E2-1 至 E2-3 已登记（`EXEC02_DECISIONS.md`）；服务器第 1 步 S0' 与 S9 PASS（`EXEC02_RESULTS.md`），第 2 步 E0–E3 待执行
+- 状态：代码与开发侧测试完成；决策 E2-1 至 E2-3 已登记（`EXEC02_DECISIONS.md`）；第 1 步 S0'、S9 PASS，第 2 步 E0–E3 已完成且 S5'–S8 PASS（`EXEC02_RESULTS.md`）；E3 的有效性问题与 E3' 申请待审阅
 - 改动范围：只在 `tools/query_diag/` 内（另有开发侧测试 `projects/DomeDETR/tests/`，不部署）。`projects/BEVFusion` 未改动
 
 ## 1. diff 摘要
