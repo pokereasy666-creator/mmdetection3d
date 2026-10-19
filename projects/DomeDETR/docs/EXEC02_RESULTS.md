@@ -10,7 +10,7 @@
 
 - `step1_s0p_check.txt`
 - `step1_b0_decoder.txt`、`step1_b0_decoder.json`
-- `step1_b0_20261019_060638.log`（终端全文）
+- `step1_b0_terminal.txt`（终端全文，即服务器上的 `work_dirs/diag/logs/b0_20261019_060638.log`；改名是因为 .gitignore 忽略 *.log）
 
 **S0'**
 

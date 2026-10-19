@@ -1,0 +1,36 @@
+[run_diag] step=b0 log=work_dirs/diag/logs/b0_20261019_060638.log
+[run_diag] NOTE: CFG_OPTS in effect: model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth (recorded in json)
+S0' consistency with exec doc #1 (work_dirs/diag/oracle_base/oracle_base.json)
+  CONFIG md5 8f49ac799dc93ccd3e8c7a8dc736a2dc  (#1: 8f49ac799dc93ccd3e8c7a8dc736a2dc)  OK
+  CKPT md5   c16536e34cff05f51b6145dec2893f7d  (#1: c16536e34cff05f51b6145dec2893f7d)  OK
+  CFG_OPTS   model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth  (#1: model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth)  OK
+  tools/query_diag vs exec doc #1:
+    diag_b0_decoder.py         NEW      -        -> 637b63a5  M3 (new)
+    diag_exec2_check.py        NEW      -        -> 271af47b  M5 (new)
+    diag_oracle_query.py       CHANGED  22880404 -> f867d886  M1/M2
+    diag_summarize.py          CHANGED  a86cf0a3 -> deaa94b3  LOG (#1 logging persistence, decision E2-1)
+    exec02_env.sh              NEW      -        -> a5a7eac2  M4 (new)
+    oracle_breakdown.py        NEW      -        -> a2991c9a  M5 (moved from projects/DomeDETR/tools, E2-2)
+    run_diag.sh                CHANGED  e19bf9b4 -> 43a11f76  M4 (+ #1 logging persistence, decision E2-1)
+  sync gate: all OK
+S0'  PASS
+[exec2] saved work_dirs/diag/exec2/s0p_check.{txt,json}
+B0-1 init vs final recall (class-aware, K=200); diff = final - init
+bin       N_gt   @0.5m init/final/diff     @1m init/final/diff     @2m init/final/diff     @4m init/final/diff
+0-20     52368  0.9037/ 0.9302/+0.0265  0.9594/ 0.9601/+0.0007  0.9762/ 0.9763/+0.0001  0.9833/ 0.9837/+0.0004
+20-30    33753  0.8208/ 0.8669/+0.0462  0.9329/ 0.9376/+0.0047  0.9685/ 0.9691/+0.0006  0.9792/ 0.9793/+0.0001
+30-40    21619  0.7705/ 0.8160/+0.0455  0.9158/ 0.9186/+0.0028  0.9595/ 0.9600/+0.0005  0.9766/ 0.9765/-0.0001
+40-50    10798  0.5977/ 0.6687/+0.0710  0.8311/ 0.8369/+0.0058  0.9292/ 0.9289/-0.0004  0.9641/ 0.9630/-0.0010
+<30      86121  0.8712/ 0.9054/+0.0342  0.9490/ 0.9513/+0.0023  0.9732/ 0.9735/+0.0003  0.9817/ 0.9820/+0.0003
+>=30     32417  0.7130/ 0.7669/+0.0540  0.8876/ 0.8914/+0.0038  0.9494/ 0.9497/+0.0002  0.9725/ 0.9720/-0.0004
+all     118538  0.8279/ 0.8676/+0.0396  0.9322/ 0.9349/+0.0027  0.9667/ 0.9670/+0.0003  0.9792/ 0.9793/+0.0001
+
+B0-2 decoder correction by nearest same-class initial query (approximate)
+bin        N_G0 G0 keep@.5 |     N_G1  G1 fix@.5 |     N_G2   G2 to@.5    G2 to@1
+<30       75028     0.9907 |     6703     0.5441 |     2081     0.0005     0.1884
+>=30      23112     0.9674 |     5661     0.4404 |     2005     0.0035     0.1616
+all       98140     0.9852 |    12364     0.4966 |     4086     0.0020     0.1752
+
+N_missed_D1 (rank_ca @2m >= 200): <30 2309 | >=30 1639 | all 3948
+S9  R_near(200)=0.97319 (expected 0.97319)  R_far(200)=0.94944 (expected 0.94944)  PASS
+[b0] saved work_dirs/diag/exec2/b0_decoder.{txt,json}
