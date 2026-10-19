@@ -1,1 +1,1 @@
-2026-10-19 dome-detr exec02: M1-M5 + decisions E2-1..E2-3 (log changes output-equivalent on #1 data; K from head.num_proposals); CPU tests 11+18 PASS; awaiting server step 1 (b0)
+2026-10-19 dome-detr exec02: step 1 S0' PASS, S9 PASS, N_missed_D1=3948; step 2 (E0-E3) pending

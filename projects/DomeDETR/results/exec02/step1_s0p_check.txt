@@ -1,0 +1,14 @@
+S0' consistency with exec doc #1 (work_dirs/diag/oracle_base/oracle_base.json)
+  CONFIG md5 8f49ac799dc93ccd3e8c7a8dc736a2dc  (#1: 8f49ac799dc93ccd3e8c7a8dc736a2dc)  OK
+  CKPT md5   c16536e34cff05f51b6145dec2893f7d  (#1: c16536e34cff05f51b6145dec2893f7d)  OK
+  CFG_OPTS   model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth  (#1: model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth)  OK
+  tools/query_diag vs exec doc #1:
+    diag_b0_decoder.py         NEW      -        -> 637b63a5  M3 (new)
+    diag_exec2_check.py        NEW      -        -> 271af47b  M5 (new)
+    diag_oracle_query.py       CHANGED  22880404 -> f867d886  M1/M2
+    diag_summarize.py          CHANGED  a86cf0a3 -> deaa94b3  LOG (#1 logging persistence, decision E2-1)
+    exec02_env.sh              NEW      -        -> a5a7eac2  M4 (new)
+    oracle_breakdown.py        NEW      -        -> a2991c9a  M5 (moved from projects/DomeDETR/tools, E2-2)
+    run_diag.sh                CHANGED  e19bf9b4 -> 43a11f76  M4 (+ #1 logging persistence, decision E2-1)
+  sync gate: all OK
+S0'  PASS
