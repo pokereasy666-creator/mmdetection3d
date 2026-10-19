@@ -1,1 +1,1 @@
-2026-10-19 dome-detr exec02: step 2 done, S5'-S8 PASS; coverage_orig +0.300 pp, coverage_boost +0.615 pp, E3 -11.93 pp (validity issue: local-max NMS displacement); E3' requested
+2026-10-19 dome-detr exec02a: E3' runner/summary in tools/query_diag_exec2a (tools/query_diag unchanged); CPU tests 6/6 PASS; awaiting server run
