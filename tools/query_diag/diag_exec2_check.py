@@ -29,15 +29,17 @@ HERE = osp.dirname(osp.abspath(__file__))
 sys.path.insert(0, HERE)
 import oracle_breakdown  # noqa: E402
 
-# Files allowed to differ from the versions that produced exec doc #1.
+# Files allowed to differ from the versions that produced exec doc #1
+# (S0' scope: M1-M5 plus the #1 logging persistence, decisions E2-1 /
+# E2-2 in projects/DomeDETR/docs/EXEC02_DECISIONS.md).
 CHANGE_CATEGORY = {
     'diag_oracle_query.py': 'M1/M2',
     'diag_b0_decoder.py': 'M3 (new)',
-    'run_diag.sh': 'M4 (+ #1 logging fix, section 2)',
+    'run_diag.sh': 'M4 (+ #1 logging persistence, decision E2-1)',
     'exec02_env.sh': 'M4 (new)',
     'diag_exec2_check.py': 'M5 (new)',
-    'oracle_breakdown.py': 'M5 (moved from projects/DomeDETR/tools)',
-    'diag_summarize.py': 'LOG (#1 logging fix: summary.txt, section 2)',
+    'oracle_breakdown.py': 'M5 (moved from projects/DomeDETR/tools, E2-2)',
+    'diag_summarize.py': 'LOG (#1 logging persistence, decision E2-1)',
 }
 TAGS = ('e0_base', 'e1_missed_orig', 'e2_missed_boost', 'e3_jitter')
 ORIG_TAGS = ('e1_missed_orig', 'e3_jitter')

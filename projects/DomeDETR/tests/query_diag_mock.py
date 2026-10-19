@@ -257,7 +257,8 @@ class MockDetector(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.bbox_head = MockHead()
+        import os           # QD_MOCK_P: num_proposals of the mock head
+        self.bbox_head = MockHead(int(os.environ.get('QD_MOCK_P', 200)))
 
     def cuda(self, *a, **k):          # CPU-only test environment
         return self

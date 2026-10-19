@@ -1,0 +1,21 @@
+diag_summarize.py  #1 (484b6bb, md5 a86cf0a3) vs current (md5 deaa94b3)
+  input: results/exec01 step3_oracle/*.json, s5_gate.json, step2_recall_summary.json
+  #1 code stdout      == step3_summary_reconstructed.txt (2676 bytes, md5 68904a29)
+  current stdout      == archive + 1 line: '[summary] saved work_dirs/diag/summary.txt\n'
+  current summary.txt == archive (byte-identical)
+  files changed by current code: +work_dirs/diag/summary.txt only; inputs unchanged; #1 code: no files written
+run_diag.sh  #1 (de1bbcd, md5 e19bf9b4; the whole #1 tools/query_diag, md5 set == #1 runtime) vs current (md5 43a11f76)
+  same workspace path, OUT and stubbed nvidia-smi / python / torchrun for both; compared: exit code, every external call (argv), terminal text, every file (md5; only the wall-clock "time" field of the gate / merge json is masked)
+  build-ops (in-place op build)                        rc=0 calls=1 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/build-ops_<time>.log
+  s0 (S0 checker call)                                 rc=0 calls=1 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/s0_<time>.log
+  quick (300-frame smoke)                              rc=0 calls=1 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/quick_<time>.log
+  quick (refused: CONFIG unset)                        rc=2 calls=0 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/quick_<time>.log
+  recall (D1 full run)                                 rc=0 calls=1 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/recall_<time>.log
+  recall (refused: C5, GPU busy)                       rc=3 calls=0 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/recall_<time>.log
+  oracle (5 groups, 1 GPU, S5 PASS)                    rc=0 calls=6 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/oracle_<time>.log
+  oracle (5 groups, 2 GPUs (torchrun), S5 PASS)        rc=0 calls=6 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/oracle_<time>.log
+  oracle (S5 FAIL: stops after base)                   rc=4 calls=2 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/oracle_<time>.log
+  s5-adjudicate (tools/test.py vs #1 oracle_base.json) rc=4 calls=2 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/s5-adjudicate_<time>.log
+  merge (D1 merge (mock npz))                          rc=0 calls=1 identical | terminal: old == new minus 1 line, log == terminal | files: +logs/merge_<time>.log
+  summary (#1 step 3 / step 2 data)                    rc=0 calls=1 identical | terminal: old == new minus 1 line + "[summary] saved" line, log == terminal | files: +logs/summary_<time>.log, summary.txt
+  merge (refused: OUT protected)                       rc=2 calls=0 identical | terminal: old == new (stops before logging) | files: +-

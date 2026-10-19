@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import os.path as osp
+import re
 import shutil
 import subprocess
 import sys
@@ -367,6 +368,255 @@ def test_env2(tmp):
     assert 'rc=1' in out, out
 
 
+# ---------------------------------------------------------------------------
+# E2-1 (EXEC02_DECISIONS.md): the #1 logging changes must not change any
+# result. Proof: rerun with exec doc #1 data / steps, #1 code vs current code.
+# ---------------------------------------------------------------------------
+
+OLD_SUMMARIZE = '484b6bb'        # diag_summarize.py md5 a86cf0a3 (#1 runs)
+OLD_RUN_DIAG = 'de1bbcd'         # run_diag.sh md5 e19bf9b4 (#1 runs)
+RES1 = osp.join(REPO, 'projects/DomeDETR/results/exec01')
+EVID = []
+
+
+def git_show(commit, rel):
+    return subprocess.check_output(['git', 'show', '%s:%s' % (commit, rel)],
+                                   cwd=REPO)
+
+
+TIME_FIELD = re.compile(rb'"time": "\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"')
+
+
+def tree(root, skip=()):
+    """{relpath: md5} of every file under root (symlinks by target). The
+    wall-clock "time" field that diag_gate_s5.py / diag_merge_bins.py write
+    into their json runtime block is masked; nothing else is."""
+    out = {}
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d != '__pycache__']
+        for n in fn:
+            p = osp.join(dp, n)
+            rel = osp.relpath(p, root)
+            if skip and rel.startswith(skip):
+                continue
+            if osp.islink(p):
+                out[rel] = 'L:' + os.readlink(p)
+            else:
+                data = TIME_FIELD.sub(b'"time": "<t>"', open(p, 'rb').read())
+                out[rel] = hashlib.md5(data).hexdigest()
+    return out
+
+
+def exec1_out(out):
+    """exec doc #1 step 2/3 returned files in the server layout."""
+    for tag in ('base', 'all', 'near', 'far', 'all_cls'):
+        d = osp.join(out, 'oracle_' + tag)
+        os.makedirs(d)
+        shutil.copy(osp.join(RES1, 'step3_oracle', 'oracle_%s.json' % tag), d)
+    shutil.copy(osp.join(RES1, 'step3_oracle', 's5_gate.json'),
+                osp.join(out, 'oracle_base'))
+    os.makedirs(osp.join(out, 'recall'))
+    shutil.copy(osp.join(RES1, 'step2_recall_summary.json'),
+                osp.join(out, 'recall', 'recall_summary.json'))
+
+
+@case('E2-1 LOG: diag_summarize.py on #1 data == archive; only +summary.txt')
+def test_summarize_equivalence(tmp):
+    ref = json.load(open(REF1))['runtime']['diag_files_md5']
+    old = osp.join(tmp, 'diag_summarize_exec1.py')
+    open(old, 'wb').write(git_show(OLD_SUMMARIZE,
+                                   'tools/query_diag/diag_summarize.py'))
+    assert md5(old) == ref['diag_summarize.py']
+    arch_path = osp.join(RES1, 'step3_summary_reconstructed.txt')
+    arch = open(arch_path, 'rb').read()
+    new = osp.join(QD, 'diag_summarize.py')
+    res = {}
+    for ver, script in (('old', old), ('new', new)):
+        ws = osp.join(tmp, 'sum_ws_' + ver)
+        exec1_out(osp.join(ws, 'work_dirs', 'diag'))
+        before = tree(ws)
+        p = subprocess.run([PY, script, 'work_dirs/diag'], cwd=ws,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert p.returncode == 0 and not p.stderr, p.stderr
+        res[ver] = (p.stdout, before, tree(ws), ws)
+    so, bo, ao, _ = res['old']
+    sn, bn, an, wsn = res['new']
+    save = b'[summary] saved work_dirs/diag/summary.txt\n'
+    assert so == arch, 'exec1 code does not reproduce the archive'
+    assert sn == arch + save, sn[-300:]
+    assert ao == bo                                   # #1 code writes nothing
+    assert {k: v for k, v in an.items() if k in bn} == bn  # inputs untouched
+    assert sorted(set(an) - set(bn)) == ['work_dirs/diag/summary.txt']
+    txt = open(osp.join(wsn, 'work_dirs/diag/summary.txt'), 'rb').read()
+    assert txt == arch
+    EVID.extend([
+        'diag_summarize.py  #1 (%s, md5 %s) vs current (md5 %s)'
+        % (OLD_SUMMARIZE, md5(old)[:8], md5(new)[:8]),
+        '  input: results/exec01 step3_oracle/*.json, s5_gate.json, '
+        'step2_recall_summary.json',
+        '  #1 code stdout      == step3_summary_reconstructed.txt '
+        '(%d bytes, md5 %s)' % (len(arch), md5(arch_path)[:8]),
+        '  current stdout      == archive + 1 line: %r' % save.decode(),
+        '  current summary.txt == archive (byte-identical)',
+        '  files changed by current code: +work_dirs/diag/summary.txt only; '
+        'inputs unchanged; #1 code: no files written'])
+
+
+TORCHRUN = '#!/usr/bin/env bash\nexec python "$@"\n'
+
+
+def run_clean(cmd, env, cwd):
+    """Run with ONLY the given environment (nothing leaks from the caller)."""
+    p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True)
+    return p.returncode, p.stdout
+
+
+def short(rel):
+    rel = rel.replace('work_dirs/diag/', '')
+    return re.sub(r'_\d{8}_\d{6}\.log$', '_<time>.log', rel)
+
+
+@case('E2-1 LOG: run_diag.sh #1 vs current on every #1 step: same calls/rc')
+def test_run_diag_log_equivalence(tmp):
+    ref = json.load(open(REF1))['runtime']['diag_files_md5']
+    old_root = osp.join(tmp, 'qd_exec1')
+    os.makedirs(old_root)
+    tar = subprocess.check_output(['git', 'archive', OLD_RUN_DIAG,
+                                   'tools/query_diag'], cwd=REPO)
+    subprocess.run(['tar', '-x', '-C', old_root], input=tar, check=True)
+    old_qd = osp.join(old_root, 'tools', 'query_diag')
+    got = {f: md5(osp.join(old_qd, f)) for f in os.listdir(old_qd)
+           if f.endswith(('.py', '.sh', '.json'))}
+    assert got == ref, 'de1bbcd tools/query_diag != #1 runtime md5 set'
+    b = osp.join(tmp, 'eqbin')
+    os.makedirs(b)
+    stub = T.PYSTUB.replace('*diag_gate_s5.py*|*diag_merge_bins.py*)',
+                            '*diag_gate_s5.py*|*diag_merge_bins.py*|'
+                            '*diag_summarize.py*)')
+    for name, body in (('nvidia-smi', T.NVSMI), ('python', stub),
+                       ('torchrun', TORCHRUN)):
+        open(osp.join(b, name), 'w').write(body)
+        os.chmod(osp.join(b, name), 0o755)
+    tpl = T.make_workspace(tmp, 'eq_tpl')
+    shutil.rmtree(osp.join(tpl, 'tools', 'query_diag'))
+    t_exec1 = osp.join(tmp, 'out_exec1')
+    exec1_out(t_exec1)
+    t_rec = osp.join(tmp, 'out_recall')
+    rc, log = sh([PY, MOCK, 'recall', QD, osp.join(t_rec, 'recall'), CFG,
+                  CKPT])
+    assert rc == 0, log[-2000:]
+    slog = osp.join(tmp, 'eq_stub.log')
+    base = {'PATH': b + os.pathsep + os.environ['PATH'], 'STUB_LOG': slog,
+            'REAL_PY': PY, 'STUB_MAP': '0.6651', 'STUB_NDS': '0.6962'}
+    run1 = dict(CONFIG=CFG, CKPT=CKPT, CUDA_VISIBLE_DEVICES='2')
+    gate = dict(run1, BASE_MAP='0.6651', BASE_NDS='0.6962')
+    ws = osp.join(tmp, 'eq_ws')              # same path for both versions
+    scenarios = [
+        ('build-ops', {}, None, 'in-place op build'),
+        ('s0', dict(CONFIG=CFG, CKPT=CKPT, BASE_MAP='0.6648',
+                    BASE_NDS='0.7060', CFG_OPTS='a.b=1',
+                    TRAIN_WORK_DIR='work_dirs/exec01_inputs/train_run'),
+         None, 'S0 checker call'),
+        ('quick', dict(run1, CFG_OPTS='a.b=1 c=x'), None, '300-frame smoke'),
+        ('quick', {}, None, 'refused: CONFIG unset'),
+        ('recall', run1, None, 'D1 full run'),
+        ('recall', dict(run1, STUB_APPS_2='4242, python, 9000 MiB'), None,
+         'refused: C5, GPU busy'),
+        ('oracle', gate, None, '5 groups, 1 GPU, S5 PASS'),
+        ('oracle', dict(gate, CUDA_VISIBLE_DEVICES='1,2', GPUS='2'), None,
+         '5 groups, 2 GPUs (torchrun), S5 PASS'),
+        ('oracle', dict(gate, STUB_MAP='0.6700'), None,
+         'S5 FAIL: stops after base'),
+        ('s5-adjudicate', dict(gate, STUB_MAP='0.6653'), t_exec1,
+         'tools/test.py vs #1 oracle_base.json'),
+        ('merge', {}, t_rec, 'D1 merge (mock npz)'),
+        ('summary', {}, t_exec1, '#1 step 3 / step 2 data'),
+        ('merge', dict(PROTECTED_DIRS=osp.join(ws, 'work_dirs')), t_rec,
+         'refused: OUT protected'),
+    ]
+    EVID.append('run_diag.sh  #1 (%s, md5 %s; the whole #1 tools/query_diag, '
+                'md5 set == #1 runtime) vs current (md5 %s)'
+                % (OLD_RUN_DIAG, md5(osp.join(old_qd, 'run_diag.sh'))[:8],
+                   md5(osp.join(QD, 'run_diag.sh'))[:8]))
+    EVID.append('  same workspace path, OUT and stubbed nvidia-smi / python / '
+                'torchrun for both; compared: exit code, every external call '
+                '(argv), terminal text, every file (md5; only the wall-clock '
+                '"time" field of the gate / merge json is masked)')
+    for step, env, out_tpl, desc in scenarios:
+        r = {}
+        for ver, qd in (('old', old_qd), ('new', QD)):
+            shutil.rmtree(ws, ignore_errors=True)
+            shutil.copytree(tpl, ws, symlinks=True)
+            shutil.copytree(qd, osp.join(ws, 'tools', 'query_diag'),
+                            ignore=shutil.ignore_patterns('__pycache__'))
+            if out_tpl:
+                shutil.copytree(out_tpl, osp.join(ws, 'work_dirs', 'diag'))
+            if osp.exists(slog):
+                os.remove(slog)
+            rc, txt = run_clean(['bash', 'tools/query_diag/run_diag.sh',
+                                 step], dict(base, **env), ws)
+            calls = open(slog).read() if osp.exists(slog) else ''
+            files = tree(ws, skip=osp.join('tools', 'query_diag'))
+            logs = sorted(k for k in files
+                          if k.startswith('work_dirs/diag/logs/'))
+            logtxt = [open(osp.join(ws, k)).read() for k in logs]
+            r[ver] = (rc, txt, calls, files, logs, logtxt)
+        rc0, t0, c0, f0, l0, _ = r['old']
+        rc1, t1, c1, f1, l1, lt1 = r['new']
+        tag = '%s (%s)' % (step, desc)
+        assert rc0 == rc1, (tag, rc0, rc1, t0, t1)
+        assert c0 == c1, (tag, c0, c1)
+        assert not l0, (tag, l0)
+        if l1:
+            assert len(l1) == 1, l1
+            assert l1[0].startswith('work_dirs/diag/logs/%s_' % step), l1
+            first, rest = t1.split('\n', 1)
+            assert first == '[run_diag] step=%s log=%s' % (step, l1[0]), first
+            how = 'old == new minus 1 line, log == terminal'
+            if step == 'summary':          # diag_summarize.py change, E2-1
+                t0 += '[summary] saved work_dirs/diag/summary.txt\n'
+                how = ('old == new minus 1 line + "[summary] saved" line, '
+                       'log == terminal')
+            assert rest == t0, (tag, t0, rest)
+            assert lt1[0] == t1, (tag, lt1[0], t1)    # log == terminal
+            extra = {l1[0]}
+            if step == 'summary':
+                extra.add('work_dirs/diag/summary.txt')
+            assert set(f1) - set(f0) == extra, (tag, set(f1) ^ set(f0))
+            assert all(f1[k] == f0[k] for k in f0), \
+                (tag, [k for k in f0 if f1[k] != f0[k]])
+        else:
+            assert t0 == t1 and f0 == f1, (tag, t0, t1)
+            extra, how = set(), 'old == new (stops before logging)'
+        n = len(c0.splitlines())
+        add = ', '.join(sorted(short(k) for k in extra)) or '-'
+        print('       %-14s rc=%d calls=%d  %s  +%s'
+              % (step, rc0, n, how, add))
+        EVID.append('  %-52s rc=%d calls=%d identical | terminal: %s | '
+                    'files: +%s' % (tag, rc0, n, how, add))
+
+
+@case('E2-3: missed threshold follows head.num_proposals (mock P=40)')
+def test_p_from_head(tmp):
+    env = {'QD_MOCK_FRAMES': '12', 'QD_MOCK_SEED': '1', 'QD_MOCK_P': '40'}
+    out = osp.join(tmp, 'recall_p40')
+    rc, log = sh([PY, MOCK, 'recall', QD, out, CFG, CKPT], env=env)
+    assert rc == 0, log[-2000:]
+    Z = np.load(osp.join(out, 'recall_per_gt.npz'))
+    ti = list(Z['thr']).index(2.0)
+    assert int(Z['P']) == 40
+    n40 = int((Z['rank_ca'][:, ti] >= 40).sum())
+    n200 = int((Z['rank_ca'][:, ti] >= 200).sum())
+    assert n40 > n200, (n40, n200)
+    e, _ = oracle(tmp, QD, 'p40', LOC + ['--subset', 'missed', '--score',
+                                         'orig'], env)
+    assert e['num_proposals'] == 40, e['num_proposals']
+    assert e['stats']['missed_gt'] == n40, (e['stats'], n40, n200)
+    print('       P=40: missed_gt=%d == D1 rank_ca>=40 (%d); rank_ca>=200 '
+          'would give %d' % (e['stats']['missed_gt'], n40, n200))
+
+
 CFG = CKPT = None
 
 
@@ -385,6 +635,14 @@ def main():
     test_summary(tmp)
     test_run_diag_exec2(tmp)
     test_env2(tmp)
+    test_summarize_equivalence(tmp)
+    test_run_diag_log_equivalence(tmp)
+    test_p_from_head(tmp)
+    if '--evidence' in sys.argv:
+        path = sys.argv[sys.argv.index('--evidence') + 1]
+        with open(path, 'w') as f:
+            f.write('\n'.join(EVID) + '\n')
+        print('evidence written to', path)
     n_fail = sum(1 for r in T.RESULTS if r[1] != 'PASS')
     print('\n%d tests, %d failed' % (len(T.RESULTS), n_fail))
     shutil.rmtree(tmp, ignore_errors=True)

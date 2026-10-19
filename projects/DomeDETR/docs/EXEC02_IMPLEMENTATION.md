@@ -2,20 +2,20 @@
 
 - 执行文档：`exec_doc_02_coverage_vs_localization.md`（本目录）
 - 分支：`claude/dome-detr-query-diag`
-- 状态：代码与开发侧测试完成；服务器第 1 步（`b0`：S0' 与 B0/S9）待执行
+- 状态：代码与开发侧测试完成；决策 E2-1 至 E2-3 已登记（`EXEC02_DECISIONS.md`）；服务器第 1 步（`b0`：S0' 与 B0/S9）待执行
 - 改动范围：只在 `tools/query_diag/` 内（另有开发侧测试 `projects/DomeDETR/tests/`，不部署）。`projects/BEVFusion` 未改动
 
 ## 1. diff 摘要
 
 | 编号 | 文件 | 改动 |
 | --- | --- | --- |
-| M1 | `diag_oracle_query.py` | 新增 `--subset {all,missed}`（默认 `all`）、`--miss-thr`（默认 2.0）。在 heatmap hook 内、**修改 heatmap 之前**，用 `replicate_init(head, logits, P)` 取未修改 heatmap 的 K = num_proposals 个初始 query；对每帧先用 `gt_from_sample` 取 GT（按类别评测距离截断），再按 `--range` 过滤，然后调用 `per_gt_hits(..., [miss_thr])` 的 class-aware 结果，`rank_ca >= P` 即为漏检。`missed` 模式只把漏检 GT 交给 `oracle_cells`，注入方式与 `loc` 相同（通道 = 该格原始 logits 的 argmax）。三个函数都与 D1 共用（`diag_common.py` 未改动） |
+| M1 | `diag_oracle_query.py` | 新增 `--subset {all,missed}`（默认 `all`）、`--miss-thr`（默认 2.0）。在 heatmap hook 内、**修改 heatmap 之前**，用 `replicate_init(head, logits, P)` 取未修改 heatmap 的 K = num_proposals 个初始 query（`P = int(head.num_proposals)`，与 D1 同一写法，未写死 200，见 E2-3）；对每帧先用 `gt_from_sample` 取 GT（按类别评测距离截断），再按 `--range` 过滤，然后调用 `per_gt_hits(..., [miss_thr])` 的 class-aware 结果，`rank_ca >= P` 即为漏检。`missed` 模式只把漏检 GT 交给 `oracle_cells`，注入方式与 `loc` 相同（通道 = 该格原始 logits 的 argmax）。三个函数都与 D1 共用（`diag_common.py` 未改动） |
 | M2 | `diag_oracle_query.py` | 计数器由 6 个增加到 9 个：`selected_injected`（被选中的初始 query 中 (类别, 格子) 落在注入掩码上的个数，orig 与 boost 都统计）、`gt_in_range`、`missed_gt`。另外：`[oracle]` 打印行增加 subset / miss_thr / seed；`selected_injected < 0.99 × injected_cells` 时打印 WARNING |
 | M3 | `diag_b0_decoder.py`（新） | 读取 #1 的 `recall_per_gt.npz`，输出表 B0-1、B0-2、`N_missed_D1` 和 S9，写入 `b0_decoder.txt` / `.json`。S9 不通过时退出码为 1 |
 | M4 | `run_diag.sh` | 新增入口 `b0`、`exec2`、`exec2-summary`（详见第 2.4 节）；`run_oracle` 支持 `ORACLE_ROOT`，exec2 的输出因此写到 `work_dirs/diag/exec2/` |
 | M4 | `exec02_env.sh`（新） | `source exec01_env.sh`（CONFIG / CKPT / CFG_OPTS 与 #1 完全相同），再设置 `BASE_MAP=0.665463`、`BASE_NDS=0.706154`（本文档第 1 节的参考 base） |
 | M5 | `diag_exec2_check.py`（新） | 子命令 `s0p`（S0'）、`step1-ok`（S0' 与 S9 都通过才返回 0）、`summary`（M5 汇总） |
-| M5 | `oracle_breakdown.py` | 从 `projects/DomeDETR/tools/` 移到 `tools/query_diag/`（随诊断目录一起部署）。逻辑不变，只抽出 `breakdown_lines()` 供汇总调用，并让 run 列宽度随 tag 长度自适应。对 #1 的 5 个 json 输出与归档的 `results/exec01/step3_oracle_breakdown.txt` **逐字节相同** |
+| M5（E2-2） | `oracle_breakdown.py` | 从 `projects/DomeDETR/tools/` 移到 `tools/query_diag/`（随诊断目录一起部署）。逻辑不变，只抽出 `breakdown_lines()` 供汇总调用，并让 run 列宽度随 tag 长度自适应。对 #1 的 5 个 json 输出与归档的 `results/exec01/step3_oracle_breakdown.txt` **逐字节相同** |
 
 "旧模式行为与 #1 完全相同"的证明：开发侧测试从提交 `de1bbcd` 取出 #1 实际运行的 `diag_oracle_query.py` / `diag_common.py`（md5 与 #1 服务器 runtime 记录的 `22880404…` / `603244dc…` 一致），在同一个 mock 上分别跑 `--oracle none`、`--oracle loc --range 0 1000`、jitter 变体，新旧两版的 metrics 与 #1 已有的全部 stats 字段完全相等。
 
@@ -103,7 +103,7 @@ GATES PASS
 
 运行方式：CPU，Python 3.13，torch CPU 版，mmengine 0.10.5。TransFusion 的 query 初始化、`predict_by_feat` 和 decode 都是逐字复制的 mock，与 #1 的测试相同。
 
-- `test_exec2_cpu.py`：8/8 PASS
+- `test_exec2_cpu.py`：11/11 PASS
   - `--subset all` 与 #1 代码完全相同（none / loc / jitter 三种）
   - 同一组 mock 帧上：
     - D1 的 N_missed = 96，E1 与 E2 的 `missed_gt` = 96
@@ -121,6 +121,8 @@ GATES PASS
     - S5' 不通过时只跑了 E0
     - 正常流程按 E0 → gate → E1 → E2 → E3 → 汇总 顺序执行，参数逐字核对
   - `exec02_env.sh` 的取值正确，并会拒绝在 EP-Fusion 仓库内运行
+  - E2-1：`diag_summarize.py` 和 `run_diag.sh` 的日志改动用 #1 数据和 #1 全部入口重跑，与 #1 代码逐项对比。结果见 `EXEC02_DECISIONS.md`，原始输出见 `results/exec02/dev_e2-1_log_equivalence.txt`
+  - E2-3：mock 的 num_proposals 设为 40 时，`missed_gt` 等于 D1 的 `rank_ca >= 40` 计数（237），不是 `>= 200` 的 96
 - `test_query_diag_cpu.py`（#1 回归，带 `--ref-dir`）：18/18 PASS
 
 ## 5. S0' 开发侧预演
@@ -134,26 +136,36 @@ GATES PASS
 | 文件 | 状态 | #1 md5 | 现 md5 | 归属 |
 | --- | --- | --- | --- | --- |
 | `diag_oracle_query.py` | CHANGED | `228804043303cef4472d203ccdba9b92` | `f867d88613806dd417b92e26d11d6a8d` | M1/M2 |
-| `run_diag.sh` | CHANGED | `e19bf9b412419d53c7012dddca109a13` | `43a11f769b0b33176ff072f3fad28f5f` | M4（另含 #1 收尾时加的日志持久化，属于第 2 节"所有终端输出写日志"） |
-| `diag_summarize.py` | CHANGED | `a86cf0a379154f9f45aadeeb14057ebf` | `deaa94b35ec03a7700d369631c671be2` | LOG（#1 收尾：写 `summary.txt`） |
+| `run_diag.sh` | CHANGED | `e19bf9b412419d53c7012dddca109a13` | `43a11f769b0b33176ff072f3fad28f5f` | M4，另含 #1 收尾时加的日志持久化（E2-1） |
+| `diag_summarize.py` | CHANGED | `a86cf0a379154f9f45aadeeb14057ebf` | `deaa94b35ec03a7700d369631c671be2` | LOG：#1 收尾时加的写 `summary.txt`（E2-1） |
 | `diag_b0_decoder.py` | NEW | – | `637b63a51b97f5b92f957aae548bf3ed` | M3 |
-| `diag_exec2_check.py` | NEW | – | `1fae5e9d1077a4a8dc9a0d33ff1b523d` | M5 |
-| `oracle_breakdown.py` | NEW | – | `a2991c9afcaed026845affcd4824fd55` | M5（迁入） |
+| `diag_exec2_check.py` | NEW | – | `271af47bf76a1aabbc16f33c15fdd40c` | M5 |
+| `oracle_breakdown.py` | NEW | – | `a2991c9afcaed026845affcd4824fd55` | M5（迁入，E2-2） |
 | `exec02_env.sh` | NEW | – | `a5a7eac2a914544ceaa19ef80f11683e` | M4 |
 
-`run_diag.sh` 和 `diag_summarize.py` 的日志改动是 #1 第 3 步之后应用户要求加的。#1 的 `--subset all` 路径不受影响。
+`run_diag.sh` 和 `diag_summarize.py` 的日志改动是 #1 第 3 步之后应用户要求加的。按 E2-1，它们在 S0' 允许范围内，条件是不改变任何计算结果（证据见 `EXEC02_DECISIONS.md`）。
 
 ## 6. 部署与运行
 
-服务器代码按 CLAUDE.md 铁律 16 来自 zip，工作区 `$WS` 沿用 #1 的那份（A-1）。
+服务器代码按 CLAUDE.md 铁律 16 来自 zip。工作区 `$WS` 沿用 #1 的那份（A-1），其中是 #1 时的代码；本次的新代码要从本分支**最新**的 zip 取得。
+
+注意：GitHub 分支 zip 的顶层目录名就是 `mmdetection3d-claude-dome-detr-query-diag`，与 `$WS` 同名。**不要在 `/212022085500129/dome-detr/` 下直接 unzip**，否则会解压进 `$WS` 本身。应解压到一个新建的空目录，`<解压目录>` 就是其中的 `mmdetection3d-claude-dome-detr-query-diag`。
 
 ```bash
-# 0) 部署：把本分支 zip 解压到 EP-Fusion 仓库之外的临时目录，
+# 0) 部署：新 zip 解压到新建的空目录（在 EP-Fusion 仓库和 $WS 之外），
 #    只把 tools/query_diag/ 和 VERSION 拷进 $WS。
 #    不动 work_dirs/、exec01_inputs、data 软链接和已编译的算子。
+SRC=/212022085500129/dome-detr/_src_exec02
+mkdir -p $SRC && unzip -q <新 zip 的路径> -d $SRC
+NEW=$SRC/mmdetection3d-claude-dome-detr-query-diag     # 即 <解压目录>
+head -1 $NEW/VERSION                                    # 应以 "2026-10-19 dome-detr exec02" 开头
+
 WS=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag
-cp -r <解压目录>/tools/query_diag/. $WS/tools/query_diag/
-cp <解压目录>/VERSION $WS/VERSION
+cp -r $NEW/tools/query_diag/. $WS/tools/query_diag/
+cp $NEW/VERSION $WS/VERSION
+diff -rq -x __pycache__ $NEW/tools/query_diag $WS/tools/query_diag && echo synced
+md5sum $WS/tools/query_diag/diag_oracle_query.py $WS/tools/query_diag/diag_exec2_check.py
+#    应为 f867d886... / 271af47b...（第 5 节）
 
 cd $WS
 source tools/query_diag/exec02_env.sh  # 末行: [exec02_env] BASE_MAP=0.665463 BASE_NDS=0.706154 ...
