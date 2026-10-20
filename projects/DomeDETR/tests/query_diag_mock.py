@@ -211,6 +211,23 @@ def cell_of(x, y):
             int(math.floor((y + 54.0) / 0.6)))
 
 
+GAUSS = __import__('os').environ.get('QD_MOCK_GAUSS', '') == '1'
+
+
+def paint_gaussian(ch, gx, gy, r, c, peak, sigma=1.0, half=2):
+    """QD_MOCK_GAUSS=1: a peak whose sigmoid is p0 * exp(-d^2 / 2 sigma^2)
+    around the continuous GT grid position (gx, gy) (cell centres at
+    index + 0.5), so DARK must recover the sub-cell offset exactly."""
+    p0 = 1.0 / (1.0 + math.exp(-peak))
+    H, W = ch.shape
+    for rr in range(max(r - half, 0), min(r + half + 1, H)):
+        for cc in range(max(c - half, 0), min(c + half + 1, W)):
+            d2 = (rr + 0.5 - gx) ** 2 + (cc + 0.5 - gy) ** 2
+            p = p0 * math.exp(-d2 / (2 * sigma * sigma))
+            z = math.log(p / (1.0 - p))
+            ch[rr, cc] = max(float(ch[rr, cc]), z)
+
+
 def make_frame(rng, n_gt=45, n_distract=320):
     """Synthetic GT + staged logits + decoder offsets for one frame."""
     H = W = 180
@@ -239,7 +256,12 @@ def make_frame(rng, n_gt=45, n_distract=320):
         r, c = cell_of(xs[i], ys[i])
         if not (0 <= r < H and 0 <= c < W):
             continue
-        logits[lab[i], r, c] = 3.0 - 0.1 * d + rng.normal(0, 0.5)
+        peak = 3.0 - 0.1 * d + rng.normal(0, 0.5)
+        if GAUSS:   # sub-cell Gaussian: log(sigmoid) is exactly quadratic
+            paint_gaussian(logits[lab[i]], (xs[i] + 54.0) / 0.6,
+                           (ys[i] + 54.0) / 0.6, r, c, peak)
+        else:
+            logits[lab[i], r, c] = peak
         # decoder pulls the query from the cell center to the GT center
         gx = (xs[i] + 54.0) / 0.6
         gy = (ys[i] + 54.0) / 0.6
@@ -410,9 +432,19 @@ def child_oracle(impl_dir, work_dir, cfg, ckpt, tag, extra):
         json.dump(checks, f)
 
 
+def child_script(path, argv):
+    """Run any Runner-based diagnostic script on the mock loader."""
+    patch_mmengine(mock_loader(24, 0))
+    mod = load_module(osp.splitext(osp.basename(path))[0], path)
+    sys.argv = [path] + list(argv)
+    sys.exit(mod.main())
+
+
 if __name__ == '__main__':
     if sys.argv[1] == 'recall':
         child_recall(*sys.argv[2:6])
+    elif sys.argv[1] == 'script':
+        child_script(sys.argv[2], sys.argv[3:])
     elif sys.argv[1] == 'oracle':
         child_oracle(*sys.argv[2:7], sys.argv[7:])
     else:

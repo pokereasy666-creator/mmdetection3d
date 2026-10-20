@@ -1,1 +1,1 @@
-2026-10-20 dome-detr exec02a: E3' done, all self-checks PASS; exact_gain +1.725, L +1.425, retention' 0.278 (critical band), r_0.5 0.306
+2026-10-20 dome-detr exec03 step 0: T1-T6 audit, plan for confirmation, step 0a tool + probe + S0''' (projects/QueryLoc); CPU tests 7/7 PASS
