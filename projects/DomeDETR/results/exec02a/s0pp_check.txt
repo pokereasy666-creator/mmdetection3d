@@ -1,0 +1,8 @@
+S0'' consistency with exec doc #2 step 2 (work_dirs/diag/exec2)
+  reference runs: oracle_e0_base.json, oracle_e1_missed_orig.json, oracle_e2_missed_boost.json, oracle_e3_jitter.json (runtime records agree)
+  CONFIG md5 8f49ac799dc93ccd3e8c7a8dc736a2dc  (#2: 8f49ac799dc93ccd3e8c7a8dc736a2dc)  OK
+  CKPT md5   c16536e34cff05f51b6145dec2893f7d  (#2: c16536e34cff05f51b6145dec2893f7d)  OK
+  CFG_OPTS   model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth  (#2: model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth)  OK
+  tools/query_diag: 15 files, all identical to exec doc #2 step 2
+  tools/query_diag_exec2a: exec2a_check.py 3dd7e52a, run_exec2a.sh 2abe3ae9; sync gate all OK
+S0''  PASS

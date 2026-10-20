@@ -1,0 +1,358 @@
+{
+  "e0": "work_dirs/diag/exec2/oracle_e0_base/oracle_e0_base.json",
+  "b0": "work_dirs/diag/exec2/b0_decoder.json",
+  "subset_ref": 20398,
+  "rows": {
+    "e3p_exact": {
+      "mAP": 0.6834261350379041,
+      "NDS": 0.7165464249861789,
+      "dmAP_pp": 1.7245807411288339,
+      "dNDS_pp": 1.0222472614549782,
+      "share_pp": {
+        "0.5": 1.595000000000002,
+        "1.0": 0.3725000000000006,
+        "2.0": -0.12974999999999792,
+        "4.0": -0.11300000000000199
+      },
+      "mATE": 0.2686,
+      "mAOE": 0.2842,
+      "stats": {
+        "frames": 6019.0,
+        "injected_cells": 20231.0,
+        "capped_cells": 0.0,
+        "restored_queries": 20231.0,
+        "init_mismatch_rate": 0.0,
+        "selected_injected": 20231.0,
+        "gt_in_range": 118538.0,
+        "missed_gt": 20385.0
+      }
+    },
+    "e3p_jitter": {
+      "mAP": 0.670980533139804,
+      "NDS": 0.7085435007225019,
+      "dmAP_pp": 0.48002055131882715,
+      "dNDS_pp": 0.2219548350872791,
+      "share_pp": {
+        "0.5": 0.4887500000000017,
+        "1.0": 0.21750000000000103,
+        "2.0": -0.11524999999999452,
+        "4.0": -0.11099999999999999
+      },
+      "mATE": 0.2828,
+      "mAOE": 0.2889,
+      "stats": {
+        "frames": 6019.0,
+        "injected_cells": 20310.0,
+        "capped_cells": 0.0,
+        "restored_queries": 20310.0,
+        "init_mismatch_rate": 0.0,
+        "selected_injected": 20310.0,
+        "gt_in_range": 118538.0,
+        "missed_gt": 20389.0
+      }
+    }
+  },
+  "derived": {
+    "coverage_orig_registered_pp": 0.3,
+    "exact_gain_pp": 1.7245807411288339,
+    "L_pp": 1.4245807411288338,
+    "jitter_gain_pp": 0.48002055131882715,
+    "retention_prime": 0.2783404336317864,
+    "r_0.5": 0.30642633228840194
+  },
+  "per_class_dAP_pp": {
+    "car": {
+      "e3p_exact": [
+        4.620000000000002,
+        1.0800000000000032,
+        -0.17000000000000348,
+        -0.40999999999999925
+      ],
+      "e3p_jitter": [
+        1.6599999999999948,
+        0.37000000000000366,
+        -0.40000000000000036,
+        -0.649999999999995
+      ]
+    },
+    "truck": {
+      "e3p_exact": [
+        8.78,
+        1.859999999999995,
+        -1.21,
+        -0.5099999999999993
+      ],
+      "e3p_jitter": [
+        4.289999999999999,
+        2.5499999999999967,
+        0.42999999999999705,
+        0.8000000000000007
+      ]
+    },
+    "construction_vehicle": {
+      "e3p_exact": [
+        4.9799999999999995,
+        -1.16,
+        -2.87,
+        -2.7400000000000038
+      ],
+      "e3p_jitter": [
+        0.7899999999999997,
+        -0.9099999999999997,
+        -2.179999999999999,
+        -1.7600000000000005
+      ]
+    },
+    "bus": {
+      "e3p_exact": [
+        13.540000000000003,
+        4.189999999999994,
+        -0.40999999999999925,
+        -0.36000000000000476
+      ],
+      "e3p_jitter": [
+        5.060000000000003,
+        2.5499999999999967,
+        -0.5000000000000004,
+        -0.660000000000005
+      ]
+    },
+    "trailer": {
+      "e3p_exact": [
+        14.01,
+        4.069999999999996,
+        -3.3099999999999907,
+        -3.070000000000006
+      ],
+      "e3p_jitter": [
+        3.7099999999999995,
+        2.17,
+        -3.0999999999999917,
+        -2.9000000000000026
+      ]
+    },
+    "barrier": {
+      "e3p_exact": [
+        8.079999999999998,
+        2.949999999999997,
+        0.880000000000003,
+        0.8499999999999952
+      ],
+      "e3p_jitter": [
+        2.499999999999991,
+        1.319999999999999,
+        0.29000000000000137,
+        0.07999999999999119
+      ]
+    },
+    "motorcycle": {
+      "e3p_exact": [
+        7.029999999999992,
+        0.38000000000000256,
+        0.30000000000000027,
+        0.019999999999997797
+      ],
+      "e3p_jitter": [
+        1.1399999999999966,
+        0.5800000000000027,
+        0.6000000000000005,
+        0.49000000000000155
+      ]
+    },
+    "bicycle": {
+      "e3p_exact": [
+        2.4399999999999977,
+        1.2700000000000045,
+        1.3000000000000012,
+        1.4100000000000001
+      ],
+      "e3p_jitter": [
+        0.46999999999999265,
+        0.11999999999999789,
+        0.26000000000000467,
+        0.19000000000000128
+      ]
+    },
+    "pedestrian": {
+      "e3p_exact": [
+        0.17999999999999128,
+        0.12999999999999678,
+        0.14999999999999458,
+        0.09000000000000119
+      ],
+      "e3p_jitter": [
+        0.05999999999999339,
+        0.06999999999999229,
+        0.09000000000000119,
+        0.060000000000004494
+      ]
+    },
+    "traffic_cone": {
+      "e3p_exact": [
+        0.14000000000000679,
+        0.12999999999999678,
+        0.14999999999999458,
+        0.20000000000000018
+      ],
+      "e3p_jitter": [
+        -0.12999999999999678,
+        -0.11999999999999789,
+        -0.10000000000000009,
+        -0.09000000000000119
+      ]
+    }
+  },
+  "self_checks": [
+    {
+      "id": "S0''",
+      "desc": "consistency with exec doc #2 step 2",
+      "value": "PASS",
+      "result": "PASS"
+    },
+    {
+      "id": "E0",
+      "desc": "reference = exec doc #2 E0 (0.666180 / 0.706324)",
+      "value": {
+        "mAP": 0.6661803276266157,
+        "NDS": 0.7063239523716291
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "ARGS",
+      "desc": "e3p_exact arguments as in exec doc #2a",
+      "value": {
+        "oracle": "loc",
+        "subset": "missed",
+        "miss_thr": 0.5,
+        "range": [
+          0.0,
+          1000.0
+        ],
+        "score": "orig",
+        "jitter_cells": 0,
+        "seed": 0,
+        "no_class_range": false
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S6",
+      "desc": "e3p_exact",
+      "value": {
+        "init_mismatch_rate": 0.0,
+        "capped_cells": 0.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S7'",
+      "desc": "e3p_exact",
+      "value": {
+        "selected_injected": 20231.0,
+        "injected_cells": 20231.0,
+        "restored_queries": 20231.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S8'",
+      "desc": "e3p_exact missed_gt vs B0 subset size",
+      "value": {
+        "missed_gt": 20385.0,
+        "subset_ref": 20398,
+        "rel_diff": 0.0006373173840572605
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "ARGS",
+      "desc": "e3p_jitter arguments as in exec doc #2a",
+      "value": {
+        "oracle": "loc",
+        "subset": "missed",
+        "miss_thr": 0.5,
+        "range": [
+          0.0,
+          1000.0
+        ],
+        "score": "orig",
+        "jitter_cells": 1,
+        "seed": 0,
+        "no_class_range": false
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S6",
+      "desc": "e3p_jitter",
+      "value": {
+        "init_mismatch_rate": 0.0,
+        "capped_cells": 0.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S7'",
+      "desc": "e3p_jitter",
+      "value": {
+        "selected_injected": 20310.0,
+        "injected_cells": 20310.0,
+        "restored_queries": 20310.0
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S8'",
+      "desc": "e3p_jitter missed_gt vs B0 subset size",
+      "value": {
+        "missed_gt": 20389.0,
+        "subset_ref": 20398,
+        "rel_diff": 0.0004412197274242573
+      },
+      "result": "PASS"
+    },
+    {
+      "id": "S8'",
+      "desc": "e3p_exact vs e3p_jitter missed_gt",
+      "value": {
+        "exact": 20385.0,
+        "jitter": 20389.0,
+        "rel_diff": 0.00019618421697974398
+      },
+      "result": "PASS"
+    }
+  ],
+  "self_checks_all_pass": true,
+  "runtime": {
+    "e3p_exact": {
+      "elapsed_s": 2304.7,
+      "gpu_name": "NVIDIA A30",
+      "cuda_visible_devices": "1",
+      "world_size": 1,
+      "fp16": {
+        "val_cfg": false,
+        "test_cfg": false
+      },
+      "repo_version": "2026-10-19 dome-detr exec02a: E3' runner/summary in tools/query_diag_exec2a (tools/query_diag unchanged); CPU tests 6/6 PASS; awaiting server run",
+      "peak_mem_allocated_mib": 2229.2
+    },
+    "e3p_jitter": {
+      "elapsed_s": 2312.2,
+      "gpu_name": "NVIDIA A30",
+      "cuda_visible_devices": "1",
+      "world_size": 1,
+      "fp16": {
+        "val_cfg": false,
+        "test_cfg": false
+      },
+      "repo_version": "2026-10-19 dome-detr exec02a: E3' runner/summary in tools/query_diag_exec2a (tools/query_diag unchanged); CPU tests 6/6 PASS; awaiting server run",
+      "peak_mem_allocated_mib": 2229.3
+    }
+  },
+  "logs": [
+    "/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/diag/logs/exec2a-run_20261020_032656.log"
+  ],
+  "summary_time": "2026-10-20 04:44:19",
+  "repo_version": "2026-10-19 dome-detr exec02a: E3' runner/summary in tools/query_diag_exec2a (tools/query_diag unchanged); CPU tests 6/6 PASS; awaiting server run"
+}

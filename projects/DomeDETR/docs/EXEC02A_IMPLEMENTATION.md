@@ -2,7 +2,7 @@
 
 - 执行文档：`exec_doc_02a_E3prime.md`（v1.1，本目录）
 - 分支：`claude/dome-detr-query-diag`
-- 状态：工具与开发侧测试完成；服务器运行待执行
+- 状态：服务器运行完成（2026-10-20），自检全部 PASS；结果见 `EXEC02A_RESULTS.md`
 
 ## 1. 实现方式与一处需要确认的处理
 

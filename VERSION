@@ -1,1 +1,1 @@
-2026-10-19 dome-detr exec02a: E3' runner/summary in tools/query_diag_exec2a (tools/query_diag unchanged); CPU tests 6/6 PASS; awaiting server run
+2026-10-20 dome-detr exec02a: E3' done, all self-checks PASS; exact_gain +1.725, L +1.425, retention' 0.278 (critical band), r_0.5 0.306

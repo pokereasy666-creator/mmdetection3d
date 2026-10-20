@@ -1,0 +1,86 @@
+Exec doc #2a summary (E3'; dmAP / dNDS in pp vs exec doc #2 E0; no Q4 / Q3' verdicts)
+E0 (work_dirs/diag/exec2/oracle_e0_base/oracle_e0_base.json): mAP 0.666180  NDS 0.706324
+S8' subset reference: N_gt 118538 x (1 - init@0.5m 0.82792) = 20398
+
+tag              mAP     dmAP      NDS     dNDS  injected  selected  restored    missed     mATE     mAOE
+e0_base       0.6662            0.7063                                                    0.2893   0.2798
+e3p_exact     0.6834   +1.725   0.7165   +1.022     20231     20231     20231     20385   0.2686   0.2842
+e3p_jitter    0.6710   +0.480   0.7085   +0.222     20310     20310     20310     20389   0.2828   0.2889
+
+dmAP contribution by match threshold (class-mean dAP / 4), pp
+  e3p_exact   @0.5m  +1.595  @1.0m  +0.373  @2.0m  -0.130  @4.0m  -0.113  | dmAP  +1.725
+  e3p_jitter  @0.5m  +0.489  @1.0m  +0.218  @2.0m  -0.115  @4.0m  -0.111  | dmAP  +0.480
+
+exact_gain  = dmAP(E3'-exact)            = +1.725 pp
+jitter_gain = dmAP(E3'-jitter)           = +0.480 pp
+L           = exact_gain - 0.300           = +1.425 pp
+retention'  = jitter_gain / exact_gain   = +0.278
+r_0.5       = @0.5m share jitter / exact = +0.306  (descriptive)
+
+Per-class dAP vs E0, pp, @0.5 / 1 / 2 / 4 m (classes without 3x3 local max listed apart)
+  [local-max classes]
+  car                  exact  +4.62  +1.08  -0.17  -0.41   jitter  +1.66  +0.37  -0.40  -0.65
+  truck                exact  +8.78  +1.86  -1.21  -0.51   jitter  +4.29  +2.55  +0.43  +0.80
+  construction_vehicle exact  +4.98  -1.16  -2.87  -2.74   jitter  +0.79  -0.91  -2.18  -1.76
+  bus                  exact +13.54  +4.19  -0.41  -0.36   jitter  +5.06  +2.55  -0.50  -0.66
+  trailer              exact +14.01  +4.07  -3.31  -3.07   jitter  +3.71  +2.17  -3.10  -2.90
+  barrier              exact  +8.08  +2.95  +0.88  +0.85   jitter  +2.50  +1.32  +0.29  +0.08
+  motorcycle           exact  +7.03  +0.38  +0.30  +0.02   jitter  +1.14  +0.58  +0.60  +0.49
+  bicycle              exact  +2.44  +1.27  +1.30  +1.41   jitter  +0.47  +0.12  +0.26  +0.19
+  [no-NMS controls]
+  pedestrian           exact  +0.18  +0.13  +0.15  +0.09   jitter  +0.06  +0.07  +0.09  +0.06
+  traffic_cone         exact  +0.14  +0.13  +0.15  +0.20   jitter  -0.13  -0.12  -0.10  -0.09
+
+Breakdown relative to E0 (tools/query_diag/oracle_breakdown.py, unchanged)
+Class-mean AP per match threshold, pp (delta vs base)
+run                AP@0.5m         AP@1.0m         AP@2.0m         AP@4.0m      mAP
+e0_base      53.40 (+0.00)   65.15 (+0.00)   72.22 (+0.00)   75.70 (+0.00)   66.618
+e3p_exact    59.78 (+6.38)   66.64 (+1.49)   71.70 (-0.52)   75.25 (-0.45)   68.343
+e3p_jitter   55.35 (+1.96)   66.02 (+0.87)   71.76 (-0.46)   75.26 (-0.44)   67.098
+
+Share of dmAP by threshold (dmAP = mean over thresholds), pp
+e3p_exact  @0.5m +1.595  @1.0m +0.372  @2.0m -0.130  @4.0m -0.113  | dmAP +1.725
+e3p_jitter @0.5m +0.489  @1.0m +0.217  @2.0m -0.115  @4.0m -0.111  | dmAP +0.480
+
+Per-class AP (mean over thresholds), pp: base | delta per run
+class                     base |  e3p_exact e3p_jitter
+car                      88.95 |      +1.28      +0.25
+truck                    61.56 |      +2.23      +2.02
+construction_vehicle     25.89 |      -0.45      -1.01
+bus                      74.52 |      +4.24      +1.61
+trailer                  44.59 |      +2.92      -0.03
+barrier                  69.72 |      +3.19      +1.05
+motorcycle               75.51 |      +1.93      +0.70
+bicycle                  59.52 |      +1.60      +0.26
+pedestrian               87.71 |      +0.14      +0.07
+traffic_cone             78.22 |      +0.16      -0.11
+
+TP errors and NDS
+          e0_base  e3p_exact e3p_jitter
+mATE       0.2893     0.2686     0.2828
+mASE       0.2551     0.2547     0.2560
+mAOE       0.2798     0.2842     0.2889
+mAVE       0.2615     0.2614     0.2608
+mAAE       0.1819     0.1827     0.1810
+NDS        0.7063     0.7165     0.7085
+
+Self-checks
+  S0''  consistency with exec doc #2 step 2      PASS  "PASS"
+  E0    reference = exec doc #2 E0 (0.666180 / 0.706324) PASS  {"mAP": 0.6661803276266157, "NDS": 0.7063239523716291}
+  ARGS  e3p_exact arguments as in exec doc #2a   PASS  {"oracle": "loc", "subset": "missed", "miss_thr": 0.5, "range": [0.0, 1000.0], "score": "orig", "jitter_cells": 0, "seed": 0, "no_class_range": false}
+  S6    e3p_exact                                PASS  {"init_mismatch_rate": 0.0, "capped_cells": 0.0}
+  S7'   e3p_exact                                PASS  {"selected_injected": 20231.0, "injected_cells": 20231.0, "restored_queries": 20231.0}
+  S8'   e3p_exact missed_gt vs B0 subset size    PASS  {"missed_gt": 20385.0, "subset_ref": 20398, "rel_diff": 0.0006373173840572605}
+  ARGS  e3p_jitter arguments as in exec doc #2a  PASS  {"oracle": "loc", "subset": "missed", "miss_thr": 0.5, "range": [0.0, 1000.0], "score": "orig", "jitter_cells": 1, "seed": 0, "no_class_range": false}
+  S6    e3p_jitter                               PASS  {"init_mismatch_rate": 0.0, "capped_cells": 0.0}
+  S7'   e3p_jitter                               PASS  {"selected_injected": 20310.0, "injected_cells": 20310.0, "restored_queries": 20310.0}
+  S8'   e3p_jitter missed_gt vs B0 subset size   PASS  {"missed_gt": 20389.0, "subset_ref": 20398, "rel_diff": 0.0004412197274242573}
+  S8'   e3p_exact vs e3p_jitter missed_gt        PASS  {"exact": 20385.0, "jitter": 20389.0, "rel_diff": 0.00019618421697974398}
+  all self-checks PASS: True
+
+Runtime
+  e3p_exact   {"elapsed_s": 2304.7, "gpu_name": "NVIDIA A30", "cuda_visible_devices": "1", "world_size": 1, "fp16": {"val_cfg": false, "test_cfg": false}, "repo_version": "2026-10-19 dome-detr exec02a: E3' runner/summary in tools/query_diag_exec2a (tools/query_diag unchanged); CPU tests 6/6 PASS; awaiting server run", "peak_mem_allocated_mib": 2229.2}
+  e3p_jitter  {"elapsed_s": 2312.2, "gpu_name": "NVIDIA A30", "cuda_visible_devices": "1", "world_size": 1, "fp16": {"val_cfg": false, "test_cfg": false}, "repo_version": "2026-10-19 dome-detr exec02a: E3' runner/summary in tools/query_diag_exec2a (tools/query_diag unchanged); CPU tests 6/6 PASS; awaiting server run", "peak_mem_allocated_mib": 2229.3}
+  logs: /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/diag/logs/exec2a-run_20261020_032656.log
+
+Q4 / Q3' verdicts are intentionally not computed (exec doc #2a sec. 5, review side).
