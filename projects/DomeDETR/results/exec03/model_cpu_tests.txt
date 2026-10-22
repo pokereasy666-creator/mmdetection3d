@@ -1,0 +1,60 @@
+{
+  "results": [
+    [
+      "3m bilinear_gather: exact on cell centres (fp32 / fp16), bilinear off-centre, gradient to features only",
+      "PASS",
+      ""
+    ],
+    [
+      "3m S-M1 / S-M0 (CPU): zero-offset M-b (kept by init_weights) == original head: outputs, all losses except loss_offset, features bit-identical",
+      "PASS",
+      ""
+    ],
+    [
+      "3m L = 1: QueryLoc get_targets / losses == original (cell mode)",
+      "PASS",
+      ""
+    ],
+    [
+      "3m S-D3L: 3-layer per-layer targets == single-layer targets; losses equal up to the total-positives normalization of the original code",
+      "PASS",
+      ""
+    ],
+    [
+      "3m D3 copy init: layers 1-2 copied from layer 0 on load (mmengine and torch loaders); a 3-layer state dict is not overwritten",
+      "PASS",
+      ""
+    ],
+    [
+      "3m M-a target: GT on cell centres == original target (up to the float32 rounding of the GT grid coordinate, positives identical); sub-cell GT skews the Gaussian toward the true centre",
+      "PASS",
+      ""
+    ],
+    [
+      "3m M-b dense L1: hand-computed targets, nearest-GT conflict rule, delta detached (detection losses do not reach the offset head)",
+      "PASS",
+      ""
+    ],
+    [
+      "3m S-T5 (CPU): top-K cells, labels and query_heatmap_score of M-a (DARK) and M-b (non-zero offsets) == original; DARK positions == subcell.dark_offsets",
+      "PASS",
+      ""
+    ],
+    [
+      "3m freezing: requires_grad off + eval kept through train() and a SyncBN-like module swap; trainable set = fuser, BEV backbone/neck, head",
+      "PASS",
+      ""
+    ]
+  ],
+  "report": [
+    "S-M1 (CPU): zero-offset M-b vs original head, train mode, same seed: layer_-1_loss_bbox, layer_-1_loss_cls, loss_heatmap, matched_ious identical; loss_offset 0.7930",
+    "S-D3L (CPU): per-layer labels / label weights / bbox targets / bbox weights and heatmap target identical to the single-layer original; positives per layer [12, 12, 12], total 36",
+    "  layer 0 loss_cls  3-layer 2.836351  single 8.509053  ratio 0.3333 = n_layer / n_total 12/36",
+    "  layer 0 loss_bbox 3-layer 0.916544  single 2.749631  ratio 0.3333 = n_layer / n_total 12/36",
+    "  layer 1 loss_cls  3-layer 2.610817  single 7.832452  ratio 0.3333 = n_layer / n_total 12/36",
+    "  layer 1 loss_bbox 3-layer 0.804914  single 2.414742  ratio 0.3333 = n_layer / n_total 12/36",
+    "  layer 2 loss_cls  3-layer 2.321218  single 6.963655  ratio 0.3333 = n_layer / n_total 12/36",
+    "  layer 2 loss_bbox 3-layer 0.887817  single 2.663451  ratio 0.3333 = n_layer / n_total 12/36",
+    "  -> literal equality fails by the factor n_layer / n_total (original code: avg_factor = positives of all layers); equality holds after removing it."
+  ]
+}

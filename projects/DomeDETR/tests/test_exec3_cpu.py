@@ -238,21 +238,24 @@ if [[ "$*" == *subcell_0a.py* ]]; then
   mkdir -p "$out"; echo '{}' > "$out/subcell_0a.json"
   exit "${STUB_0A_RC:-0}"
 fi
-exit 0
+exit "${STUB_RC:-0}"
 '''
+TORCHRUN = '#!/usr/bin/env bash\necho "torchrun $*" >> "$STUB_LOG"\nexit 0\n'
 
 
-@case('3 run_queryloc.sh: probe / s0ppp / 0a order, gating, C5, logs')
+@case('3 run_queryloc.sh: probe / s0ppp / 0a / check-load / sm0 / sm1 / '
+      '0b / rehearse: order, exact arguments, gating, C5, logs')
 def test_runner(tmp):
     b = osp.join(tmp, 'ql_bin')
     os.makedirs(b)
-    for name, body in (('nvidia-smi', T.NVSMI), ('python', PYSTUB)):
+    for name, body in (('nvidia-smi', T.NVSMI), ('python', PYSTUB),
+                       ('torchrun', TORCHRUN)):
         open(osp.join(b, name), 'w').write(body)
         os.chmod(osp.join(b, name), 0o755)
     slog = osp.join(tmp, 'ql_stub.log')
     seq = itertools.count()
 
-    def run(step, **env):
+    def run(step, *extra, **env):
         ws = osp.join(tmp, 'ql_ws_%d' % next(seq))
         root = copy_root(tmp, osp.basename(ws))
         os.makedirs(osp.join(root, 'tools'), exist_ok=True)
@@ -268,7 +271,8 @@ def test_runner(tmp):
              'CUDA_VISIBLE_DEVICES': '2'}
         e.update(env)
         p = subprocess.run(['bash', 'projects/QueryLoc/tools/run_queryloc.sh',
-                            step], cwd=root, env=e, stdout=subprocess.PIPE,
+                            step] + list(extra), cwd=root, env=e,
+                           stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, universal_newlines=True)
         calls = open(slog).read().splitlines() if osp.exists(slog) else []
         return p.returncode, p.stdout, calls, root
@@ -276,7 +280,12 @@ def test_runner(tmp):
     def kinds(calls):
         return [('s0ppp' if 'queryloc_check.py s0ppp' in c else
                  '0a' if 'subcell_0a.py' in c else
-                 'probe' if 'probe_step0.py' in c else c) for c in calls]
+                 'probe' if 'probe_step0.py' in c else
+                 'st0' if 'check_load.py' in c else
+                 'eval' if 'eval_ql.py' in c else
+                 'pair' if 'pair_check.py' in c else
+                 'rehearse' if c.startswith('torchrun') else c)
+                for c in calls]
 
     rc, txt, calls, root = run('0a')
     assert rc == 0, txt
@@ -302,6 +311,45 @@ def test_runner(tmp):
     assert rc == 1 and 'usage' in txt and not calls
     rc, txt, calls, root = run('0a', PROTECTED_DIRS=tmp)
     assert rc == 2 and 'protected' in txt and not calls, txt
+    # step-0 entries of the v1.1 doc
+    rc, txt, calls, _ = run('check-load', CUDA_VISIBLE_DEVICES='')
+    assert rc == 0 and kinds(calls) == ['s0ppp', 'st0'], calls
+    assert calls[1].endswith('check_load.py --ckpt %s --out-dir '
+                             'work_dirs/queryloc/step0/st0 --cfg-options X=1'
+                             % CKPT), calls[1]
+    rc, txt, calls, _ = run('sm0')
+    assert rc == 0 and kinds(calls) == ['s0ppp', 'eval'], calls
+    assert re.search(r'eval_ql\.py \S+/configs/ql_mb\.py %s --tag '
+                     r'sm0_mb_zero --out-dir work_dirs/queryloc/step0/sm0 '
+                     r'--ref-json work_dirs/diag/exec2/oracle_e0_base/'
+                     r'oracle_e0_base\.json --tol 0\.001 --debug-frames 50 '
+                     r'--cfg-options X=1$' % re.escape(CKPT), calls[1]), \
+        calls[1]
+    rc, txt, calls, _ = run('sm0', STUB_RC='1')
+    assert rc == 4 and 'S-M0 FAILED' in txt, txt
+    rc, txt, calls, _ = run('sm1')
+    assert rc == 0 and kinds(calls) == ['s0ppp', 'pair'] and \
+        'pair_check.py sm1 --ckpt' in calls[1], calls
+    rc, txt, calls, _ = run('0b')
+    assert rc == 0 and kinds(calls) == ['s0ppp', 'eval'] and \
+        'configs/ql_0b.py' in calls[1] and '--tag p0b_dark' in calls[1] and \
+        '--tol' not in calls[1], calls
+    rc, txt, calls, root = run('rehearse', 'all',
+                               CUDA_VISIBLE_DEVICES='0,1,2,3')
+    assert rc == 0 and kinds(calls) == ['s0ppp'] + ['rehearse'] * 4, calls
+    for c, n in zip(calls[1:], ('c0', 'd3', 'mb', 'ma')):
+        assert re.search(r'^torchrun --nproc_per_node=4 --master_port=29541 '
+                         r'\S+/rehearse\.py \S+/configs/ql_%s\.py --ckpt '
+                         r'\S+ --launcher pytorch --work-dir work_dirs/'
+                         r'queryloc/step0/rehearse/ql_%s --cfg-options X=1$'
+                         % (n, n), c), c
+    assert txt.count('[gpu-check] GPU 3 idle') == 4, txt
+    logs = os.listdir(osp.join(root, 'work_dirs/queryloc/logs'))
+    assert len(logs) == 1 and logs[0].startswith('rehearse-all_'), logs
+    rc, txt, calls, _ = run('rehearse', 'c0')
+    assert rc == 2 and 'exactly 4' in txt and kinds(calls) == ['s0ppp']
+    rc, txt, calls, _ = run('rehearse', 'xx', CUDA_VISIBLE_DEVICES='0,1,2,3')
+    assert rc == 2 and 'rehearse needs one of' in txt and not calls, txt
 
 
 def fn_body(text, name):

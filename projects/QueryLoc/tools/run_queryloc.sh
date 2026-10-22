@@ -4,23 +4,33 @@
 #
 #   run_queryloc.sh probe                     read-only server probe (no GPU)
 #   run_queryloc.sh s0ppp                     S0''' only (no GPU)
-#   CUDA_VISIBLE_DEVICES=<id> run_queryloc.sh 0a
-#                                             S0''' -> C5 -> step 0a (1 GPU)
-# The steps of 4.2 / 4.3 and of steps 1-2 are added after the plan is
-# confirmed.
+#   run_queryloc.sh check-load                S0''' -> S-T0 (no GPU)
+#   CUDA_VISIBLE_DEVICES=<id> run_queryloc.sh 0a | sm0 | sm1 | 0b
+#                                             S0''' -> C5 -> one GPU step:
+#                                             0a step 0a analysis; sm0 S-M0
+#                                             (M-b zero offset: 50-frame
+#                                             bitwise + full val vs E0);
+#                                             sm1 S-M1 (one batch); 0b
+#                                             step 0b (DARK positions, val)
+#   CUDA_VISIBLE_DEVICES=<4 ids> run_queryloc.sh rehearse <c0|d3|mb|ma|all>
+#                                             sec. 4.2 + S-T2, 4 GPUs only
 #
 # Outputs under $OUT (default work_dirs/queryloc): probe_step0_<time>.txt,
-# s0ppp/, step0a/, logs/<step>_<time>.log. Reference: $REF_E0 (exec doc #2
-# E0 json, default work_dirs/diag/exec2/oracle_e0_base/oracle_e0_base.json).
+# s0ppp/, step0a/, step0/{st0,sm0,sm1,rehearse/<cfg>}/, step0b/,
+# logs/<step>_<time>.log. Reference: $REF_E0 (exec doc #2 E0 json, default
+# work_dirs/diag/exec2/oracle_e0_base/oracle_e0_base.json).
 # The A-1 guard, C5 GPU check and CFG_OPTS handling are copied verbatim from
 # tools/query_diag/run_diag.sh (which must stay unchanged).
 set -euo pipefail
 
 QL=$(cd "$(dirname "$0")" && pwd)
+QLC=$(cd "$QL/../configs" && pwd)
 DIAG=$(cd "$QL/../../../tools/query_diag" && pwd)
 OUT=${OUT:-work_dirs/queryloc}
 REF_E0=${REF_E0:-work_dirs/diag/exec2/oracle_e0_base/oracle_e0_base.json}
 STEP=${1:-}
+ARG=${2:-}
+PORT=${PORT:-29541}
 MEM_LIMIT_MIB=1024
 export PYTHONPATH=$PWD:$DIAG:${PYTHONPATH:-}
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -45,13 +55,14 @@ if inside_protected "$OUT"; then
   die "OUT=$OUT resolves inside a protected directory ($PROTECTED_DIRS)"
 fi
 case "$STEP" in
-  probe|s0ppp|0a)
+  probe|s0ppp|0a|check-load|sm0|sm1|0b|rehearse)
     mkdir -p "$OUT/logs"
-    RUN_LOG="$OUT/logs/${STEP}_$(date +%Y%m%d_%H%M%S).log"
+    RUN_LOG="$OUT/logs/${STEP}${ARG:+-$ARG}_$(date +%Y%m%d_%H%M%S).log"
     exec > >(tee -a "$RUN_LOG") 2>&1
     echo "[queryloc] step=$STEP log=$RUN_LOG" ;;
   *)
-    echo "usage: run_queryloc.sh {probe|s0ppp|0a} (got '$STEP')"
+    echo "usage: run_queryloc.sh {probe|s0ppp|check-load|0a|sm0|sm1|0b|" \
+      "rehearse <c0|d3|mb|ma|all>} (got '$STEP')"
     exit 1 ;;
 esac
 
@@ -137,4 +148,59 @@ case "$STEP" in
         "Stop and report." >&2
       exit 4
     fi ;;
+  check-load)
+    need_repo_root; need_config; need_ckpt; need_ref
+    s0ppp
+    if ! python "$QL/check_load.py" --ckpt "$CKPT" \
+        --out-dir "$OUT/step0/st0" ${CFG_ARGS[@]+"${CFG_ARGS[@]}"}; then
+      echo "[queryloc] S-T0 FAILED (see check_load.txt). Stop and report." >&2
+      exit 4
+    fi ;;
+  sm0)
+    need_repo_root; need_config; need_ckpt; need_ref
+    s0ppp
+    check_gpus 1
+    if ! python "$QL/eval_ql.py" "$QLC/ql_mb.py" "$CKPT" --tag sm0_mb_zero \
+        --out-dir "$OUT/step0/sm0" --ref-json "$REF_E0" --tol 0.001 \
+        --debug-frames 50 ${CFG_ARGS[@]+"${CFG_ARGS[@]}"}; then
+      echo "[queryloc] S-M0 FAILED: M-a and M-b must not run. Stop and" \
+        "report." >&2
+      exit 4
+    fi ;;
+  sm1)
+    need_repo_root; need_config; need_ckpt; need_ref
+    s0ppp
+    check_gpus 1
+    if ! python "$QL/pair_check.py" sm1 --ckpt "$CKPT" \
+        --out-dir "$OUT/step0/sm1" ${CFG_ARGS[@]+"${CFG_ARGS[@]}"}; then
+      echo "[queryloc] S-M1 FAILED: M-a and M-b must not run. Stop and" \
+        "report." >&2
+      exit 4
+    fi ;;
+  0b)
+    need_repo_root; need_config; need_ckpt; need_ref
+    s0ppp
+    check_gpus 1
+    python "$QL/eval_ql.py" "$QLC/ql_0b.py" "$CKPT" --tag p0b_dark \
+      --out-dir "$OUT/step0b" --ref-json "$REF_E0" \
+      ${CFG_ARGS[@]+"${CFG_ARGS[@]}"} ;;
+  rehearse)
+    need_repo_root; need_config; need_ckpt; need_ref
+    case "$ARG" in
+      c0|d3|mb|ma) NAMES=("$ARG") ;;
+      all) NAMES=(c0 d3 mb ma) ;;
+      *) die "rehearse needs one of c0|d3|mb|ma|all (got '$ARG')" ;;
+    esac
+    s0ppp
+    for n in "${NAMES[@]}"; do
+      check_gpus 4                     # sec. 3: 4 GPUs, SyncBN, batch 32
+      if ! torchrun --nproc_per_node=4 --master_port="$PORT" \
+          "$QL/rehearse.py" "$QLC/ql_$n.py" --ckpt "$CKPT" \
+          --launcher pytorch --work-dir "$OUT/step0/rehearse/ql_$n" \
+          ${CFG_ARGS[@]+"${CFG_ARGS[@]}"}; then
+        echo "[queryloc] rehearsal ql_$n: S-T2 FAILED or error. Stop and" \
+          "report." >&2
+        exit 4
+      fi
+    done ;;
 esac

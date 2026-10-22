@@ -1,0 +1,13 @@
+S0''' consistency (exec doc #3) at /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag
+  CONFIG md5 8f49ac799dc93ccd3e8c7a8dc736a2dc  (#2 E0: 8f49ac799dc93ccd3e8c7a8dc736a2dc)  OK
+  CKPT md5   c16536e34cff05f51b6145dec2893f7d  (#2 E0: c16536e34cff05f51b6145dec2893f7d)  OK
+  CFG_OPTS   model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth  (#2 E0: model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth)  OK
+  projects/BEVFusion: 33 / 33 manifest files identical
+  tools/query_diag: 15 files, identical to exec doc #2 step 2
+  projects/QueryLoc: 5 files vs code_md5.json; sync gate all OK
+    queryloc/subcell.py                      52172a54db119f9dfcad5b54bcfb4111
+    tools/probe_step0.py                     67c72577e2bb588184a4fe3c73391792
+    tools/queryloc_check.py                  0d39ac0e98d6e9735cfb5fdbd9a0e1c5
+    tools/run_queryloc.sh                    e7658acc538c8b33afca44436f2811c6
+    tools/subcell_0a.py                      66cb74d0c07d2592dcf316ea2dd02659
+S0'''  PASS

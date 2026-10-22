@@ -95,3 +95,33 @@ def softargmax_offsets(nb, valid):
 def rowcol_to_xy(off_rc, transposed=False):
     """(d_row, d_col) -> (d_x, d_y) in grid units."""
     return off_rc.flip(-1) if transposed else off_rc
+
+
+def bilinear_gather(feat_flat, pos_xy, H, W):
+    """Sample [B, C, H*W] features at continuous grid positions.
+
+    pos_xy [B, P, 2] is in bev_pos units (x = row + 0.5, y = col + 0.5).
+    Written with four gathers so that a position exactly on a cell centre
+    (fractional part 0) returns the plain gather of that cell bit for bit:
+    the other three weights are exactly 0 (exec doc #3 S-M0). Positions are
+    clamped to the map; gradients flow into feat_flat, not into pos_xy.
+    Returns [B, C, P] in feat_flat's dtype.
+    """
+    B, C, _ = feat_flat.shape
+    pos = pos_xy.detach().float()
+    r = (pos[..., 0] - 0.5).clamp(0, H - 1)
+    c = (pos[..., 1] - 0.5).clamp(0, W - 1)
+    r0, c0 = r.floor(), c.floor()
+    fr, fc = r - r0, c - c0
+    r0, c0 = r0.long(), c0.long()
+    r1, c1 = (r0 + 1).clamp(max=H - 1), (c0 + 1).clamp(max=W - 1)
+
+    def take(rr, cc):
+        idx = (rr * W + cc)[:, None, :].expand(-1, C, -1)
+        return feat_flat.gather(2, idx).float()
+
+    out = take(r0, c0) * ((1 - fr) * (1 - fc))[:, None] + \
+        take(r0, c1) * ((1 - fr) * fc)[:, None] + \
+        take(r1, c0) * (fr * (1 - fc))[:, None] + \
+        take(r1, c1) * (fr * fc)[:, None]
+    return out.to(feat_flat.dtype)

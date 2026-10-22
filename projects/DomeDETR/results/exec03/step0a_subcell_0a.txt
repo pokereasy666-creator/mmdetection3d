@@ -1,0 +1,32 @@
+Exec doc #3 step 0a: sub-cell position in the existing heatmap (K=200, class-aware, recall threshold 0.5 m)
+
+Initial recall @0.5 m by position type (all queries)
+bin       N_gt     cell     dark     soft dark-cell pp soft-cell pp
+<30      86121  0.87166  0.90521  0.90336       +3.356       +3.170
+>=30     32417  0.71216  0.76845  0.76299       +5.630       +5.084
+all     118538  0.82804  0.86781  0.86497       +3.978       +3.693
+
+GT attached to the nearest same-class query (cell centre, <= 2 m); distances in m, mean / median
+grp bin          N            d_cell            d_dark            d_soft moved_d moved_s  fb_bdr  fb_nnd    clip
+G0  <30      75068   0.2506/  0.2526   0.1656/  0.1359   0.1613/  0.1388  0.7179  0.7704       0    1369   13243
+G0  >=30     23086   0.2660/  0.2651   0.2176/  0.1907   0.2050/  0.1892  0.6230  0.7046       0     240    3402
+G0  all      98154   0.2543/  0.2554   0.1779/  0.1472   0.1715/  0.1493  0.6956  0.7549       0    1609   16645
+G1  <30       6686   0.6533/  0.6160   0.4946/  0.4462   0.5415/  0.5157  0.7952  0.8283       0      40    1488
+G1  >=30      5686   0.6753/  0.6445   0.5448/  0.5151   0.5949/  0.5762  0.7730  0.8053       0       9     851
+G1  all      12372   0.6634/  0.6279   0.5177/  0.4783   0.5660/  0.5451  0.7850  0.8177       0      49    2339
+G2  <30       2085   1.3698/  1.3203   1.2999/  1.2556   1.3303/  1.2845  0.6408  0.6777       0      27     360
+G2  >=30      2024   1.3949/  1.3565   1.3375/  1.3237   1.3638/  1.3334  0.6265  0.6640       0       5     270
+G2  all       4109   1.3821/  1.3367   1.3184/  1.2921   1.3468/  1.3070  0.6337  0.6710       0      32     630
+  moved_d / moved_s: share with d_dark / d_soft < d_cell; fb_bdr / fb_nnd: DARK fell back (map border / Hessian not negative definite); clip: DARK offset clipped to +-0.5 cell
+
+DARK status over all selected queries
+  all     queries   1203800  ok   1077402  border   15218  not_neg_def   111180  clipped   413403
+  nms     queries    469076  ok    467923  border       0  not_neg_def     1153  clipped    42650
+  no_nms  queries    734724  ok    609479  border   15218  not_neg_def   110027  clipped   370753
+  (nms = classes with 3x3 local max; no_nms = pedestrian, traffic_cone)
+
+Step 0b trigger: dark - cell recall @0.5 m (all) = +3.978 pp (threshold +0.50 pp) -> TRIGGERED
+
+Self-checks
+  S-0a1  cell recall @0.5 m (all) == B0 0.82792 (tol 0.001)   PASS  {"cell": 0.8280382662099918, "b0": 0.82792, "diff": 0.00011826620999177972}
+  S-0a2  replicated top-K labels == head.query_labels (>= 0.99) PASS  1.0

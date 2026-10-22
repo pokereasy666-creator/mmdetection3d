@@ -1,0 +1,138 @@
+[queryloc] step=probe log=work_dirs/queryloc/logs/probe_20261022_060657.log
+[queryloc] NOTE: CFG_OPTS in effect: model.img_backbone.init_cfg.checkpoint=/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/work_dirs/exec01_inputs/swint-nuimages-pretrained.pth (recorded in json)
+Exec doc #3 step 0 probe  2026-10-22 06:06:57  repo_version: 2026-10-20 dome-detr exec03 step 0: T1-T6 audit, plan for confirmation, step 0a tool + probe + S0''' (projects/QueryLoc); CPU tests 7/7 PASS  cwd: /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag
+
+== versions ==
+python 3.8.20
+torch     2.0.1+cu118  (/root/anaconda3/envs/bevfusion/lib/python3.8/site-packages/torch)
+mmcv      2.1.0  (/root/anaconda3/envs/bevfusion/lib/python3.8/site-packages/mmcv)
+mmengine  0.10.5  (/root/anaconda3/envs/bevfusion/lib/python3.8/site-packages/mmengine)
+mmdet     3.2.0  (/root/anaconda3/envs/bevfusion/lib/python3.8/site-packages/mmdet)
+mmdet3d   1.4.0  (/212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/mmdet3d)
+numpy     1.23.5  (/root/anaconda3/envs/bevfusion/lib/python3.8/site-packages/numpy)
+
+== T4 mmdet gaussian_focal_loss (positive definition) ==
+gaussian_focal_loss  /root/anaconda3/envs/bevfusion/lib/python3.8/site-packages/mmdet/models/losses/utils.py:11-37
+    11  @weighted_loss
+    12  def gaussian_focal_loss(pred: Tensor,
+    13                          gaussian_target: Tensor,
+    14                          alpha: float = 2.0,
+    15                          gamma: float = 4.0,
+    16                          pos_weight: float = 1.0,
+    17                          neg_weight: float = 1.0) -> Tensor:
+    18      """`Focal Loss <https://arxiv.org/abs/1708.02002>`_ for targets in gaussian
+    19      distribution.
+    20  
+    21      Args:
+    22          pred (torch.Tensor): The prediction.
+    23          gaussian_target (torch.Tensor): The learning target of the prediction
+    24              in gaussian distribution.
+    25          alpha (float, optional): A balanced form for Focal Loss.
+    26              Defaults to 2.0.
+    27          gamma (float, optional): The gamma for calculating the modulating
+    28              factor. Defaults to 4.0.
+    29          pos_weight(float): Positive sample loss weight. Defaults to 1.0.
+    30          neg_weight(float): Negative sample loss weight. Defaults to 1.0.
+    31      """
+    32      eps = 1e-12
+    33      pos_weights = gaussian_target.eq(1)
+    34      neg_weights = (1 - gaussian_target).pow(gamma)
+    35      pos_loss = -(pred + eps).log() * (1 - pred).pow(alpha) * pos_weights
+    36      neg_loss = -(1 - pred + eps).log() * pred.pow(alpha) * neg_weights
+    37      return pos_weight * pos_loss + neg_weight * neg_loss
+gaussian_focal_loss_with_pos_inds  /root/anaconda3/envs/bevfusion/lib/python3.8/site-packages/mmdet/models/losses/gaussian_focal_loss.py:40-89
+    40  def gaussian_focal_loss_with_pos_inds(
+    41          pred: Tensor,
+    42          gaussian_target: Tensor,
+    43          pos_inds: Tensor,
+    44          pos_labels: Tensor,
+    45          alpha: float = 2.0,
+    46          gamma: float = 4.0,
+    47          pos_weight: float = 1.0,
+    48          neg_weight: float = 1.0,
+    49          reduction: str = 'mean',
+    50          avg_factor: Optional[Union[int, float]] = None) -> Tensor:
+    51      """`Focal Loss <https://arxiv.org/abs/1708.02002>`_ for targets in gaussian
+    52      distribution.
+    53  
+    54      Note: The index with a value of 1 in ``gaussian_target`` in the
+    55      ``gaussian_focal_loss`` function is a positive sample, but in
+    56      ``gaussian_focal_loss_with_pos_inds`` the positive sample is passed
+    57      in through the ``pos_inds`` parameter.
+    58  
+    59      Args:
+    60          pred (torch.Tensor): The prediction. The shape is (N, num_classes).
+    61          gaussian_target (torch.Tensor): The learning target of the prediction
+    62              in gaussian distribution. The shape is (N, num_classes).
+    63          pos_inds (torch.Tensor): The positive sample index.
+    64              The shape is (M, ).
+    65          pos_labels (torch.Tensor): The label corresponding to the positive
+    66              sample index. The shape is (M, ).
+    67          alpha (float, optional): A balanced form for Focal Loss.
+    68              Defaults to 2.0.
+    69          gamma (float, optional): The gamma for calculating the modulating
+    70              factor. Defaults to 4.0.
+    71          pos_weight(float): Positive sample loss weight. Defaults to 1.0.
+    72          neg_weight(float): Negative sample loss weight. Defaults to 1.0.
+    73          reduction (str): Options are "none", "mean" and "sum".
+    74              Defaults to 'mean`.
+    75          avg_factor (int, float, optional): Average factor that is used to
+    76              average the loss. Defaults to None.
+    77      """
+    78      eps = 1e-12
+    79      neg_weights = (1 - gaussian_target).pow(gamma)
+    80  
+    81      pos_pred_pix = pred[pos_inds]
+    82      pos_pred = pos_pred_pix.gather(1, pos_labels.unsqueeze(1))
+    83      pos_loss = -(pos_pred + eps).log() * (1 - pos_pred).pow(alpha)
+    84      pos_loss = weight_reduce_loss(pos_loss, None, reduction, avg_factor)
+    85  
+    86      neg_loss = -(1 - pred + eps).log() * pred.pow(alpha) * neg_weights
+    87      neg_loss = weight_reduce_loss(neg_loss, None, reduction, avg_factor)
+    88  
+    89      return pos_weight * pos_loss + neg_weight * neg_loss
+T4 verdict: positives are `gaussian_target.eq(1)` (as assumed)
+mmdet3d draw_heatmap_gaussian: /212022085500129/dome-detr/mmdetection3d-claude-dome-detr-query-diag/mmdet3d/models/utils/gaussian.py md5 da67f7b6b87a67499b4612a27a4e2e17
+
+== T5 config of the run that produced the start weights (work_dirs/exec01_inputs/train_run) ==
+file work_dirs/exec01_inputs/train_run/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py md5 b2feb08674c61b8f061d37d473b65f5a
+  optim_wrapper = {'accumulative_counts': 4, 'clip_grad': {'max_norm': 10, 'norm_type': 2}, 'loss_scale': 512.0, 'optimizer': {'lr': 0.0002, 'type': 'AdamW', 'weight_decay': 0.01}, 'type': 'AmpOptimWrapper'}
+  param_scheduler = [{'begin': 0, 'by_epoch': False, 'end': 500, 'start_factor': 0.33333333, 'type': 'LinearLR'}, {'T_max': 6, 'begin': 0, 'by_epoch': True, 'convert_to_iter_based': True, 'end': 6, 'eta_min_ratio': 0.0001, 'type': 'CosineAnnealingLR'}, {'begin': 0, 'by_epoch': True, 'convert_to_iter_based': True, 'end': 2.4, 'eta_min': 0.8947368421052632, 'type': 'CosineAnnealingMomentum'}, {'begin': 2.4, 'by_epoch': True, 'convert_to_iter_based': True, 'end': 6, 'eta_min': 1, 'type': 'CosineAnnealingMomentum'}]
+  train_cfg = {'by_epoch': True, 'max_epochs': 6, 'val_interval': 1}
+  auto_scale_lr = {'base_batch_size': 32, 'enable': False}
+  randomness = {'deterministic': False, 'seed': 577127641}
+  load_from = '/212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ/work_dirs/bevfusion_lidar_voxel0075_4xa30_accum2_seed577127641/epoch_20.pth'
+  sync_bn = 'torch'
+  find_unused_parameters = '<absent>'
+  model_wrapper_cfg = '<absent>'
+  train_dataloader.batch_size = 2, num_workers = 4, dataset.type = 'CBGSDataset'
+
+== T5 launch lines of work_dirs/exec01_inputs/train_run/20260718_020825/20260718_020825.log ==
+      numpy_random_seed: 577127641
+      GPU 0,1,2,3: NVIDIA A30
+      seed: 577127641
+      Distributed launcher: pytorch
+      Distributed training: True
+      sampler_seed=dict(type='DistSamplerSeedHook'),
+  launcher = 'pytorch'
+  load_from = '/212022085500129/bevfusion-concat/mmdetection3d-claude-jolly-wozniak-c4YMQ/work_dirs/bevfusion_lidar_voxel0075_4xa30_accum2_seed577127641/epoch_20.pth'
+
+== 4.2 GPU inventory (read-only nvidia-smi) ==
+index, name, memory.used [MiB], memory.total [MiB], utilization.gpu [%]
+0, NVIDIA A30, 3 MiB, 24576 MiB, 0 %
+1, NVIDIA A30, 1437 MiB, 24576 MiB, 30 %
+2, NVIDIA A30, 1437 MiB, 24576 MiB, 30 %
+3, NVIDIA A30, 1437 MiB, 24576 MiB, 30 %
+gpu_uuid, pid, process_name, used_gpu_memory [MiB]
+GPU-2fe7cb99-506e-31d7-e991-94b4b8c8b643, 46817, [Not Found], 1428 MiB
+GPU-e5a80c44-8bd7-2b1a-0e21-41a4f7610bf2, 46817, [Not Found], 1428 MiB
+GPU-5e6813a1-4ce6-e3c1-c566-fd10cafc8b58, 46817, [Not Found], 1428 MiB
+0, GPU-7ecec61f-cdfb-a0a4-02c8-0a713f2e07c5
+1, GPU-2fe7cb99-506e-31d7-e991-94b4b8c8b643
+2, GPU-e5a80c44-8bd7-2b1a-0e21-41a4f7610bf2
+3, GPU-5e6813a1-4ce6-e3c1-c566-fd10cafc8b58
+
+== disk space (work_dirs) ==
+Filesystem                                         Size  Used Avail Use% Mounted on
+10.10.10.76:/mnt/inspurfs/user-fs/212022085500129  102T   27T   70T  28% /212022085500129
+[probe] saved work_dirs/queryloc/probe_step0_20261022_060701.txt
